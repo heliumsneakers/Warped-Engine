@@ -1,0 +1,28 @@
+{
+	"cmake" : 
+	{
+		"generator" : 
+		{
+			"multiConfig" : false,
+			"name" : "Unix Makefiles"
+		},
+		"paths" : 
+		{
+			"cmake" : "/opt/homebrew/Cellar/cmake/3.27.8/bin/cmake",
+			"cpack" : "/opt/homebrew/Cellar/cmake/3.27.8/bin/cpack",
+			"ctest" : "/opt/homebrew/Cellar/cmake/3.27.8/bin/ctest",
+			"root" : "/opt/homebrew/Cellar/cmake/3.27.8/share/cmake"
+		},
+		"version" : 
+		{
+			"isDirty" : false,
+			"major" : 3,
+			"minor" : 27,
+			"patch" : 8,
+			"string" : "3.27.8",
+			"suffix" : ""
+		}
+	},
+	"objects" : [],
+	"reply" : {}
+}
