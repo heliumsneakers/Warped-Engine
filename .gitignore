@@ -1,0 +1,21 @@
+# Ignore temporary files
+*.tmp
+*.swp
+
+# Ignore build artifacts
+/build/bin
+*.o
+*.so
+*.exe
+
+/assets/
+
+# Ignore IDE/editor configurations
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# Ignore sensitive files
+.env
+secrets.txt
+
