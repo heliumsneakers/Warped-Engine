@@ -9,6 +9,7 @@
 *.exe
 
 /assets/
+/.cache/
 
 # Ignore IDE/editor configurations
 .vscode/

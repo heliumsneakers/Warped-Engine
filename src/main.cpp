@@ -1,16 +1,24 @@
-// src/main.cpp
-
 #include "raylib.h"
 #include "raymath.h"
 #include "player.h"
 #include "parameters.h"
 
-int main() { 
-    InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Raylib Game Engine with TrenchBroom Integration");
+#include <string>
+
+int main() {
+    // Initialize window
+    InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Warped Engine");
+
+    // Load model (including materials)
+    const char* objPath = "../../assets/maps/test.obj";
+    Model obj = LoadModel(objPath);
+
+    // Set model position
+    Vector3 modelPosition = { 0.0f, 0.0f, 0.0f };
 
     // Initialize player
     Player player;
-    InitPlayer(&player, (Vector3){20.0f, 20.0f, 20.0f}, (Vector3){0.0f, 1.0f, 0.0f}, (Vector3){0.0f, 1.0f, 0.0f}, 90.0f, CAMERA_PERSPECTIVE);
+    InitPlayer(&player, (Vector3){ 20.0f, 20.0f, 20.0f }, (Vector3){ 0.0f, 1.0f, 0.0f }, (Vector3){ 0.0f, 1.0f, 0.0f }, 90.0f, CAMERA_PERSPECTIVE);
 
     SetTargetFPS(60);
 
@@ -28,14 +36,15 @@ int main() {
 
             BeginMode3D(player.camera);
                 DrawGrid(100, 5.0f);
-                // Add your drawing code here
+                DrawModel(obj, modelPosition, 0.2f, WHITE); // Draw the loaded model
             EndMode3D();
 
             DrawFPS(10, 10);
         EndDrawing();
     }
 
-    // De-Initialization
+    // Unload model and deinitialize
+    UnloadModel(obj);
     CloseWindow();
 
     return 0;
