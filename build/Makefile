@@ -283,6 +283,30 @@ src/main.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/WarpedGame.dir/build.make CMakeFiles/WarpedGame.dir/src/main.cpp.s
 .PHONY : src/main.cpp.s
 
+src/map_parser.o: src/map_parser.cpp.o
+.PHONY : src/map_parser.o
+
+# target to build an object file
+src/map_parser.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/WarpedGame.dir/build.make CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o
+.PHONY : src/map_parser.cpp.o
+
+src/map_parser.i: src/map_parser.cpp.i
+.PHONY : src/map_parser.i
+
+# target to preprocess a source file
+src/map_parser.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/WarpedGame.dir/build.make CMakeFiles/WarpedGame.dir/src/map_parser.cpp.i
+.PHONY : src/map_parser.cpp.i
+
+src/map_parser.s: src/map_parser.cpp.s
+.PHONY : src/map_parser.s
+
+# target to generate assembly for a file
+src/map_parser.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/WarpedGame.dir/build.make CMakeFiles/WarpedGame.dir/src/map_parser.cpp.s
+.PHONY : src/map_parser.cpp.s
+
 src/parameters.o: src/parameters.cpp.o
 .PHONY : src/parameters.o
 
@@ -354,6 +378,9 @@ help:
 	@echo "... src/main.o"
 	@echo "... src/main.i"
 	@echo "... src/main.s"
+	@echo "... src/map_parser.o"
+	@echo "... src/map_parser.i"
+	@echo "... src/map_parser.s"
 	@echo "... src/parameters.o"
 	@echo "... src/parameters.i"
 	@echo "... src/parameters.s"

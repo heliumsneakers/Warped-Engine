@@ -7,6 +7,12 @@
 },
 {
   "directory": "/Users/klo/Warped/build",
+  "command": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DGRAPHICS_API_OPENGL_33 -DJPH_OBJECT_STREAM -DPLATFORM_DESKTOP -DRAYGUI_IMPLEMENTATION -I/Users/klo/Warped/src/include -I/Users/klo/Warped/lib/raygui/src -I/Users/klo/Warped/include -I/Users/klo/Warped/lib/JoltPhysics/Build/.. -I/Users/klo/Warped/build/_deps/raylib-src/src -I/Users/klo/Warped/build/_deps/raylib-src/src/external/glfw/include -F/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.1.sdk/System/Library/Frameworks -std=gnu++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.1.sdk -pthread -o CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o -c /Users/klo/Warped/src/map_parser.cpp",
+  "file": "/Users/klo/Warped/src/map_parser.cpp",
+  "output": "CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o"
+},
+{
+  "directory": "/Users/klo/Warped/build",
   "command": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DGRAPHICS_API_OPENGL_33 -DJPH_OBJECT_STREAM -DPLATFORM_DESKTOP -DRAYGUI_IMPLEMENTATION -I/Users/klo/Warped/src/include -I/Users/klo/Warped/lib/raygui/src -I/Users/klo/Warped/include -I/Users/klo/Warped/lib/JoltPhysics/Build/.. -I/Users/klo/Warped/build/_deps/raylib-src/src -I/Users/klo/Warped/build/_deps/raylib-src/src/external/glfw/include -F/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.1.sdk/System/Library/Frameworks -std=gnu++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.1.sdk -pthread -o CMakeFiles/WarpedGame.dir/src/parameters.cpp.o -c /Users/klo/Warped/src/parameters.cpp",
   "file": "/Users/klo/Warped/src/parameters.cpp",
   "output": "CMakeFiles/WarpedGame.dir/src/parameters.cpp.o"

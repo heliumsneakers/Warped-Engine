@@ -83,10 +83,24 @@ CMakeFiles/WarpedGame.dir/src/main.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/WarpedGame.dir/src/main.cpp.s"
 	/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/klo/Warped/src/main.cpp -o CMakeFiles/WarpedGame.dir/src/main.cpp.s
 
+CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o: CMakeFiles/WarpedGame.dir/flags.make
+CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o: /Users/klo/Warped/src/map_parser.cpp
+CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o: CMakeFiles/WarpedGame.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/klo/Warped/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o"
+	/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o -MF CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o.d -o CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o -c /Users/klo/Warped/src/map_parser.cpp
+
+CMakeFiles/WarpedGame.dir/src/map_parser.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/WarpedGame.dir/src/map_parser.cpp.i"
+	/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/klo/Warped/src/map_parser.cpp > CMakeFiles/WarpedGame.dir/src/map_parser.cpp.i
+
+CMakeFiles/WarpedGame.dir/src/map_parser.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/WarpedGame.dir/src/map_parser.cpp.s"
+	/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/klo/Warped/src/map_parser.cpp -o CMakeFiles/WarpedGame.dir/src/map_parser.cpp.s
+
 CMakeFiles/WarpedGame.dir/src/parameters.cpp.o: CMakeFiles/WarpedGame.dir/flags.make
 CMakeFiles/WarpedGame.dir/src/parameters.cpp.o: /Users/klo/Warped/src/parameters.cpp
 CMakeFiles/WarpedGame.dir/src/parameters.cpp.o: CMakeFiles/WarpedGame.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/klo/Warped/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object CMakeFiles/WarpedGame.dir/src/parameters.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/klo/Warped/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object CMakeFiles/WarpedGame.dir/src/parameters.cpp.o"
 	/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/WarpedGame.dir/src/parameters.cpp.o -MF CMakeFiles/WarpedGame.dir/src/parameters.cpp.o.d -o CMakeFiles/WarpedGame.dir/src/parameters.cpp.o -c /Users/klo/Warped/src/parameters.cpp
 
 CMakeFiles/WarpedGame.dir/src/parameters.cpp.i: cmake_force
@@ -100,7 +114,7 @@ CMakeFiles/WarpedGame.dir/src/parameters.cpp.s: cmake_force
 CMakeFiles/WarpedGame.dir/src/player.cpp.o: CMakeFiles/WarpedGame.dir/flags.make
 CMakeFiles/WarpedGame.dir/src/player.cpp.o: /Users/klo/Warped/src/player.cpp
 CMakeFiles/WarpedGame.dir/src/player.cpp.o: CMakeFiles/WarpedGame.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/klo/Warped/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object CMakeFiles/WarpedGame.dir/src/player.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/klo/Warped/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building CXX object CMakeFiles/WarpedGame.dir/src/player.cpp.o"
 	/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/WarpedGame.dir/src/player.cpp.o -MF CMakeFiles/WarpedGame.dir/src/player.cpp.o.d -o CMakeFiles/WarpedGame.dir/src/player.cpp.o -c /Users/klo/Warped/src/player.cpp
 
 CMakeFiles/WarpedGame.dir/src/player.cpp.i: cmake_force
@@ -114,6 +128,7 @@ CMakeFiles/WarpedGame.dir/src/player.cpp.s: cmake_force
 # Object files for target WarpedGame
 WarpedGame_OBJECTS = \
 "CMakeFiles/WarpedGame.dir/src/main.cpp.o" \
+"CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o" \
 "CMakeFiles/WarpedGame.dir/src/parameters.cpp.o" \
 "CMakeFiles/WarpedGame.dir/src/player.cpp.o"
 
@@ -121,13 +136,14 @@ WarpedGame_OBJECTS = \
 WarpedGame_EXTERNAL_OBJECTS =
 
 bin/WarpedGame: CMakeFiles/WarpedGame.dir/src/main.cpp.o
+bin/WarpedGame: CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o
 bin/WarpedGame: CMakeFiles/WarpedGame.dir/src/parameters.cpp.o
 bin/WarpedGame: CMakeFiles/WarpedGame.dir/src/player.cpp.o
 bin/WarpedGame: CMakeFiles/WarpedGame.dir/build.make
 bin/WarpedGame: lib/libJolt.a
 bin/WarpedGame: lib/libraylib.a
 bin/WarpedGame: CMakeFiles/WarpedGame.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/Users/klo/Warped/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking CXX executable bin/WarpedGame"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/Users/klo/Warped/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Linking CXX executable bin/WarpedGame"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/WarpedGame.dir/link.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.

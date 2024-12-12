@@ -9,6 +9,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 # The set of dependency files which are needed:
 set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/Users/klo/Warped/src/main.cpp" "CMakeFiles/WarpedGame.dir/src/main.cpp.o" "gcc" "CMakeFiles/WarpedGame.dir/src/main.cpp.o.d"
+  "/Users/klo/Warped/src/map_parser.cpp" "CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o" "gcc" "CMakeFiles/WarpedGame.dir/src/map_parser.cpp.o.d"
   "/Users/klo/Warped/src/parameters.cpp" "CMakeFiles/WarpedGame.dir/src/parameters.cpp.o" "gcc" "CMakeFiles/WarpedGame.dir/src/parameters.cpp.o.d"
   "/Users/klo/Warped/src/player.cpp" "CMakeFiles/WarpedGame.dir/src/player.cpp.o" "gcc" "CMakeFiles/WarpedGame.dir/src/player.cpp.o.d"
   )
