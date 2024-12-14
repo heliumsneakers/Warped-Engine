@@ -6,9 +6,9 @@ CXX_DEFINES = -DJPH_OBJECT_STREAM
 
 CXX_INCLUDES = -I/Users/klo/Warped/src/include -I/Users/klo/Warped/lib/raygui/src -I/Users/klo/Warped/lib/JoltPhysics/Build/..
 
-CXX_FLAGSarm64 =  -Wall -Werror -g -fno-rtti -fno-exceptions -ffp-model=precise -faligned-allocation -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.1.sdk -pthread
+CXX_FLAGSarm64 =  -Wall -Werror -g -fno-rtti -fno-exceptions -ffp-model=precise -faligned-allocation -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -pthread
 
-CXX_FLAGS =  -Wall -Werror -g -fno-rtti -fno-exceptions -ffp-model=precise -faligned-allocation -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.1.sdk -pthread
+CXX_FLAGS =  -Wall -Werror -g -fno-rtti -fno-exceptions -ffp-model=precise -faligned-allocation -std=c++17 -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -pthread
 
 # PCH options: lib/JoltPhysics/Build/CMakeFiles/Jolt.dir/cmake_pch_arm64.hxx.pch_OPTIONS = -Winvalid-pch;-Xclang;-emit-pch;-Xclang;-include;-Xclang;/Users/klo/Warped/build/lib/JoltPhysics/Build/CMakeFiles/Jolt.dir/cmake_pch_arm64.hxx;-x;c++-header
 

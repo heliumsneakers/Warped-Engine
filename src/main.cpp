@@ -1,33 +1,26 @@
+// main.cpp
 #include "raylib.h"
 #include "raymath.h"
-#include "player.h"
-#include "parameters.h"
-#include <string>
+#include "rlgl.h"
 #include "map_parser.h"
+#include "parameters.h"
+#include "player.h"
+#include <stdio.h>
 
 int main() {
     // Initialize window
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Warped Engine");
+    SetTargetFPS(144);
+
     printf("WINDOW INIT\n");
 
-    // Load model (including materials)
-    const char* objPath = "../../assets/maps/test.obj";
-    Model obj = LoadModel(objPath);
-    printf("MODEL LOADED\n");
-
-
-    // Set model position
-    Vector3 modelPosition = { 0.0f, 0.0f, 0.0f };
-
-    // Initialize player
-    Player player;
-    InitPlayer(&player, (Vector3){ 20.0f, 20.0f, 20.0f }, (Vector3){ 0.0f, 1.0f, 0.0f }, (Vector3){ 0.0f, 1.0f, 0.0f }, 90.0f, CAMERA_PERSPECTIVE);
-
-    SetTargetFPS(60);
-
+    // Initialize TextureManager
     TextureManager textureManager;
     InitTextureManager(textureManager);
-    printf("Texture Manager Initialized\n");
+   
+    // Initialize player with placeholder values
+    Player player;
+    InitPlayer(&player, (Vector3){20.0f, 20.0f, 20.0f}, (Vector3){0.0f, 1.0f, 0.0f}, (Vector3){0.0f, 1.0f, 0.0f}, 90.0f, CAMERA_PERSPECTIVE);
 
     // Parse the map
     Map map = ParseMapFile("../../assets/maps/test.map");
@@ -35,6 +28,7 @@ int main() {
 
     // Extract player start positions
     std::vector<PlayerStart> playerStarts = GetPlayerStarts(map);
+
     Vector3 playerPosition = {0.0f, 0.0f, 0.0f};
     if (!playerStarts.empty()) {
         playerPosition = playerStarts[0].position;
@@ -43,40 +37,24 @@ int main() {
         printf("No player start positions found.\n");
     }
 
-    // Convert map to mesh
-    Mesh mapMesh = MapToMesh(map, textureManager);
-    printf("Map Mesh: %d vertices, %d triangles\n", mapMesh.vertexCount, mapMesh.triangleCount);
-
-    if (mapMesh.vertexCount == 0) {
-        printf("Map Mesh is empty. Exiting.\n");
-        UnloadAllTextures(textureManager);
-        CloseWindow();
-        return 1;
+    // **Update player's camera to the player start position**
+    if (!playerStarts.empty()) {
+        player.camera.position = playerPosition;
+        // Set target to th:ne model's position (origin)
+        player.camera.target = (Vector3){0.0f, 0.0f, 0.0f};
+        player.camera.up = (Vector3){0.0f, 1.0f, 0.0f};
+        printf("Player camera position set to player start position and target set to model.\n");
     }
 
-    // Load the mesh into a Raylib Model
-    Model mapModel = LoadModelFromMesh(mapMesh);
+    // Convert map to mesh and create model
+    Model mapModel = MapToMesh(map, textureManager);
     printf("Map Model Loaded: %d materials\n", mapModel.materialCount);
+    printf("Map mesh count: %d\n", mapModel.meshCount);
 
-    if (mapModel.materialCount == 0) {
-        printf("Map Model has no materials. Exiting.\n");
-        UnloadMesh(mapMesh);
-        UnloadAllTextures(textureManager);
-        CloseWindow();
-        return 1;
-    }
-
-    // Assign textures to the model's materials
-    // Since we have multiple textures, ensure each submesh has the correct material
-    // For simplicity, assuming a single material here
-    // If multiple materials are needed, consider creating multiple models
-    if (!textureManager.textures.empty()) {
-        // Assign the first loaded texture to the model's diffuse map
-        Texture2D firstTexture = textureManager.textures.begin()->second;
-        mapModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = firstTexture;
-        printf("Assigned texture to Map Model.\n");
-    }
-
+    // Debug against obj
+    Model obj = LoadModel("../../assets/maps/test.obj");
+    printf("OBJ MESH COUNT: %d\n", obj.meshCount);
+ 
     // Main game loop
     while (!WindowShouldClose()) {
         // Calculate delta time
@@ -85,33 +63,33 @@ int main() {
         // Update player
         UpdatePlayer(&player, deltaTime);
 
-        // Draw
+        // Update camera target based on yaw and pitch
+        UpdateCameraTarget(&player);
+
+        // Begin drawing
         BeginDrawing();
-            ClearBackground(DARKGRAY);
+            ClearBackground(RAYWHITE);
 
             BeginMode3D(player.camera);
-
+                // Draw a grid for reference
                 DrawGrid(100, 5.0f);
 
-                /*
-                DrawModel(obj, modelPosition, 0.2f, WHITE); 
-                DrawModelWires(obj, modelPosition, 0.2f, GREEN);
-                */
+                // Draw the map model at the origin
+                DrawModel(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
 
-                // Draw the model at the origin
-                DrawModel(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 0.2f, WHITE);
-                DrawModelWires(mapModel, (Vector3){0.0f,0.0f,0.0f}, 1.0f, RED);
-
+                // Optionally, draw model wires for better visualization
+                DrawModelWires(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, RED);
             EndMode3D();
 
+            // Draw UI elements
             DrawFPS(10, 10);
         EndDrawing();
     }
 
-    // Unload model and deinitialize
-    UnloadModel(obj);
+    // Unload resources
     UnloadModel(mapModel);
+    UnloadModel(obj);
+    UnloadAllTextures(textureManager);
     CloseWindow();
-
     return 0;
 }
