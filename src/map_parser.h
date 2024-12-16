@@ -11,20 +11,24 @@ typedef struct Vertex {
     Vector2 texcoord;
 } Vertex;
 
-typedef struct Face {
+struct Face {
+    std::vector<Vector3> vertices;
     std::string texture;
-    Vector3 textureAxes1; // [ux, uy, uz]
+    Vector3 textureAxes1;
+    Vector3 textureAxes2;
     float offsetX;
-    Vector3 textureAxes2; // [vx, vy, vz]
     float offsetY;
     float rotation;
     float scaleX;
     float scaleY;
-    int someAttribute1;
-    int someAttribute2;
-    int someAttribute3;
-    std::vector<Vector3> vertices;
-} Face;
+    Vector3 normal; // Added normal vector
+    // Add other attributes as needed
+};
+
+struct Plane {
+    Vector3 normal;
+    double d;
+};
 
 typedef struct Brush {
     std::vector<Face> faces;

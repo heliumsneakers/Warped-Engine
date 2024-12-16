@@ -910,7 +910,6 @@ CMakeFiles/WarpedGame.dir/src/main.cpp.o: /Users/klo/Warped/src/main.cpp \
   /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/16/include/stddef.h \
   /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/16/include/stdint.h \
   _deps/raylib-src/src/raylib.h \
-  _deps/raylib-src/src/raymath.h \
   _deps/raylib-src/src/rlgl.h \
   /Users/klo/Warped/src/map_parser.h \
   /Users/klo/Warped/src/parameters.h \
@@ -2165,6 +2164,8 @@ CMakeFiles/WarpedGame.dir/src/player.cpp.o: /Users/klo/Warped/src/player.cpp \
 
 /Users/klo/Warped/src/parameters.cpp:
 
+_deps/raylib-src/src/raymath.h:
+
 /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk/usr/include/unistd.h:
 
 /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk/usr/include/c++/v1/queue:
@@ -2254,8 +2255,6 @@ CMakeFiles/WarpedGame.dir/src/player.cpp.o: /Users/klo/Warped/src/player.cpp \
 /Users/klo/Warped/src/player.h:
 
 /Users/klo/Warped/src/map_parser.h:
-
-_deps/raylib-src/src/raymath.h:
 
 _deps/raylib-src/src/raylib.h:
 
