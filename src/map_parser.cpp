@@ -18,6 +18,19 @@ const double epsilon = 1e-6f;
 
 // ------------------ Helper Functions ------------------ //
 
+// Coordinate system conversion from TrenchBroom (Z-up) to Raylib (Y-up):
+// TrenchBroom: X=right, Y=forward, Z=up
+// Raylib:      X=right, Y=up, Z=forward
+// Conversion: X' = X, Y' = Z, Z' = Y
+static void ConvertZUpToYUp(Vector3 &v) {
+    float x = v.x;
+    float y = v.y;
+    float z = v.z;
+    v.x = x;  // X stays X
+    v.y = -z;  // Y = Z
+    v.z = y;  // Z = Y
+}
+
 // Trim function to remove leading and trailing whitespace
 std::string Trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
@@ -121,15 +134,13 @@ Texture2D LoadTextureByName(TextureManager& manager, const std::string& textureN
         printf("Texture '%s' already loaded.\n", textureName.c_str());
         return it->second;
     } else {
-        // Construct file path (adjust based on your assets directory structure)
         std::string filePath = "../../assets/textures/" + textureName + ".png"; // Assuming PNG format
         Texture2D tex = LoadTexture(filePath.c_str());
-        if (tex.id != 0) { // Check if texture loaded successfully
+        if (tex.id != 0) {
             manager.textures[textureName] = tex;
             printf("Successfully loaded texture: %s\n", filePath.c_str());
         } else {
             printf("Failed to load texture: %s\n", filePath.c_str());
-            // Load default texture
             std::string defaultPath = "../../assets/textures/default.png";
             tex = LoadTexture(defaultPath.c_str());
             if (tex.id != 0) {
@@ -155,7 +166,6 @@ void UnloadAllTextures(TextureManager& manager) {
 
 // ------------------ Intersection Function ------------------ //
 
-
 // Function to calculate the intersection point of three planes
 bool GetIntersection(const Plane& p1, const Plane& p2, const Plane& p3, Vector3& intersection) {
     Vector3 cross23 = Vector3CrossProduct(p2.normal, p3.normal);
@@ -166,11 +176,11 @@ bool GetIntersection(const Plane& p1, const Plane& p2, const Plane& p3, Vector3&
         return false;
     }
 
-    Vector3 term1 = Vector3Scale(cross23, -p1.d); // -d1 * (n2 × n3)
+    Vector3 term1 = Vector3Scale(cross23, -p1.d);
     Vector3 cross31 = Vector3CrossProduct(p3.normal, p1.normal);
-    Vector3 term2 = Vector3Scale(cross31, -p2.d); // -d2 * (n3 × n1)
+    Vector3 term2 = Vector3Scale(cross31, -p2.d);
     Vector3 cross12 = Vector3CrossProduct(p1.normal, p2.normal);
-    Vector3 term3 = Vector3Scale(cross12, -p3.d); // -d3 * (n1 × n2)
+    Vector3 term3 = Vector3Scale(cross12, -p3.d);
 
     Vector3 numerator = Vector3Add(Vector3Add(term1, term2), term3);
     intersection = Vector3Scale(numerator, 1.0f / denom);
@@ -187,7 +197,6 @@ Map ParseMapFile(const std::string& filename) {
     Map map;
     std::ifstream file(filename);
     if (!file.is_open()) {
-        // Handle error
         printf("Failed to open file: %s\n", filename.c_str());
         return map;
     }
@@ -211,12 +220,10 @@ Map ParseMapFile(const std::string& filename) {
 
         if (line == "{") {
             if (!inEntity) {
-                // Start of a new entity
                 currentEntity = Entity();
                 inEntity = true;
                 printf("Started parsing a new entity.\n");
             } else if (!inBrush) {
-                // Start of a new brush within the current entity
                 currentBrush = Brush();
                 inBrush = true;
                 brushCount++;
@@ -228,12 +235,12 @@ Map ParseMapFile(const std::string& filename) {
         if (line == "}") {
             if (inBrush) {
                 // End of brush
-                currentEntity.brushes.push_back(currentBrush); // Correctly add brush to entity
+                currentEntity.brushes.push_back(currentBrush);
                 inBrush = false;
                 printf("Finished parsing a brush. Total brushes: %d\n", brushCount);
             } else if (inEntity) {
                 // End of entity
-                map.entities.push_back(currentEntity); // Correctly add entity to map
+                map.entities.push_back(currentEntity);
                 inEntity = false;
                 entityCount++;
                 printf("Finished parsing an entity. Total entities: %d\n", entityCount);
@@ -303,6 +310,8 @@ Map ParseMapFile(const std::string& filename) {
                         if (coords.size() == 3) {
                             try {
                                 Vector3 vertex = { std::stof(coords[0]), std::stof(coords[1]), std::stof(coords[2]) };
+                                // Transform the vertex coordinate system
+                                ConvertZUpToYUp(vertex);
                                 face.vertices.push_back(vertex);
                             } catch (const std::invalid_argument&) {
                                 printf("Invalid vertex coordinates: %s\n", vertexStr.c_str());
@@ -342,6 +351,8 @@ Map ParseMapFile(const std::string& filename) {
                         if (axes.size() == 4) {
                             try {
                                 Vector3 axis = { std::stof(axes[0]), std::stof(axes[1]), std::stof(axes[2]) };
+                                // Transform texture axis as well
+                                ConvertZUpToYUp(axis);
                                 float offset = std::stof(axes[3]);
                                 if (i == 0) {
                                     face.textureAxes1 = axis;
@@ -382,7 +393,7 @@ Map ParseMapFile(const std::string& filename) {
                 if (!token.empty()) {
                     try {
                         face.rotation = std::stof(token);
-                    } catch (const std::invalid_argument&) {
+                    } catch (...) {
                         face.rotation = 0.0f;
                     }
                 }
@@ -391,7 +402,7 @@ Map ParseMapFile(const std::string& filename) {
                 if (!token.empty()) {
                     try {
                         face.scaleX = std::stof(token);
-                    } catch (const std::invalid_argument&) {
+                    } catch (...) {
                         face.scaleX = 1.0f;
                     }
                 }
@@ -400,20 +411,16 @@ Map ParseMapFile(const std::string& filename) {
                 if (!token.empty()) {
                     try {
                         face.scaleY = std::stof(token);
-                    } catch (const std::invalid_argument&) {
+                    } catch (...) {
                         face.scaleY = 1.0f;
                     }
                 }
 
                 printf("Parsed Face Rotation: %f, ScaleX: %f, ScaleY: %f\n", face.rotation, face.scaleX, face.scaleY);
 
-                // Calculate and assign the normal vector
-                if (face.vertices.size() >= 3) {
-                    face.normal = CalculateNormal(face.vertices[0], face.vertices[1], face.vertices[2]);
-                    printf("Calculated Face Normal: [%f, %f, %f]\n", face.normal.x, face.normal.y, face.normal.z);
-                } else {
-                    face.normal = {0.0f, 0.0f, 0.0f};
-                }
+                // Now calculate normal with already transformed vertices
+                face.normal = CalculateNormal(face.vertices[0], face.vertices[1], face.vertices[2]);
+                printf("Calculated Face Normal: [%f, %f, %f]\n", face.normal.x, face.normal.y, face.normal.z);
 
                 currentBrush.faces.push_back(face);
                 faceCount++;
@@ -439,9 +446,11 @@ std::vector<PlayerStart> GetPlayerStarts(const Map& map) {
                 if (coords.size() == 3) {
                     try {
                         Vector3 position = { std::stof(coords[0]), std::stof(coords[1]), std::stof(coords[2]) };
+                        // Transform player start position
+                        ConvertZUpToYUp(position);
                         playerStarts.push_back(PlayerStart{ position });
                         printf("Player Start Position: (%f, %f, %f)\n", position.x, position.y, position.z);
-                    } catch (const std::invalid_argument&) {
+                    } catch (...) {
                         printf("Invalid origin coordinates for player start.\n");
                     }
                 } else {
@@ -510,7 +519,7 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
                 }
             }
 
-            // For each polygon (face), process, sort and triangulate
+            // Process each polygon face
             for (int i = 0; i < numFaces; ++i) {
                 RemoveDuplicatePoints(polys[i], (float)epsilon);
 
@@ -519,10 +528,8 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
                     continue;
                 }
 
-                // Sort polygon vertices
                 SortPolygonVertices(polys[i], brush.faces[i].normal);
 
-                // Recalculate polygon normal
                 Vector3 polyNormal = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
 
                 // If polygon normal is opposite to face normal, reverse
@@ -531,13 +538,11 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
                     polyNormal = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
                 }
 
-                // Now fan triangulate
                 Vector3 v0 = polys[i][0];
                 for (size_t t = 1; t + 1 < polys[i].size(); ++t) {
                     Vector3 v1 = polys[i][t];
                     Vector3 v2 = polys[i][t + 1];
 
-                    // Load texture
                     std::string textureName = brush.faces[i].texture;
                     Texture2D texture = LoadTextureByName(textureManager, textureName);
                     if (texture.id == 0) {
@@ -551,7 +556,6 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
                         }
                     }
 
-                    // Initialize texture mesh data if not present
                     if (textureMeshesMap.find(textureName) == textureMeshesMap.end()) {
                         textureMeshesMap[textureName] = TextureMeshData();
                     }
@@ -585,7 +589,6 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
         }
     }
 
-    // Create separate meshes for each texture
     std::vector<Mesh> meshes;
     std::vector<Texture2D> textures;
 
@@ -597,7 +600,7 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
             continue;
         }
 
-        Mesh mesh = { 0 };
+        Mesh mesh = {0};
         mesh.vertexCount = (int)meshData.vertices.size();
         mesh.triangleCount = (int)(meshData.indices.size() / 3);
         mesh.vertices = (float*)malloc(sizeof(float)*mesh.vertexCount*3);
