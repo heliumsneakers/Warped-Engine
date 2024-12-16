@@ -12,12 +12,13 @@
 #include <vector>
 #include <string>
 #include <cmath> // For fabs
+#include <algorithm> // for std::sort, std::reverse
 
-const double epsilon = 1e-5f;
+const double epsilon = 1e-6f;
 
 // ------------------ Helper Functions ------------------ //
 
-// Trim function to remove leading nd trailing whitespace
+// Trim function to remove leading and trailing whitespace
 std::string Trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
     size_t end = s.find_last_not_of(" \t\r\n");
@@ -41,6 +42,67 @@ Vector3 CalculateNormal(const Vector3& v1, const Vector3& v2, const Vector3& v3)
     Vector3 edge2 = Vector3Subtract(v3, v1);
     Vector3 normal = Vector3CrossProduct(edge1, edge2);
     return Vector3Normalize(normal);
+}
+
+// Remove duplicate points from a vector of Vector3
+static void RemoveDuplicatePoints(std::vector<Vector3>& points, float eps) {
+    std::vector<Vector3> unique;
+    for (auto& p : points) {
+        bool found = false;
+        for (auto& u : unique) {
+            float dx = p.x - u.x;
+            float dy = p.y - u.y;
+            float dz = p.z - u.z;
+            float distSq = dx*dx + dy*dy + dz*dz;
+            if (distSq < eps*eps) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) unique.push_back(p);
+    }
+    points = std::move(unique);
+}
+
+// Sort polygon vertices by angle around the centroid
+static void SortPolygonVertices(std::vector<Vector3>& poly, Vector3 normal) {
+    // Compute centroid
+    Vector3 centroid = {0,0,0};
+    for (auto& p : poly) centroid = Vector3Add(centroid, p);
+    centroid = Vector3Scale(centroid, 1.0f / (float)poly.size());
+
+    // Create a local coordinate system in the plane of the polygon
+    // Choose an arbitrary vector that is not parallel to normal
+    Vector3 arbitrary = {1,0,0};
+    if (fabs(Vector3DotProduct(normal, arbitrary)) > 0.9f) {
+        arbitrary = (Vector3){0,1,0};
+    }
+
+    Vector3 U = Vector3Normalize(Vector3CrossProduct(normal, arbitrary));
+    Vector3 V = Vector3CrossProduct(normal, U);
+
+    struct AnglePoint {
+        float angle;
+        Vector3 p;
+    };
+
+    std::vector<AnglePoint> ap;
+    ap.reserve(poly.size());
+    for (auto& p : poly) {
+        Vector3 dir = Vector3Subtract(p, centroid);
+        float u = Vector3DotProduct(dir, U);
+        float v = Vector3DotProduct(dir, V);
+        float angle = atan2f(v, u);
+        ap.push_back({angle, p});
+    }
+
+    std::sort(ap.begin(), ap.end(), [](const AnglePoint& a, const AnglePoint& b){
+        return a.angle < b.angle;
+    });
+
+    for (size_t i=0; i<poly.size(); i++) {
+        poly[i] = ap[i].p;
+    }
 }
 
 // ------------------ TextureManager Functions ------------------ //
@@ -202,13 +264,10 @@ Map ParseMapFile(const std::string& filename) {
 
         if (inBrush) {
             // Parsing brush faces
-            // Detect start of a face
             if (line.find('(') != std::string::npos) {
                 // Start accumulating face tokens
                 std::string faceLine = line;
-                // Check if face is completed on the same line
                 if (line.find(')') == std::string::npos) {
-                    // Read additional lines until ')' is found
                     while (std::getline(file, line)) {
                         line = Trim(line);
                         faceLine += " " + line;
@@ -218,7 +277,6 @@ Map ParseMapFile(const std::string& filename) {
                     }
                 }
 
-                // Now, parse faceLine as a complete face
                 Face face;
                 std::istringstream iss(faceLine);
                 std::string token;
@@ -234,7 +292,6 @@ Map ParseMapFile(const std::string& filename) {
                             vertexStr = token.substr(1, closingParen - 1);
                         } else {
                             vertexStr = token.substr(1);
-                            // Read until ')' is found
                             while (iss >> token && token.find(')') == std::string::npos) {
                                 vertexStr += " " + token;
                             }
@@ -247,7 +304,7 @@ Map ParseMapFile(const std::string& filename) {
                             try {
                                 Vector3 vertex = { std::stof(coords[0]), std::stof(coords[1]), std::stof(coords[2]) };
                                 face.vertices.push_back(vertex);
-                            } catch (const std::invalid_argument& e) {
+                            } catch (const std::invalid_argument&) {
                                 printf("Invalid vertex coordinates: %s\n", vertexStr.c_str());
                                 face.vertices.clear();
                                 break;
@@ -271,7 +328,6 @@ Map ParseMapFile(const std::string& filename) {
                     iss >> token;
                     if (token.empty()) continue;
                     if (token.front() == '[') {
-                        // Collect tokens until ']' is found
                         std::string axesStr = token.substr(1);
                         if (token.find(']') == std::string::npos) {
                             while (iss >> token) {
@@ -298,9 +354,8 @@ Map ParseMapFile(const std::string& filename) {
                                     printf("Texture Axes 2: [%f, %f, %f], OffsetY: %f\n", 
                                            axis.x, axis.y, axis.z, face.offsetY);
                                 }
-                            } catch (const std::invalid_argument& e) {
-                                printf("Invalid texture axes: %s\n", axesStr.c_str());
-                                // Assign default texture axes or handle the error
+                            } catch (const std::invalid_argument&) {
+                                printf("Invalid texture axes.\n");
                                 if (i == 0) {
                                     face.textureAxes1 = { 0.0f, 0.0f, 0.0f };
                                     face.offsetX = 0.0f;
@@ -310,8 +365,7 @@ Map ParseMapFile(const std::string& filename) {
                                 }
                             }
                         } else {
-                            printf("Unexpected number of values in texture axes: %s\n", token.c_str());
-                            // Assign default texture axes or handle the error
+                            printf("Unexpected number of values in texture axes.\n");
                             if (i == 0) {
                                 face.textureAxes1 = { 0.0f, 0.0f, 0.0f };
                                 face.offsetX = 0.0f;
@@ -328,8 +382,7 @@ Map ParseMapFile(const std::string& filename) {
                 if (!token.empty()) {
                     try {
                         face.rotation = std::stof(token);
-                    } catch (const std::invalid_argument& e) {
-                        printf("Invalid rotation value: %s\n", token.c_str());
+                    } catch (const std::invalid_argument&) {
                         face.rotation = 0.0f;
                     }
                 }
@@ -338,8 +391,7 @@ Map ParseMapFile(const std::string& filename) {
                 if (!token.empty()) {
                     try {
                         face.scaleX = std::stof(token);
-                    } catch (const std::invalid_argument& e) {
-                        printf("Invalid scaleX value: %s\n", token.c_str());
+                    } catch (const std::invalid_argument&) {
                         face.scaleX = 1.0f;
                     }
                 }
@@ -348,8 +400,7 @@ Map ParseMapFile(const std::string& filename) {
                 if (!token.empty()) {
                     try {
                         face.scaleY = std::stof(token);
-                    } catch (const std::invalid_argument& e) {
-                        printf("Invalid scaleY value: %s\n", token.c_str());
+                    } catch (const std::invalid_argument&) {
                         face.scaleY = 1.0f;
                     }
                 }
@@ -361,11 +412,9 @@ Map ParseMapFile(const std::string& filename) {
                     face.normal = CalculateNormal(face.vertices[0], face.vertices[1], face.vertices[2]);
                     printf("Calculated Face Normal: [%f, %f, %f]\n", face.normal.x, face.normal.y, face.normal.z);
                 } else {
-                    printf("Cannot calculate normal for face with fewer than 3 vertices.\n");
-                    face.normal = {0.0f, 0.0f, 0.0f}; // Assign a default normal
+                    face.normal = {0.0f, 0.0f, 0.0f};
                 }
 
-                // Add face to current brush
                 currentBrush.faces.push_back(face);
                 faceCount++;
                 printf("Added face %d to brush %d.\n", faceCount, brushCount);
@@ -392,9 +441,8 @@ std::vector<PlayerStart> GetPlayerStarts(const Map& map) {
                         Vector3 position = { std::stof(coords[0]), std::stof(coords[1]), std::stof(coords[2]) };
                         playerStarts.push_back(PlayerStart{ position });
                         printf("Player Start Position: (%f, %f, %f)\n", position.x, position.y, position.z);
-                    } catch (const std::invalid_argument& e) {
+                    } catch (const std::invalid_argument&) {
                         printf("Invalid origin coordinates for player start.\n");
-                        // Handle the error as needed
                     }
                 } else {
                     printf("Unexpected number of origin coordinates: %zu\n", coords.size());
@@ -408,9 +456,8 @@ std::vector<PlayerStart> GetPlayerStarts(const Map& map) {
 }
 
 
-// Convert Map to Raylib Model with Multiple Meshes and Materials using Intersection Method
+// Convert Map to Raylib Model with Multiple Meshes and Materials
 Model MapToMesh(const Map& map, TextureManager& textureManager) {
-    // Temporary storage for meshes per texture
     struct TextureMeshData {
         std::vector<Vector3> vertices;
         std::vector<Vector3> normals;
@@ -420,28 +467,26 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
     
     std::unordered_map<std::string, TextureMeshData> textureMeshesMap;
 
-    // Iterate through all entities, brushes, and faces
     for (const auto& entity : map.entities) {
         for (const auto& brush : entity.brushes) {
-            const int numFaces = brush.faces.size();
+            int numFaces = (int)brush.faces.size();
             if (numFaces < 3) {
                 printf("Brush has fewer than 3 faces. Skipping.\n");
                 continue;
             }
 
-            // Convert brush faces to planes
             std::vector<Plane> planes;
+            planes.reserve(numFaces);
             for (const auto& face : brush.faces) {
                 Plane plane;
-                plane.normal = face.normal; // Ensure normals are normalized
+                plane.normal = face.normal; 
                 plane.d = Vector3DotProduct(face.normal, face.vertices[0]);
                 planes.push_back(plane);
             }
 
-            // Generate polygons by intersecting three planes
-            // One polygon per face
-            std::vector<std::vector<Vector3>> polys(numFaces, std::vector<Vector3>());
+            std::vector<std::vector<Vector3>> polys(numFaces);
 
+            // Find intersection points
             for (int i = 0; i < numFaces - 2; ++i) {
                 for (int j = i + 1; j < numFaces - 1; ++j) {
                     for (int k = j + 1; k < numFaces; ++k) {
@@ -449,104 +494,94 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
                         if (GetIntersection(planes[i], planes[j], planes[k], intersectionPoint)) {
                             bool isInside = true;
                             for (int m = 0; m < numFaces; ++m) {
-                                // If point is in front of any plane, it's outside the convex brush
                                 float distance = Vector3DotProduct(brush.faces[m].normal, intersectionPoint) + planes[m].d;
-                                printf("Plane %d: distance = %f\n", m, distance);
-                                if (distance > epsilon) { // Adjust epsilon as needed
+                                if (distance > epsilon) {
                                     isInside = false;
-                                    printf("DISTANCE > EPSILON\n");
                                     break;
                                 }
                             }
                             if (isInside) {
-                                printf("Adding intersection point [%f, %f, %f] to polygons %d, %d, %d.\n", 
-                                intersectionPoint.x, intersectionPoint.y, intersectionPoint.z, i, j, k);
                                 polys[i].push_back(intersectionPoint);
                                 polys[j].push_back(intersectionPoint);
                                 polys[k].push_back(intersectionPoint);
-                            }   else {
-                                printf("Intersection Point: [%f, %f, %f] is outside brush.\n", 
-                                       intersectionPoint.x, intersectionPoint.y, intersectionPoint.z);
                             }
                         }
                     }
-                } 
+                }
             }
 
-            
-    
-            // Now, for each polygon, triangulate and add to mesh
+            // For each polygon (face), process, sort and triangulate
             for (int i = 0; i < numFaces; ++i) {
+                RemoveDuplicatePoints(polys[i], (float)epsilon);
+
                 if (polys[i].size() < 3) {
-                        printf("Skipping polygon %d due to insufficient vertices (%zu).\n", i, polys[i].size());
-                        continue; // Not enough points to form a polygon
+                    printf("Skipping polygon %d due to insufficient vertices (%zu).\n", i, polys[i].size());
+                    continue;
                 }
 
-                printf("Triangulating polygon %d with %zu vertices.\n", i, polys[i].size());
+                // Sort polygon vertices
+                SortPolygonVertices(polys[i], brush.faces[i].normal);
 
-                // Use the first vertex as the fan's center
+                // Recalculate polygon normal
+                Vector3 polyNormal = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
+
+                // If polygon normal is opposite to face normal, reverse
+                if (Vector3DotProduct(polyNormal, brush.faces[i].normal) < 0.0f) {
+                    std::reverse(polys[i].begin(), polys[i].end());
+                    polyNormal = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
+                }
+
+                // Now fan triangulate
                 Vector3 v0 = polys[i][0];
-
                 for (size_t t = 1; t + 1 < polys[i].size(); ++t) {
-                        Vector3 v1 = polys[i][t];
-                        Vector3 v2 = polys[i][t + 1];
+                    Vector3 v1 = polys[i][t];
+                    Vector3 v2 = polys[i][t + 1];
 
-                        printf("Adding triangle: [%f, %f, %f] - [%f, %f, %f] - [%f, %f, %f]\n",
-                                   v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
-
-                        // Load texture
-                        std::string textureName = brush.faces[i].texture;
-                        Texture2D texture = LoadTextureByName(textureManager, textureName);
-                        if (texture.id == 0) {
-                                // Fallback to default texture
-                                auto defaultIt = textureManager.textures.find("default");
-                                if (defaultIt != textureManager.textures.end()) {
-                                                texture = defaultIt->second;
-                                                textureName = "default"; // Use default texture name
-                                                printf("Using default texture for face with missing texture '%s'.\n", brush.faces[i].texture.c_str());
-                                } else {
-                                                printf("No valid texture available for face. Skipping.\n");
-                                                continue;
-                                }
+                    // Load texture
+                    std::string textureName = brush.faces[i].texture;
+                    Texture2D texture = LoadTextureByName(textureManager, textureName);
+                    if (texture.id == 0) {
+                        auto defaultIt = textureManager.textures.find("default");
+                        if (defaultIt != textureManager.textures.end()) {
+                            texture = defaultIt->second;
+                            textureName = "default";
+                        } else {
+                            printf("No valid texture found for face.\n");
+                            continue;
                         }
+                    }
 
-                        // Initialize texture mesh data if not present
-                        if (textureMeshesMap.find(textureName) == textureMeshesMap.end()) {
-                                textureMeshesMap[textureName] = TextureMeshData();
-                                printf("Initialized TextureMeshData for texture '%s'.\n", textureName.c_str());
-                        }
+                    // Initialize texture mesh data if not present
+                    if (textureMeshesMap.find(textureName) == textureMeshesMap.end()) {
+                        textureMeshesMap[textureName] = TextureMeshData();
+                    }
 
-                        // Compute texture coordinates
-                        auto ComputeUV = [&](const Vector3& vertex) -> Vector2 {
-                                float u = Vector3DotProduct(vertex, brush.faces[i].textureAxes1) + brush.faces[i].offsetX;
-                                float v = Vector3DotProduct(vertex, brush.faces[i].textureAxes2) + brush.faces[i].offsetY;
-                                u /= static_cast<float>(texture.width);
-                                v /= static_cast<float>(texture.height);
-                                return Vector2{ u, v };
-                        };
+                    auto ComputeUV = [&](const Vector3& vertex) -> Vector2 {
+                        float u = Vector3DotProduct(vertex, brush.faces[i].textureAxes1) + brush.faces[i].offsetX;
+                        float v = Vector3DotProduct(vertex, brush.faces[i].textureAxes2) + brush.faces[i].offsetY;
+                        u /= (float)texture.width;
+                        v /= (float)texture.height;
+                        return Vector2{ u, v };
+                    };
 
-                        // Add vertices, normals, texcoords
-                        size_t baseVertexIndex = textureMeshesMap[textureName].vertices.size();
-                        textureMeshesMap[textureName].vertices.push_back(v0);
-                        textureMeshesMap[textureName].normals.push_back(brush.faces[i].normal);
-                        textureMeshesMap[textureName].texcoords.push_back(ComputeUV(v0));
+                    size_t baseVertexIndex = textureMeshesMap[textureName].vertices.size();
+                    textureMeshesMap[textureName].vertices.push_back(v0);
+                    textureMeshesMap[textureName].normals.push_back(polyNormal);
+                    textureMeshesMap[textureName].texcoords.push_back(ComputeUV(v0));
 
-                        textureMeshesMap[textureName].vertices.push_back(v1);
-                        textureMeshesMap[textureName].normals.push_back(brush.faces[i].normal);
-                        textureMeshesMap[textureName].texcoords.push_back(ComputeUV(v1));
+                    textureMeshesMap[textureName].vertices.push_back(v1);
+                    textureMeshesMap[textureName].normals.push_back(polyNormal);
+                    textureMeshesMap[textureName].texcoords.push_back(ComputeUV(v1));
 
-                        textureMeshesMap[textureName].vertices.push_back(v2);
-                        textureMeshesMap[textureName].normals.push_back(brush.faces[i].normal);
-                        textureMeshesMap[textureName].texcoords.push_back(ComputeUV(v2));
+                    textureMeshesMap[textureName].vertices.push_back(v2);
+                    textureMeshesMap[textureName].normals.push_back(polyNormal);
+                    textureMeshesMap[textureName].texcoords.push_back(ComputeUV(v2));
 
-                        // Add indices
-                        textureMeshesMap[textureName].indices.push_back(static_cast<unsigned short>(baseVertexIndex));
-                        textureMeshesMap[textureName].indices.push_back(static_cast<unsigned short>(baseVertexIndex + 1));
-                        textureMeshesMap[textureName].indices.push_back(static_cast<unsigned short>(baseVertexIndex + 2));
+                    textureMeshesMap[textureName].indices.push_back((unsigned short)baseVertexIndex);
+                    textureMeshesMap[textureName].indices.push_back((unsigned short)(baseVertexIndex + 1));
+                    textureMeshesMap[textureName].indices.push_back((unsigned short)(baseVertexIndex + 2));
                 }
             }
-
-            printf("Finished processing brush with %d faces.\n", numFaces);
         }
     }
 
@@ -554,94 +589,68 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
     std::vector<Mesh> meshes;
     std::vector<Texture2D> textures;
 
-    for (const auto& pair : textureMeshesMap) {
+    for (auto& pair : textureMeshesMap) {
         const std::string& textureName = pair.first;
         const TextureMeshData& meshData = pair.second;
 
         if (meshData.indices.empty()) {
-            printf("No indices for texture '%s'. Skipping mesh creation.\n", textureName.c_str());
             continue;
         }
 
         Mesh mesh = { 0 };
-        mesh.vertexCount = static_cast<int>(meshData.vertices.size());
-        mesh.triangleCount = static_cast<int>(meshData.indices.size() / 3);
-        mesh.vertices = (float*)malloc(sizeof(float) * mesh.vertexCount * 3);
-        mesh.normals = (float*)malloc(sizeof(float) * mesh.vertexCount * 3);
-        mesh.texcoords = (float*)malloc(sizeof(float) * mesh.vertexCount * 2);
-        mesh.indices = (unsigned short*)malloc(sizeof(unsigned short) * meshData.indices.size());
+        mesh.vertexCount = (int)meshData.vertices.size();
+        mesh.triangleCount = (int)(meshData.indices.size() / 3);
+        mesh.vertices = (float*)malloc(sizeof(float)*mesh.vertexCount*3);
+        mesh.normals = (float*)malloc(sizeof(float)*mesh.vertexCount*3);
+        mesh.texcoords = (float*)malloc(sizeof(float)*mesh.vertexCount*2);
+        mesh.indices = (unsigned short*)malloc(sizeof(unsigned short)*meshData.indices.size());
 
-        if (!mesh.vertices || !mesh.normals || !mesh.texcoords || !mesh.indices) {
-            printf("Memory allocation failed for mesh with texture '%s'.\n", textureName.c_str());
-            RL_FREE(mesh.vertices);
-            RL_FREE(mesh.normals);
-            RL_FREE(mesh.texcoords);
-            RL_FREE(mesh.indices);
-            continue;
-        }
-
-        // Populate vertex data
         for (int i = 0; i < mesh.vertexCount; ++i) {
-            mesh.vertices[i * 3 + 0] = meshData.vertices[i].x;
-            mesh.vertices[i * 3 + 1] = meshData.vertices[i].y;
-            mesh.vertices[i * 3 + 2] = meshData.vertices[i].z;
+            mesh.vertices[i*3+0] = meshData.vertices[i].x;
+            mesh.vertices[i*3+1] = meshData.vertices[i].y;
+            mesh.vertices[i*3+2] = meshData.vertices[i].z;
 
-            mesh.normals[i * 3 + 0] = meshData.normals[i].x;
-            mesh.normals[i * 3 + 1] = meshData.normals[i].y;
-            mesh.normals[i * 3 + 2] = meshData.normals[i].z;
+            mesh.normals[i*3+0] = meshData.normals[i].x;
+            mesh.normals[i*3+1] = meshData.normals[i].y;
+            mesh.normals[i*3+2] = meshData.normals[i].z;
 
-            mesh.texcoords[i * 2 + 0] = meshData.texcoords[i].x;
-            mesh.texcoords[i * 2 + 1] = meshData.texcoords[i].y;
+            mesh.texcoords[i*2+0] = meshData.texcoords[i].x;
+            mesh.texcoords[i*2+1] = meshData.texcoords[i].y;
         }
 
-        // Populate index data
-        for (size_t i = 0; i < meshData.indices.size(); ++i) {
+        for (size_t i=0; i < meshData.indices.size(); ++i) {
             mesh.indices[i] = meshData.indices[i];
         }
 
-        // Upload mesh data to GPU
-        UploadMesh(&mesh, false); // 'false' indicates the mesh isn't dynamic
-        printf("Uploaded mesh for texture '%s' to GPU.\n", textureName.c_str());
-
+        UploadMesh(&mesh, false);
         meshes.push_back(mesh);
         textures.push_back(textureManager.textures.at(textureName));
-
-        printf("Created mesh for texture '%s' with %d vertices and %d triangles.\n",
-               textureName.c_str(), mesh.vertexCount, mesh.triangleCount);
-
-        // Free the CPU-side mesh data as it's now on the GPU
-        RL_FREE(mesh.vertices);
-        RL_FREE(mesh.normals);
-        RL_FREE(mesh.texcoords);
-        RL_FREE(mesh.indices);
     }
 
-    // Create a Model with multiple meshes and materials
-    Model model = { 0 };
+    Model model = {0};
     model.transform = MatrixIdentity();
-
-    model.meshCount = static_cast<int>(meshes.size());
-    model.materialCount = static_cast<int>(textures.size());
+    model.meshCount = (int)meshes.size();
+    model.materialCount = (int)textures.size();
 
     if (model.meshCount > 0 && model.materialCount > 0) {
-        model.meshes = (Mesh*)malloc(sizeof(Mesh) * model.meshCount);
-        model.materials = (Material*)malloc(sizeof(Material) * model.materialCount);
-        model.meshMaterial = (int*)malloc(sizeof(int) * model.meshCount);
+        model.meshes = (Mesh*)malloc(sizeof(Mesh)*model.meshCount);
+        model.materials = (Material*)malloc(sizeof(Material)*model.materialCount);
+        model.meshMaterial = (int*)malloc(sizeof(int)*model.meshCount);
 
         for (int i = 0; i < model.meshCount; ++i) {
             model.meshes[i] = meshes[i];
-            model.meshMaterial[i] = i; // Assign each mesh to its corresponding material
+            model.meshMaterial[i] = i;
         }
 
         for (int i = 0; i < model.materialCount; ++i) {
-            model.materials[i] = LoadMaterialDefault(); // Initialize with default material
+            model.materials[i] = LoadMaterialDefault();
             model.materials[i].maps[MATERIAL_MAP_DIFFUSE].texture = textures[i];
         }
 
         printf("Model created with %d meshes and %d materials.\n", model.meshCount, model.materialCount);
     } else {
         printf("No meshes or textures available to create the model.\n");
-    } 
+    }
+
     return model;
 }
-
