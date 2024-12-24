@@ -10,6 +10,7 @@
 *.exe
 
 /assets/
+/build/
 /.cache/
 
 # Ignore IDE/editor configurations
