@@ -7,11 +7,11 @@ https://heliumsneakers.itch.io/mini-quake-demo
 
 The original project was compiled with emscripten for web, but I've reverted to local builds to accommodate the physics library, the web build version of this project is split into a separate project folder locally. I plan on uploading it in the future.
 
- The engine is structured around *3 libraries, and 1 external map editor.
+ The engine is structured around **3 libraries, and 1 external map editor**.
 - **Raylib**: Graphics library used for rendering and mathematics.
-- *RayGui*: GUI library used for the user interface, and in game hot reloading of changes.
-- *Jolt Physics*: The physics library used in the project for collisions and physics interactions, as well as the physics server.
-- *Trench Broom*: Quake map editor for creating convex geometry (maps) and entities. The format used in this project is Valve 220.
+- **RayGui**: GUI library used for the user interface, and in game hot reloading of changes.
+- **Jolt Physics**: The physics library used in the project for collisions and physics interactions, as well as the physics server.
+- **Trench Broom**: Quake map editor for creating convex geometry (maps) and entities. The format used in this project is Valve 220.
 
 The engine specifies entity definitions, and configurations in a .fgd file (Forge Game Data), and has the data parsed in engine for runtime assembly of the geometry and entities.
 
