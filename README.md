@@ -40,6 +40,8 @@ git submodule update
 **NOTE: Before building the project ensure that Jolt and Raylib are built:**
 ```
 https://github.com/jrouwe/JoltPhysics
+```
+```
 https://github.com/raysan5/raylib
 ```
 3. Build
