@@ -1,0 +1,115 @@
+// Warped.fgd
+// Author: [Kaue Oliveira]
+// Date: [10/12/2024]
+
+// Base Classes
+
+@BaseClass = Target : "Performs actions on entities with a matching 'targetname'." [
+    target(string) : "Name of entity (targetname) to target." : ""
+]
+
+@BaseClass = Targetname : "Receives actions performed by entities with a matching 'target'." [
+    targetname(string) : "Name of the entity." : ""
+]
+
+@BaseClass = Angles : "Defines the orientation of an entity." [
+    angles(angle) : "Orientation (Pitch Yaw Roll)" : "0 0 0"
+]
+
+@BaseClass = Origin : "Defines the origin (position) of an entity." [
+    origin(origin) : "Origin (position) of the entity." : "0 0 0"
+]
+
+@BaseClass = RenderFx : "Defines rendering effects." [
+    renderamt(integer) : "Render Amount" : 255 : "Amount of rendering applied to the entity."
+    rendermode(choices) : "Render Mode" : 0 =
+    [
+        0 : "Normal"
+        1 : "Color"
+        2 : "Texture"
+        3 : "Glow"
+        4 : "Solid"
+        5 : "Additive"
+    ]
+]
+
+// Entity Definitions
+
+// Worldspawn Entity
+@SolidClass base(Origin) = worldspawn : "World Entity" [
+    // Map properties
+    skyname(string) : "Sky Texture" : "" : "Name of the sky texture to use."
+    sounds(integer) : "CD Track" : 0 : "CD track to play as background music."
+    message(string) : "Message" : "" : "Text message to display when the level starts."
+    _ambient(color255) : "Ambient Light" : "0 0 0" : "Ambient light color."
+    _color(color255) : "Sky Color" : "0 0 0" : "Color of the sky."
+    _fog(color255) : "Fog Color" : "0 0 0" : "Fog color."
+    _fogdensity(float) : "Fog Density" : 0 : "Density of the fog."
+]
+
+// Player Spawn Entity
+@PointClass base(Targetname, Origin, Angles) size(-16 -16 -36, 16 16 36) color(0 255 0) = info_player_start : "Player Spawn Point" [
+    // No additional properties
+]
+
+// Player Spawn Entity
+@PointClass base(Targetname, Origin, Angles) size(-16 -16 -36, 16 16 36) color(0 255 0) = info_obj_spawn : "Objective Spawn Point" [
+    // No additional properties
+]
+
+// Light Entity
+@PointClass base(Targetname, Origin, Angles) size(-8 -8 -8, 8 8 8) color(255 255 128) = light : "Light Entity" [
+    _light(color255) : "Light Color" : "255 255 255" : "Color of the light in RGB (0-255)."
+    light(integer) : "Brightness" : 300 : "Intensity of the light."
+    delay(choices) : "Attenuation" =
+    [
+        0 : "Linear falloff (Default)"
+        1 : "Inverse distance falloff"
+        2 : "Inverse distance squared"
+        3 : "No falloff"
+        4 : "Local minlight"
+        5 : "Inverse distance squared B"
+    ]
+    wait(integer) : "Fade distance multiplier" : 1 : "Multiplier for fade distance."
+    angles(angle) : "Spotlight Direction" : "0 0 0" : "Direction of the light."
+]
+
+// Trigger Once
+@SolidClass base(Targetname, Target) size(-8 -8 -8, 8 8 8) color(0 255 255) = trigger_once : "Trigger Once" [
+    spawnflags(flags) =
+    [
+        1 : "Start Disabled" : 0
+    ]
+]
+
+// Trigger Multiple
+@SolidClass base(Targetname, Target) size(-8 -8 -8, 8 8 8) color(0 255 255) = trigger_multiple : "Trigger Multiple" [
+    wait(float) : "Wait Time" : 1 : "Time before the trigger can be activated again."
+    spawnflags(flags) =
+    [
+        1 : "Start Disabled" : 0
+        2 : "Repeatable" : 1
+    ]
+]
+
+// Func Detail
+@SolidClass base(Targetname) size(-8 -8 -8, 8 8 8) color(128 128 128) = func_detail : "Detail Brush" [
+    // No additional properties
+]
+
+// Clip Brush
+@SolidClass base(Targetname) size(-8 -8 -8, 8 8 8) color(255 0 255) = func_clip : "Clip Brush" [
+    // No additional properties
+]
+
+// Skip Brush
+@SolidClass base(Targetname) size(-8 -8 -8, 8 8 8) color(255 128 0) = func_skip : "Skip Brush" [
+    // No additional properties
+]
+
+// Physics Brush
+@SolidClass base(Targetname) size(-8 -8 -8, 8 8 8) color(128 128 255) = func_physics : "Physics Brush" [
+    mass(float) : "Mass" : 1 : "Mass of the physics object."
+    velocity(string) : "Initial Velocity" : "0 0 0" : "Initial velocity of the object."
+]
+

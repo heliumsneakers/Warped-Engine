@@ -21,8 +21,7 @@ struct Face {
     float rotation;
     float scaleX;
     float scaleY;
-    Vector3 normal; // Added normal vector
-    // Add other attributes as needed
+    Vector3 normal;
 };
 
 struct Plane {
@@ -51,7 +50,6 @@ typedef struct TextureManager {
     std::unordered_map<std::string, Texture2D> textures;
 } TextureManager;
 
-// Function declarations
 void InitTextureManager(TextureManager& manager);
 void UnloadAllTextures(TextureManager& manager);
 Map ParseMapFile(const std::string& filePath);

@@ -17,7 +17,7 @@ int main() {
     TextureManager textureManager;
     InitTextureManager(textureManager);
    
-    // Initialize player with placeholder values
+    // Initialize player 
     Player player;
     InitPlayer(&player, (Vector3){20.0f, 20.0f, 20.0f}, (Vector3){0.0f, 1.0f, 0.0f}, (Vector3){0.0f, 1.0f, 0.0f}, 90.0f, CAMERA_PERSPECTIVE);
 
@@ -36,10 +36,8 @@ int main() {
         printf("No player start positions found.\n");
     }
 
-    // **Update player's camera to the player start position**
     if (!playerStarts.empty()) {
         player.camera.position = playerPosition;
-        // Set target to th:ne model's position (origin)
         player.camera.target = (Vector3){0.0f, 0.0f, 0.0f};
         player.camera.up = (Vector3){0.0f, 1.0f, 0.0f};
         printf("Player camera position set to player start position and target set to model.\n");
@@ -56,13 +54,10 @@ int main() {
  
     // Main game loop
     while (!WindowShouldClose()) {
-        // Calculate delta time
         float deltaTime = GetFrameTime();
 
-        // Update player
         UpdatePlayer(&player, deltaTime);
 
-        // Update camera target based on yaw and pitch
         UpdateCameraTarget(&player);
 
         // Begin drawing
@@ -70,17 +65,15 @@ int main() {
             ClearBackground(RAYWHITE);
 
             BeginMode3D(player.camera);
-                // Draw a grid for reference
+
                 DrawGrid(100, 5.0f);
 
-                // Draw the map model at the origin
                 DrawModel(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
 
-                // Optionally, draw model wires for better visualization
                 DrawModelWires(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, RED);
+
             EndMode3D();
 
-            // Draw UI elements
             DrawFPS(10, 10);
         EndDrawing();
     }
