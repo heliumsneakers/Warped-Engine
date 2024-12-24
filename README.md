@@ -15,7 +15,7 @@ The original project was compiled with emscripten for web, but I've reverted to 
 
 The engine specifies entity definitions, and configurations in a .fgd file (Forge Game Data), and has the data parsed in engine for runtime assembly of the geometry and entities.
 
-I'd like to thank **Stefan Hajnoczi** for his work in the 2001 paper ".MAP files, file format description, algorithms, and code" Which can be found here:
+I'd like to thank **Stefan Hajnoczi** for his work in the 2001 paper ".MAP files, file format description, algorithms, and code" which can be found here:
 
  https://github.com/stefanha/map-files/blob/master/MAPFiles.pdf
 
