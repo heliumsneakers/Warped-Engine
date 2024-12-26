@@ -52,8 +52,8 @@
     // No additional properties
 ]
 
-// Player Spawn Entity
-@PointClass base(Targetname, Origin, Angles) size(-16 -16 -36, 16 16 36) color(0 255 0) = info_obj_spawn : "Objective Spawn Point" [
+// Object Spawn Entity
+@PointClass base(Targetname, Origin, Angles) size(-16 -16 -36, 16 16 36) color(0 255 0) = info_obj_spawn : "Object Spawn Point" [
     // No additional properties
 ]
 
@@ -112,4 +112,3 @@
     mass(float) : "Mass" : 1 : "Mass of the physics object."
     velocity(string) : "Initial Velocity" : "0 0 0" : "Initial velocity of the object."
 ]
-
