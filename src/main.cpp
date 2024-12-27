@@ -70,7 +70,7 @@ int main() {
 
                 DrawModel(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
 
-                DrawModelWires(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, RED);
+                DrawModelWires(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, GREEN);
 
             EndMode3D();
 

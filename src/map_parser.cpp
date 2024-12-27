@@ -14,7 +14,13 @@
 #include <cmath> 
 #include <algorithm> 
 
-const double epsilon = 1e-6f; // NOTE: Adjust if needed, test many curves in a detailed arch to see if we can handle such structures.
+
+/*
+ * NOTE: Adjust if needed, test many curves in a detailed arch to see if we can handle such structures.
+ * UPDATE: Increased from 1e-6 to 1e-4. There was an issue when sloped surfaces were on the -x / -y coords
+ *          in trenchbroom, keep an eye on this when testing larger scale levels.
+*/
+const double epsilon = 1e-4f; 
 
 // ------------------ Helper Functions ------------------ //
 
@@ -551,13 +557,33 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
                     if (textureMeshesMap.find(textureName) == textureMeshesMap.end()) {
                         textureMeshesMap[textureName] = TextureMeshData();
                     }
+                    // NOTE: issue when clamping || repeating texture coordinates, attempting a modulo fix?
+                   auto ComputeUV = [&](const Vector3& vertex) -> Vector2 {
+                        // 1) Dot with the face axes
+                        float sx = Vector3DotProduct(vertex, brush.faces[i].textureAxes1);
+                        float sy = Vector3DotProduct(vertex, brush.faces[i].textureAxes2);
 
-                    auto ComputeUV = [&](const Vector3& vertex) -> Vector2 {
-                        float u = Vector3DotProduct(vertex, brush.faces[i].textureAxes1) + brush.faces[i].offsetX;
-                        float v = Vector3DotProduct(vertex, brush.faces[i].textureAxes2) + brush.faces[i].offsetY;
-                        u /= (float)texture.width;
-                        v /= (float)texture.height;
-                        return Vector2{ u, v };
+                        // 2) Scale
+                        sx *= brush.faces[i].scaleX;
+                        sy *= brush.faces[i].scaleY;
+
+                        // 3) Rotate by face.rotation
+                        float rad = brush.faces[i].rotation * DEG2RAD;
+                        float cosr = cosf(rad);
+                        float sinr = sinf(rad);
+
+                        float sxRot = sx * cosr - sy * sinr;
+                        float syRot = sx * sinr + sy * cosr;
+
+                        // 4) Offsets (the "offsetX" and "offsetY" from the Valve 220 line)
+                        sxRot += brush.faces[i].offsetX;
+                        syRot += brush.faces[i].offsetY;
+
+                        // 5) Normalize to [0..1] if you want repeated tiling
+                        sxRot /= (float)texture.width;
+                        syRot /= (float)texture.height;
+
+                        return Vector2{ sxRot, syRot };
                     };
 
                     size_t baseVertexIndex = textureMeshesMap[textureName].vertices.size();
