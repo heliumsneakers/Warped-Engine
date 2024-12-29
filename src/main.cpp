@@ -17,6 +17,11 @@ int main() {
     TextureManager textureManager;
     InitTextureManager(textureManager);
    
+    // Culling Specification
+    rlSetClipPlanes(0.01, 5000.0);
+    printf("Near Cull dist: %f\n", rlGetCullDistanceNear());
+    printf("Far Cull dist: %f \n", rlGetCullDistanceFar());
+   
     // Initialize player 
     Player player;
     InitPlayer(&player, (Vector3){20.0f, 20.0f, 20.0f}, (Vector3){0.0f, 1.0f, 0.0f}, (Vector3){0.0f, 1.0f, 0.0f}, 90.0f, CAMERA_PERSPECTIVE);

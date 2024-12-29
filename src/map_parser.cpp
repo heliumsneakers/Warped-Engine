@@ -557,17 +557,18 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
                     if (textureMeshesMap.find(textureName) == textureMeshesMap.end()) {
                         textureMeshesMap[textureName] = TextureMeshData();
                     }
-                    // NOTE: issue when clamping || repeating texture coordinates, attempting a modulo fix?
+
+                    // All important texture handling based on face-line data happens here.
                    auto ComputeUV = [&](const Vector3& vertex) -> Vector2 {
-                        // 1) Dot with the face axes
+
                         float sx = Vector3DotProduct(vertex, brush.faces[i].textureAxes1);
                         float sy = Vector3DotProduct(vertex, brush.faces[i].textureAxes2);
+                        
+                        // TODO: Division is slow and expensive. Try implementing some sort of math wizardry in place of division.
+                        sx /= brush.faces[i].scaleX;
+                        sy /= brush.faces[i].scaleY;
 
-                        // 2) Scale
-                        sx *= brush.faces[i].scaleX;
-                        sy *= brush.faces[i].scaleY;
-
-                        // 3) Rotate by face.rotation
+                        // Align textures for rotated faces
                         float rad = brush.faces[i].rotation * DEG2RAD;
                         float cosr = cosf(rad);
                         float sinr = sinf(rad);
@@ -575,13 +576,12 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
                         float sxRot = sx * cosr - sy * sinr;
                         float syRot = sx * sinr + sy * cosr;
 
-                        // 4) Offsets (the "offsetX" and "offsetY" from the Valve 220 line)
                         sxRot += brush.faces[i].offsetX;
                         syRot += brush.faces[i].offsetY;
 
-                        // 5) Normalize to [0..1] if you want repeated tiling
+                        // NOTE: (IF TILING) Normalize to [0..1] for repeated tiling? || Use Raylibs built-in texture repeat? 
                         sxRot /= (float)texture.width;
-                        syRot /= (float)texture.height;
+                        syRot /= (float)texture.height ;
 
                         return Vector2{ sxRot, syRot };
                     };
