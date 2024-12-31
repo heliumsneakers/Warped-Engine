@@ -31,9 +31,9 @@ static void ConvertAxisZY(Vector3 &v) {
     float x = v.x;
     float y = v.y;
     float z = v.z;
-    v.x = x;  // X stays X
-    v.y = z;  // Y = Z
-    v.z = y;  // Z = Y
+
+    v.y = z;
+    v.z = y;
 }
 
 // Trim function to remove leading and trailing whitespace
@@ -414,6 +414,20 @@ Map ParseMapFile(const std::string& filename) {
                     }
                 }
 
+                /*
+                if (face.scaleX < 0.0f) {
+                    face.textureAxes1 = Vector3Negate(face.textureAxes1);
+                    face.scaleX = -face.scaleX;
+                    face.offsetX = -face.offsetX;
+                    printf("\nNEGATIVE SCALE.X\n");
+                }
+                if (face.scaleY < 0.0f) {
+                    face.textureAxes2 = Vector3Negate(face.textureAxes2);
+                    face.scaleY = -face.scaleY;
+                    face.offsetY = -face.offsetY;
+                    printf("\nNEGATIVE SCALE.Y\n");
+                } */
+
                 printf("Parsed Face Rotation: %f, ScaleX: %f, ScaleY: %f\n", face.rotation, face.scaleX, face.scaleY);
 
                 // calculate normal with already transformed vertices
@@ -581,7 +595,10 @@ Model MapToMesh(const Map& map, TextureManager& textureManager) {
 
                         // NOTE: (IF TILING) Normalize to [0..1] for repeated tiling? || Use Raylibs built-in texture repeat? 
                         sxRot /= (float)texture.width;
-                        syRot /= (float)texture.height ;
+                        syRot /= (float)texture.height;
+
+                        // Flip X-axis for coordinate system conversion.
+                        sxRot = 1.0f - sxRot; 
 
                         return Vector2{ sxRot, syRot };
                     };
