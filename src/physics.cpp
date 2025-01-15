@@ -13,6 +13,10 @@
  *        for collision detection. This is heavily inspired by Quake's collision system
  *        which has stood the test of time.
  *
+ *        NOTE: See "Real-Time Collision Detection by Christer Ericson" page 400, Ch. 9.5.1.
+ *              This chapter reviews many convex collision detection algorithms, the section
+ *              specified defines the Gilbert-Johnson-Keerthi algorithm (GJK).
+ *
  *      - Other brush entites like triggers, physics objects, etc.. will need to be handled
  *        differently. Potentially in a similar way to world brushes but there isn't much
  *        documentation or examples on convex collisions specific to the use case I intend
