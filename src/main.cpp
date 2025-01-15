@@ -9,7 +9,7 @@
 int main() {
     // Initialize window
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Warped Engine");
-    SetTargetFPS(144);
+    SetTargetFPS(FPS_MAX);
 
     printf("WINDOW INIT\n");
 
@@ -42,7 +42,12 @@ int main() {
     }
 
     if (!playerStarts.empty()) {
-        player.camera.position = playerPosition;
+        player.camera.position = (Vector3){
+            playerPosition.x,
+            playerPosition.y + eyeOffset,
+            playerPosition.z
+        };
+        printf("\n\nplayer cam pos y = %f\n\n", player.camera.position.y);
         player.camera.target = (Vector3){0.0f, 0.0f, 0.0f};
         player.camera.up = (Vector3){0.0f, 1.0f, 0.0f};
         printf("Player camera position set to player start position and target set to model.\n");
@@ -52,6 +57,7 @@ int main() {
     Model mapModel = MapToMesh(map, textureManager);
     printf("Map Model Loaded: %d materials\n", mapModel.materialCount);
     printf("Map mesh count: %d\n", mapModel.meshCount);
+ 
 
     // Debug against obj
     Model obj = LoadModel("../../assets/maps/test.obj");
@@ -75,7 +81,9 @@ int main() {
 
                 DrawModel(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
 
-                DrawModelWires(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, GREEN);
+                DebugDrawPlayerAABB(&player);
+
+                //DrawModelWires(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, GREEN);
 
             EndMode3D();
 

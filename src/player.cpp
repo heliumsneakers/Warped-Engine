@@ -5,10 +5,27 @@
 #include "raymath.h"
 #include "parameters.h"
 
+// Jolt Specific
+#include "Jolt/Jolt.h"
+#include "Jolt/Physics/Body/Body.h"
+#include "Jolt/Geometry/ConvexSupport.h"
+#include "Jolt/Physics/Collision/Shape/ConvexShape.h"
+
+// NOTE: Thinking about writing the player collision here directly, could be too messy though
+//       considering that all of the quake style movement code will go here as well. 
+//       See to adding the collision code back into physics.cpp and just calling it here.
+
 #define MOUSE_SENSITIVITY 0.5f
+bool cursorEnabled;
+
+float eyeOffset = 16.0f;
 
 void InitPlayer(Player *player, Vector3 position, Vector3 target, Vector3 up, float fovy, int projection) {
-    player->camera.position = position;
+    player->camera.position = (Vector3){
+        position.x,
+        position.y + eyeOffset,
+        position.z
+    };
     player->camera.target = target;
     player->camera.up = up;
     player->camera.fovy = fovy;
@@ -21,8 +38,12 @@ void InitPlayer(Player *player, Vector3 position, Vector3 target, Vector3 up, fl
     player->yaw = atan2f(direction.z, direction.x) * RAD2DEG;
     player->pitch = asinf(direction.y) * RAD2DEG;
 
+    player->center = position;
+    player->halfExt = (Vector3){16,28,16}; 
+
     SetMousePosition(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
     DisableCursor();
+    cursorEnabled = false;
 }
 
 void UpdatePlayer(Player *player, float deltaTime) {
@@ -38,7 +59,7 @@ void UpdatePlayer(Player *player, float deltaTime) {
     if (player->pitch > 89.0f) player->pitch = 89.0f;
     if (player->pitch < -89.0f) player->pitch = -89.0f;
 
-    UpdateCameraTarget(player);
+    UpdateCameraTarget(player);  
 
     // ------ Keyboard ------
     Vector3 direction = {0.0f, 0.0f, 0.0f};
@@ -64,10 +85,22 @@ void UpdatePlayer(Player *player, float deltaTime) {
     if (IsKeyDown(KEY_LEFT_SHIFT)) {
         direction = Vector3Subtract(direction, Vector3Scale(player->camera.up, player->speed * deltaTime));
     }
-
+    if (IsKeyPressed(KEY_M) && cursorEnabled == false) {
+        EnableCursor();
+        cursorEnabled = true;
+    } else if (IsKeyPressed(KEY_M) && cursorEnabled == true){
+        DisableCursor();
+        cursorEnabled = false;
+    }
+    
     // Apply movement
     player->camera.position = Vector3Add(player->camera.position, direction);
     player->camera.target = Vector3Add(player->camera.target, direction);
+    player->center = (Vector3) {
+        player->camera.position.x,
+        player->camera.position.y - eyeOffset,
+        player->camera.position.z
+    };
 }
 
 void UpdateCameraTarget(Player *player) {
@@ -83,3 +116,24 @@ void UpdateCameraTarget(Player *player) {
 
     player->camera.target = Vector3Add(player->camera.position, direction);
 }
+
+void DebugDrawPlayerAABB(Player *player) {
+     Vector3 minPt = {
+        player->center.x - player->halfExt.x,
+        player->center.y - player->halfExt.y,
+        player->center.z - player->halfExt.z
+    };
+    Vector3 maxPt = {
+        player->center.x + player->halfExt.x,
+        player->center.y + player->halfExt.y,
+        player->center.z + player->halfExt.z
+    };
+
+    DrawCubeWires(
+        Vector3Scale(Vector3Add(minPt, maxPt), 0.5f), 
+        (maxPt.x - minPt.x),
+        (maxPt.y - minPt.y),
+        (maxPt.z - minPt.z),
+        RED
+    );
+} 

@@ -19,7 +19,7 @@
  * Epsilon used in intersection tests and duplicate checks.
  * Adjust if needed for large or extremely small geometry.
  */
-static const double epsilon = 1e-4;
+static const double epsilon = 1e-3f;
 
 /* 
 ------------------------------------------------------------
@@ -407,8 +407,8 @@ std::vector<PlayerStart> GetPlayerStarts(const Map &map) {
                     try {
                         Vector3 pos = {
                             std::stof(coords[0]),
-                            std::stof(coords[1]),
-                            std::stof(coords[2])
+                            std::stof(coords[2]),
+                            std::stof(coords[1])
                         }; 
                         PlayerStart ps;
                         ps.position = pos; 
@@ -551,11 +551,11 @@ Model MapToMesh(const Map &map, TextureManager &textureManager) {
 
                         // Rotation
                         float rad = rotDeg * DEG2RAD;
-                        float c   = cosf(rad);
-                        float s   = sinf(rad);
+                        float cosr   = cosf(rad);
+                        float sinr   = sinf(rad);
 
-                        float sxRot = sx*c - sy*s;
-                        float syRot = sx*s + sy*c;
+                        float sxRot = sx * cosr - sy * sinr;
+                        float syRot = sx * sinr + sy * cosr;
 
                         // Offset
                         // NOTE: Negated for axis conversion.
@@ -630,7 +630,7 @@ Model MapToMesh(const Map &map, TextureManager &textureManager) {
         }
 
         // Upload to GPU
-        UploadMesh(&mesh, false); 
+        UploadMesh(&mesh, false);
         meshes.push_back(mesh);
 
         // Grab the texture
