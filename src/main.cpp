@@ -1,10 +1,13 @@
 // main.cpp
 #include "raylib.h"
 #include "rlgl.h"
+#include <stdio.h>
+#include <vector>
+#include "physx/collision_data.h"
+#include "physx/physics.h"
 #include "utils/map_parser.h"
 #include "utils/parameters.h"
 #include "player/player.h"
-#include <stdio.h>
 
 int main() {
     // Initialize window
@@ -57,12 +60,10 @@ int main() {
     Model mapModel = MapToMesh(map, textureManager);
     printf("Map Model Loaded: %d materials\n", mapModel.materialCount);
     printf("Map mesh count: %d\n", mapModel.meshCount);
- 
+    
+    std::vector<MeshCollisionData> collisionData = ExtractCollisionData(mapModel);
+    BuildMapPhysics(collisionData, physicsInterface); // TODO: Implement the physics system.
 
-    // Debug against obj
-    Model obj = LoadModel("../../assets/maps/test.obj");
-    printf("OBJ MESH COUNT: %d\n", obj.meshCount);
- 
     // Main game loop
     while (!WindowShouldClose()) {
         float deltaTime = GetFrameTime();
@@ -93,7 +94,6 @@ int main() {
 
     // Unload resources
     UnloadModel(mapModel);
-    UnloadModel(obj);
     UnloadAllTextures(textureManager);
     CloseWindow();
     return 0;
