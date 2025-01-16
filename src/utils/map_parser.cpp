@@ -668,8 +668,7 @@ Model MapToMesh(const Map &map, TextureManager &textureManager) {
             model.materials[i] = LoadMaterialDefault();
             model.materials[i].maps[MATERIAL_MAP_DIFFUSE].texture = textures[i];
         }
-        printf("Model created with %d meshes, %d materials.\n",
-               model.meshCount, model.materialCount);
+        printf("Model created with %d meshes, %d materials.\n", model.meshCount, model.materialCount);
     }
     else {
         printf("No valid geometry found.\n");

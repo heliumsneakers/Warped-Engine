@@ -13,7 +13,7 @@
  *        for collision detection. This is heavily inspired by Quake's collision system
  *        which has stood the test of time.
  *
- *        NOTE: See "Real-Time Collision Detection by Christer Ericson" page 400, Ch. 9.5.1.
+ *        NOTE: See "Real-Time Collision Detection by Christer Ericson" page 400, Ch. 9.5.
  *              This chapter reviews many convex collision detection algorithms, the section
  *              specified defines the Gilbert-Johnson-Keerthi algorithm (GJK).
  *

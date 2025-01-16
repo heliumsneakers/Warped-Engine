@@ -1,9 +1,9 @@
 // main.cpp
 #include "raylib.h"
 #include "rlgl.h"
-#include "map_parser.h"
-#include "parameters.h"
-#include "player.h"
+#include "utils/map_parser.h"
+#include "utils/parameters.h"
+#include "player/player.h"
 #include <stdio.h>
 
 int main() {

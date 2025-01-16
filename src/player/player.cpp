@@ -3,7 +3,7 @@
 #include "player.h"
 #include "raylib.h"
 #include "raymath.h"
-#include "parameters.h"
+#include "utils/parameters.h"
 
 // Jolt Specific
 #include "Jolt/Jolt.h"
