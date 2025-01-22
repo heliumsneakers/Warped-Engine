@@ -9,6 +9,11 @@
 #include "utils/parameters.h"
 #include "player/player.h"
 
+#include "Jolt/Jolt.h"
+#include "Jolt/Physics/Body/BodyInterface.h"
+
+
+
 int main() {
     // Initialize window
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Warped Engine");
@@ -60,13 +65,33 @@ int main() {
     Model mapModel = MapToMesh(map, textureManager);
     printf("Map Model Loaded: %d materials\n", mapModel.materialCount);
     printf("Map mesh count: %d\n", mapModel.meshCount);
-    
+
+
+    // Initialize physics here and generate collision hulls.
+
+    InitPhysicsSystem();
+
+    JPH::BodyInterface *bodyInterface = &GetBodyInterface();
+
+    printf("\n\n EXTRACTING COLLISION DATA");
     std::vector<MeshCollisionData> collisionData = ExtractCollisionData(mapModel);
-    BuildMapPhysics(collisionData, physicsInterface); // TODO: Implement the physics system.
+    printf("\n\n COLLISION DATA EXTRACTED SUCCESFULLY");
+
+    //printf("\n\n BUILDING MAP PHYSICS");
+    BuildMapPhysics(collisionData, bodyInterface);
+
+    // TODO: Assign the players physics and add functionality to UpdatePlayer() to update with the physics tick.
+
+    float deltaTime = 1.0f/60.0f;
+
+    SpawnDebugPhysObj(bodyInterface);
+    
+    //SpawnMinimalTest(*bodyInterface);
 
     // Main game loop
     while (!WindowShouldClose()) {
-        float deltaTime = GetFrameTime();
+         
+        UpdatePhysicsSystem(deltaTime, bodyInterface);
 
         UpdatePlayer(&player, deltaTime);
 
@@ -82,6 +107,12 @@ int main() {
 
                 DrawModel(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
 
+                if (bodyInterface->IsActive(debugSphereID)) {
+                    JPH::RVec3 pos = bodyInterface->GetCenterOfMassPosition(debugSphereID);
+                        Vector3 spherePos = {(float)pos.GetX(), (float)pos.GetY(), (float)pos.GetZ()};
+                    DrawSphere(spherePos, 10.0f, RED);
+                }
+
                 DebugDrawPlayerAABB(&player);
 
                 //DrawModelWires(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, GREEN);
@@ -93,6 +124,7 @@ int main() {
     }
 
     // Unload resources
+    ShutdownPhysicsSystem();
     UnloadModel(mapModel);
     UnloadAllTextures(textureManager);
     CloseWindow();

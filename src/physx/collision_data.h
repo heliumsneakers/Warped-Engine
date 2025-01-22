@@ -9,4 +9,4 @@ struct MeshCollisionData {
     std::vector<Vector3> vertices;
 };
 
-std::vector<MeshCollisionData> ExtractCollisionData(const Model &model);
+std::vector<MeshCollisionData> ExtractCollisionData(Model &model);

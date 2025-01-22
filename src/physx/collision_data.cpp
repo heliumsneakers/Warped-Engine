@@ -1,7 +1,7 @@
 #include "collision_data.h"
 #include <vector>
 
-std::vector<MeshCollisionData> ExtractCollisionData(const Model &model) {
+std::vector<MeshCollisionData> ExtractCollisionData(Model &model) {
     std::vector<MeshCollisionData> result;
     result.reserve(model.meshCount);
 
