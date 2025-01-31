@@ -71,10 +71,12 @@ int main() {
 
     InitPhysicsSystem();
 
+    InitJoltCharacter(&player, s_physics_system);
+
     JPH::BodyInterface *bodyInterface = &GetBodyInterface();
 
     printf("\n\n EXTRACTING COLLISION DATA");
-    std::vector<MeshCollisionData> collisionData = ExtractCollisionData(mapModel);
+    std::vector<MeshCollisionData> collisionData = ExtractCollisionData(map);
     printf("\n\n COLLISION DATA EXTRACTED SUCCESFULLY");
 
     //printf("\n\n BUILDING MAP PHYSICS");
@@ -93,10 +95,10 @@ int main() {
          
         UpdatePhysicsSystem(deltaTime, bodyInterface);
 
-        UpdatePlayer(&player, deltaTime);
+        UpdatePlayer(&player, s_physics_system, deltaTime);
 
         UpdateCameraTarget(&player);
-
+    
         // Begin drawing
         BeginDrawing();
             ClearBackground(RAYWHITE);

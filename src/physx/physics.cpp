@@ -5,6 +5,7 @@
 #include "Jolt/Math/MathTypes.h"
 #include "Jolt/Math/Real.h"
 #include "Jolt/Math/Vec3.h"
+#include "Jolt/Physics/Body/Body.h"
 #include "Jolt/Physics/Body/BodyID.h"
 #include "Jolt/Physics/Body/BodyInterface.h"
 #include "Jolt/Physics/Collision/ObjectLayer.h"
@@ -75,8 +76,11 @@
  *        well but a wireframe draw implementation will be highly effective in checking if the hulls are being created
  *        correctly. Since there is alot of operations done on the parsed geometry from the .map file we need to ensure
  *        the vertices are being read properly from the point cloud.
+ *
+ *  NOTE: Implement trigger volumes using Jolt's sensor system. I believe this can be achieved by reading the trigger
+ *        entity data from the map parser and assigning it's geometry as a collision hull but without uploading it to
+ *        the GPU since we don't want to draw it and cause any artifacts. 
  * */
-
 
 static void TraceImpl(const char *inFMT, ...)
 {
@@ -104,6 +108,7 @@ public:
     {
         m_object_to_broadphase[Layers::NON_MOVING] = BroadPhaseLayers::NON_MOVING;
         m_object_to_broadphase[Layers::MOVING]     = BroadPhaseLayers::MOVING;
+        m_object_to_broadphase[Layers::SENSOR]     = BroadPhaseLayers::SENSOR;
     }
 
     virtual JPH::uint GetNumBroadPhaseLayers() const override
@@ -141,9 +146,9 @@ public:
     {
         // Example:
         // Non-moving only collides with moving
-        if (inObject1 == Layers::NON_MOVING && inObject2 == Layers::NON_MOVING)
-            return false;
-
+        if (inObject1 == Layers::NON_MOVING && inObject2 == Layers::NON_MOVING) return false;
+        if (inObject1 == Layers::SENSOR && inObject2 == Layers::SENSOR) return false;
+        if (inObject1 == Layers::SENSOR && inObject2 == Layers::NON_MOVING) return false;
         // Otherwise everything else collides
         return true;
     }
@@ -178,6 +183,9 @@ public:
                                 JPH::ContactSettings &ioSettings) override
     {
         // Called when new contact begins
+        if ((inBody1.GetObjectLayer() == Layers::SENSOR)|| (inBody2.GetObjectLayer() == Layers::SENSOR)) {
+            printf("\n TRIGGER ACTIVATED!\n");
+        } 
     }
 
     virtual void OnContactPersisted(const JPH::Body &inBody1, const JPH::Body &inBody2, 
@@ -185,6 +193,9 @@ public:
                                     JPH::ContactSettings &ioSettings) override
     {
         // Called every frame contact persists
+        if ((inBody1.GetObjectLayer() == Layers::SENSOR) || (inBody2.GetObjectLayer() == Layers::SENSOR)) {
+            printf("TRIGGER ACTIVATED!!!\n");
+        }
     }
 
     virtual void OnContactRemoved(const JPH::SubShapeIDPair &inSubShapePair) override
@@ -210,12 +221,12 @@ public:
 //--------------------------------------//
 // Global or static variables
 //--------------------------------------//
-static JPH::PhysicsSystem                   *s_physics_system = nullptr;
+JPH::PhysicsSystem                   *s_physics_system = nullptr;
 static BPLayerInterfaceImpl                 s_broadphase_layer_interface;
 static ObjectVsBroadPhaseLayerFilterImpl    s_object_vs_broadphase_layer_filter;
 static ObjectLayerPairFilterImpl            s_object_layer_pair_filter;
 
-static JPH::TempAllocatorImpl               *s_temp_allocator  = nullptr;
+JPH::TempAllocatorImpl               *s_temp_allocator  = nullptr;
 static JPH::JobSystem                       *s_job_system      = nullptr;
 
 static constexpr JPH::uint                  maxPhysicsJobs     = 1024;
@@ -344,37 +355,35 @@ void SpawnDebugPhysObj(JPH::BodyInterface *bodyInterface) {
     printf("\n --TEST OBJECT SPAWNED-- \n");
 }
 
-void BuildMapPhysics(std::vector<MeshCollisionData> &meshCollisionData, JPH::BodyInterface *bodyInterface) { 
-    
-    // For each set of points in our point cloud stored in MeshCollisonData we convert to Jolt and 
-    // create a convex hull shape.
-   
-    //-------------- DEBUG BRUSH COLLISION MESH COUNT ------------------
+void BuildMapPhysics(std::vector<MeshCollisionData> &meshCollisionData, JPH::BodyInterface *bodyInterface)
+{
     int count = 0;
-    //-------------- DEBUG BRUSH COLLISION MESH COUNT ------------------
 
     for (auto &mcd : meshCollisionData) {
-        
-        // Convert to Jolt
+        // If NO_COLLIDE or something similar, we skip
+        if (mcd.collisionType == CollisionType::NO_COLLIDE) {
+            continue; 
+        }
+
+        // Convert Raylib vectors to Jolt float3
         std::vector<JPH::Float3> jolt_points;
         jolt_points.reserve(mcd.vertices.size());
         for (auto &v : mcd.vertices) {
             jolt_points.push_back(JPH::Float3(v.x, v.y, v.z));
         }
 
-        // Build the Convex Hull
+        // Build a convex hull from these points
         JPH::ConvexHullShapeSettings hull_settings;
-
-        hull_settings.mPoints.clear();
         hull_settings.mPoints.resize(jolt_points.size());
-
         for (size_t i = 0; i < jolt_points.size(); ++i) {
-            hull_settings.mPoints[i] = JPH::Vec3(jolt_points[i].x,
-                                                 jolt_points[i].y,
-                                                 jolt_points[i].z);
+            hull_settings.mPoints[i] = JPH::Vec3(
+                jolt_points[i].x,
+                jolt_points[i].y,
+                jolt_points[i].z
+            );
         }
 
-        auto shape_result = hull_settings.Create(); 
+        auto shape_result = hull_settings.Create();
         if (shape_result.HasError()) {
             printf("Error building hull shape: %s\n", shape_result.GetError().c_str());
             continue;
@@ -382,23 +391,58 @@ void BuildMapPhysics(std::vector<MeshCollisionData> &meshCollisionData, JPH::Bod
 
         JPH::RefConst<JPH::Shape> hull_shape = shape_result.Get();
 
-        // For now create static body of brushes for debug purposes to see if everything is working as intended.
-        JPH::BodyCreationSettings bcs (
+        // Decide motion type and layer from collisionType
+        JPH::EMotionType motionType     = JPH::EMotionType::Static;
+        JPH::ObjectLayer objectLayer    = Layers::NON_MOVING; // default
+
+        switch (mcd.collisionType) {
+            case CollisionType::STATIC: {
+                motionType = JPH::EMotionType::Static;
+                objectLayer = Layers::NON_MOVING;
+                break;
+            }
+            case CollisionType::TRIGGER: {
+                // Often you'd keep it static but on a special "trigger" layer,
+                // or still NON_MOVING if your filters treat triggers differently.
+                motionType = JPH::EMotionType::Static; 
+                objectLayer = Layers::SENSOR; // Or a custom TRIGGER layer if you have one
+                break;
+            }
+            case CollisionType::DYNAMIC: {
+                motionType = JPH::EMotionType::Dynamic;
+                objectLayer = Layers::MOVING;
+                break;
+            }
+            // NO_COLLIDE or UNKNOWN => skip
+            default: {
+                continue;
+            }
+        }
+
+        // Create a body creation settings with the chosen motion/layer
+        JPH::BodyCreationSettings bcs(
             hull_shape,
-            JPH::RVec3::sZero(),
+            JPH::RVec3::sZero(),       // offset if local geometry
             JPH::Quat::sIdentity(),
-            JPH::EMotionType::Static,
-            Layers::NON_MOVING
-        ); 
-        // create and add body to the physics interface 
+            motionType,
+            objectLayer
+        );
+
+        if (mcd.collisionType == CollisionType::TRIGGER) {
+            bcs.mIsSensor = true;
+            printf("\n SETTING IS SENSOR TO TRUE \n");
+        }
+
         if (JPH::Body *body = bodyInterface->CreateBody(bcs)) {
-            bodyInterface->AddBody(body->GetID(), JPH::EActivation::Activate); 
+            bodyInterface->AddBody(body->GetID(), JPH::EActivation::Activate);
             ++count;
-        } else printf("Failed to create body for a brush\n");
+        }
+        else {
+            printf("Failed to create body for a brush\n");
+        }
     }
-    //-------------- DEBUG BRUSH COLLISION MESH COUNT ------------------
-    printf("\n\n %d MAP COLLISIONS SUCCESFULLY CREATED \n\n", count);
-    //-------------- DEBUG BRUSH COLLISION MESH COUNT ------------------
+
+    printf("\n\n %d MAP COLLISIONS SUCCESSFULLY CREATED \n\n", count);
 }
 
 /* ~~~

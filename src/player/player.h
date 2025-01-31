@@ -1,6 +1,8 @@
 #pragma once
 
 #include "raylib.h"
+#include "Jolt/Jolt.h"
+#include "Jolt/Physics/PhysicsSystem.h"
 
 extern float eyeOffset;
 
@@ -18,9 +20,19 @@ typedef struct Player {
 } Player;
 
 
+void InitJoltCharacter(Player *player, JPH::PhysicsSystem *physicsSystem);
+
 void InitPlayer(Player *player, Vector3 position, Vector3 target, Vector3 up, float fovy, int projection);
 
-void UpdatePlayer(Player *player, float deltaTime);
+void PM_Friction();
+
+void PM_Accelerate(Vector3 wishDir, float wishSpeed, float accel);
+
+void PM_AirAccelerate(Vector3 wishDir, float wishSpeed, float accel);
+
+void PM_AirMove();
+
+void UpdatePlayer(Player *player,JPH::PhysicsSystem *s_physics_system ,float deltaTime);
 
 void UpdateCameraTarget(Player *player);
 

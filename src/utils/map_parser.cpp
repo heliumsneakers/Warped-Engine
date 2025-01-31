@@ -15,12 +15,6 @@
 #include <cmath> 
 #include <algorithm> 
 
-/*
- * Epsilon used in intersection tests and duplicate checks.
- * Adjust if needed for large or extremely small geometry.
- */
-static const double epsilon = 1e-3f;
-
 /* 
 ------------------------------------------------------------
  HELPER FUNCTIONS
@@ -52,7 +46,7 @@ Vector3 CalculateNormal(const Vector3& v1, const Vector3& v2, const Vector3& v3)
 }
 
 // Remove duplicates in-place
-static void RemoveDuplicatePoints(std::vector<Vector3>& points, float eps) {
+void RemoveDuplicatePoints(std::vector<Vector3>& points, float eps) {
     std::vector<Vector3> unique;
     unique.reserve(points.size());
 
@@ -74,7 +68,7 @@ static void RemoveDuplicatePoints(std::vector<Vector3>& points, float eps) {
 }
 
 // Sort polygon vertices by angle around centroid
-static void SortPolygonVertices(std::vector<Vector3>& poly, const Vector3& normal) {
+void SortPolygonVertices(std::vector<Vector3>& poly, const Vector3& normal) {
     if (poly.size() < 3) return;
 
     // Compute centroid
@@ -115,52 +109,9 @@ static void SortPolygonVertices(std::vector<Vector3>& poly, const Vector3& norma
     }
 }
 
-// ------------------ TextureManager Functions ------------------ //
-
-void InitTextureManager(TextureManager& manager) {
-    manager.textures.clear();
-    printf("TextureManager initialized and cleared.\n");
-}
-
-Texture2D LoadTextureByName(TextureManager& manager, const std::string& textureName) { 
-    auto it = manager.textures.find(textureName);
-    if (it != manager.textures.end()) {
-        printf("Texture '%s' already loaded.\n", textureName.c_str());
-        return it->second;
-    } else {
-        std::string filePath = "../../assets/textures/" + textureName + ".png"; // Assuming PNG format
-        Texture2D tex = LoadTexture(filePath.c_str());
-        if (tex.id != 0) {
-            manager.textures[textureName] = tex;
-            printf("Successfully loaded texture: %s\n", filePath.c_str());
-        } else {
-            printf("Failed to load texture: %s\n", filePath.c_str());
-            std::string defaultPath = "../../assets/textures/default.png";
-            tex = LoadTexture(defaultPath.c_str());
-            if (tex.id != 0) {
-                manager.textures["default"] = tex;
-                printf("Loaded default texture: %s\n", defaultPath.c_str());
-            } else {
-                printf("Failed to load default texture: %s\n", defaultPath.c_str());
-            }
-        }
-        return tex;
-    }
-}
-
-void UnloadAllTextures(TextureManager& manager) {
-    for (auto& pair : manager.textures) {
-        UnloadTexture(pair.second);
-        printf("Unloaded texture: %s\n", pair.first.c_str());
-    }
-    manager.textures.clear();
-    printf("All textures unloaded and TextureManager cleared.\n");
-}
-
-
 // Simple intersection of three planes (in TB coords)
 // **Credit to Stefan Hajnoczi**
-static bool GetIntersection(const Plane& p1, const Plane& p2, const Plane& p3, Vector3& out) {
+bool GetIntersection(const Plane& p1, const Plane& p2, const Plane& p3, Vector3& out) {
     Vector3 cross23 = Vector3CrossProduct(p2.normal, p3.normal);
     float denom     = Vector3DotProduct(p1.normal, cross23);
 
@@ -183,7 +134,7 @@ static bool GetIntersection(const Plane& p1, const Plane& p2, const Plane& p3, V
     return true;
 }
 
-static Vector3 ConvertTBtoRaylib(const Vector3& in) {
+Vector3 ConvertTBtoRaylib(const Vector3& in) {
     //  TB: (x,  y,  z) = (right, forward, up)
     // Raylib: (x,  y,  z) = (right, up, forward)
     Vector3 out = { 
@@ -195,12 +146,62 @@ static Vector3 ConvertTBtoRaylib(const Vector3& in) {
 }
 
 /*
+  --------------------------------------------------------
+    TEXTURE MANAGER
+  --------------------------------------------------------
+*/
+
+void InitTextureManager(TextureManager& manager) {
+    manager.textures.clear();
+    printf("TextureManager initialized and cleared.\n");
+}
+
+Texture2D LoadTextureByName(TextureManager& manager, const std::string& textureName) { 
+    auto it = manager.textures.find(textureName);
+    if (it != manager.textures.end()) {
+        // LOGGING
+        // printf("Texture '%s' already loaded.\n", textureName.c_str());
+        return it->second;
+    } else {
+        std::string filePath = "../../assets/textures/" + textureName + ".png"; // Assuming PNG format
+        Texture2D tex = LoadTexture(filePath.c_str());
+        if (tex.id != 0) {
+            manager.textures[textureName] = tex;
+            // LOGGING
+            // printf("Successfully loaded texture: %s\n", filePath.c_str());
+        } else {
+            printf("Failed to load texture: %s\n", filePath.c_str());
+            std::string defaultPath = "../../assets/textures/default.png";
+            tex = LoadTexture(defaultPath.c_str());
+            if (tex.id != 0) {
+                manager.textures["default"] = tex;
+                // LOGGING
+                // printf("Loaded default texture: %s\n", defaultPath.c_str());
+            } else {
+                printf("Failed to load default texture: %s\n", defaultPath.c_str());
+            }
+        }
+        return tex;
+    }
+}
+
+void UnloadAllTextures(TextureManager& manager) {
+    for (auto& pair : manager.textures) {
+        UnloadTexture(pair.second);
+        printf("Unloaded texture: %s\n", pair.first.c_str());
+    }
+    manager.textures.clear();
+    printf("All textures unloaded and TextureManager cleared.\n");
+}
+
+
+/*
 ------------------------------------------------------------
  PARSER IMPLEMENTATION
 ------------------------------------------------------------
 */
 
-// The main parse function: parse geometry in TB coords (no flipping) 
+// The main parse function: parse geometry in TB coords
 Map ParseMapFile(const std::string &filename) {
     Map map;
     std::ifstream file(filename);
@@ -265,7 +266,7 @@ Map ParseMapFile(const std::string &filename) {
                             std::string val = line.substr(thirdQ+1, fourthQ - thirdQ -1);
                             currentEntity.properties[key] = val;
                             // Debug
-                            //printf("Property: %s = %s\n", key.c_str(), val.c_str());
+                            printf("Property: %s = %s\n", key.c_str(), val.c_str());
                         }
                     }
                 }
@@ -394,6 +395,11 @@ Map ParseMapFile(const std::string &filename) {
     return map;
 }
 
+/*
+ --------------------------------------------------------
+    ENTITY PARSING
+ --------------------------------------------------------
+*/
 // For reading "info_player_start" in TB coords
 std::vector<PlayerStart> GetPlayerStarts(const Map &map) {
     std::vector<PlayerStart> starts;
@@ -426,7 +432,7 @@ std::vector<PlayerStart> GetPlayerStarts(const Map &map) {
 
 /*
 ------------------------------------------------------------
- BUILD MODEL
+    BUILD MODEL
 ------------------------------------------------------------
 */
 

@@ -2,11 +2,21 @@
 
 #include <vector>
 #include "raylib.h"
+#include "../utils/map_parser.h"
 
-// Struct to store vertices for collision data
+enum class CollisionType {
+    STATIC,
+    DYNAMIC,
+    TRIGGER,
+    NO_COLLIDE,
+    UNKNOWN,
+};
 
 struct MeshCollisionData {
     std::vector<Vector3> vertices;
+    CollisionType collisionType;
 };
 
-std::vector<MeshCollisionData> ExtractCollisionData(Model &model);
+static CollisionType GetEntityCollisionType(const Entity &ent);
+static std::vector<Vector3> BuildBrushGeometry(const Brush &brush);
+std::vector<MeshCollisionData> ExtractCollisionData(const Map &map);

@@ -5,6 +5,12 @@
 #include <string>
 #include <unordered_map>
 
+/*
+ * Epsilon used in intersection tests and duplicate checks.
+ * Adjust if needed for large or extremely small geometry.
+ */
+const double epsilon = 1e-3f;
+
 typedef struct Vertex {
     Vector3 position;
     Vector3 normal;
@@ -50,10 +56,20 @@ typedef struct TextureManager {
     std::unordered_map<std::string, Texture2D> textures;
 } TextureManager;
 
+
 void InitTextureManager(TextureManager& manager);
 void UnloadAllTextures(TextureManager& manager);
+Vector3 ConvertTBtoRaylib(const Vector3& in);
+
 Map ParseMapFile(const std::string& filePath);
 std::vector<PlayerStart> GetPlayerStarts(const Map& map);
 Texture2D LoadTextureByName(TextureManager& manager, const std::string& textureName);
+
 Vector3 CalculateNormal(const Vector3& v1, const Vector3& v2, const Vector3& v3);
+void RemoveDuplicatePoints(std::vector<Vector3>& points, float eps);
+bool GetIntersection(const Plane& p1, const Plane& p2, const Plane& p3, Vector3& out);
+void SortPolygonVertices(std::vector<Vector3>& poly, const Vector3& normal);
+Vector3 ConvertTBtoRaylib(const Vector3& in);
+
+
 Model MapToMesh(const Map& map, TextureManager& textureManager);
