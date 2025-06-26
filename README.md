@@ -1,5 +1,7 @@
 # Warped Engine
-Warped Engine is heavily inspired by Valve and Id Software's workflows. It is a project aiming to build a lightweight structure with minimal dependencies that can run on multiple platforms. 
+Warped Engine is heavily inspired by Valve and Id Software's workflows. It is a project aiming to build a lightweight structure with minimal dependencies that can run on multiple platforms.
+
+Id Tech 2 and GoldSrc are awesome pieces of software and I'd like to build something similar but in a more modern context.
 
 The initial spark for this project was from a 72 hour game jam, where I wrote the beginnings of the engine. This initial version included: map parser (without textures), player movement, and UI.
 
