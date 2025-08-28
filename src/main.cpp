@@ -15,6 +15,7 @@
 
 
 int main() {
+
     // Initialize window
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Warped Engine");
     SetTargetFPS(FPS_MAX);
@@ -83,9 +84,7 @@ int main() {
     BuildMapPhysics(collisionData, bodyInterface);
 
     // TODO: Assign the players physics and add functionality to UpdatePlayer() to update with the physics tick.
-
-    float deltaTime = 1.0f/60.0f;
-
+ 
     SpawnDebugPhysObj(bodyInterface);
     
     //SpawnMinimalTest(*bodyInterface);
@@ -95,14 +94,16 @@ int main() {
          
         UpdatePhysicsSystem(deltaTime, bodyInterface);
 
-        UpdatePlayer(&player, s_physics_system, deltaTime);
+        if (DEVMODE) {
+            UpdatePlayer(&player, s_physics_system, deltaTime);
+        } else UpdatePlayerMove(&player, s_physics_system, deltaTime);
 
-        UpdateCameraTarget(&player);
-    
+            UpdateCameraTarget(&player);
+            
         // Begin drawing
         BeginDrawing();
             ClearBackground(RAYWHITE);
-
+ 
             BeginMode3D(player.camera);
 
                 DrawGrid(100, 5.0f);
@@ -116,6 +117,7 @@ int main() {
                 }
 
                 DebugDrawPlayerAABB(&player);
+                DebugDir(&player);
 
                 //DrawModelWires(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, GREEN);
 

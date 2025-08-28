@@ -1,5 +1,6 @@
 // map_parser.cpp
 #include "map_parser.h"
+#include "parameters.h"
 #include "raymath.h"
 #include "raylib.h"
 #include "rlgl.h"
@@ -448,7 +449,23 @@ Model MapToMesh(const Map &map, TextureManager &textureManager) {
     std::unordered_map<std::string, TextureMeshData> textureMeshes;
 
     for (auto &entity : map.entities) {
+        // Logic for skipping trigger entity rendering if we are not in DEVMODE
+        bool isTriggerBrush = false;
+        auto it = entity.properties.find("classname");
+            if (it != entity.properties.end()) {
+                const std::string &classname = it->second;
+                if (classname == "trigger_once" || classname == "trigger_multiple") {
+                    isTriggerBrush = true;
+                }
+            }
+
         for (auto &brush : entity.brushes) {
+
+            // Here we explicitly skip trigger brushes if !DEVMODE
+            if (isTriggerBrush && !DEVMODE) {
+                continue;
+            }
+
             int numFaces = (int)brush.faces.size();
             if (numFaces < 3) {
                 printf("Skipping brush (fewer than 3 faces).\n");

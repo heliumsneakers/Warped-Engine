@@ -9,7 +9,7 @@
  * Epsilon used in intersection tests and duplicate checks.
  * Adjust if needed for large or extremely small geometry.
  */
-const double epsilon = 1e-3f;
+const double epsilon = 1e-2f;
 
 typedef struct Vertex {
     Vector3 position;

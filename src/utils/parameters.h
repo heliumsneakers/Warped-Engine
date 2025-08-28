@@ -3,4 +3,5 @@
 extern int SCREEN_WIDTH;
 extern int SCREEN_HEIGHT;
 extern int FPS_MAX;
-
+extern bool DEVMODE;
+extern float deltaTime;

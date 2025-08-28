@@ -194,7 +194,7 @@ public:
     {
         // Called every frame contact persists
         if ((inBody1.GetObjectLayer() == Layers::SENSOR) || (inBody2.GetObjectLayer() == Layers::SENSOR)) {
-            printf("TRIGGER ACTIVATED!!!\n");
+            //printf("TRIGGER ACTIVATED!!!\n");
         }
     }
 
@@ -348,8 +348,11 @@ void SpawnDebugPhysObj(JPH::BodyInterface *bodyInterface) {
 
     JPH::RefConst<JPH::Shape> sphere_shape = new JPH::SphereShape(10.0f); 
 
-    JPH::BodyCreationSettings sphere_settings (sphere_shape, JPH::RVec3( 0.0f, 1500.0f, -180.0f ), JPH::Quat::sIdentity(),
-                                               JPH::EMotionType::Dynamic, Layers::MOVING);
+    JPH::BodyCreationSettings sphere_settings (
+        sphere_shape, JPH::RVec3( 0.0f, 1500.0f, -180.0f ),
+        JPH::Quat::sIdentity(),
+        JPH::EMotionType::Dynamic,
+        Layers::MOVING);
     debugSphereID = bodyInterface->CreateAndAddBody(sphere_settings, JPH::EActivation::Activate);
  
     printf("\n --TEST OBJECT SPAWNED-- \n");
