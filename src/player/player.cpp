@@ -3,6 +3,7 @@
 #include "player.h"
 #include "Jolt/Math/Math.h"
 #include "Jolt/Physics/Collision/Shape/CapsuleShape.h"
+#include "Jolt/Physics/Collision/Shape/Shape.h"
 #include "raylib.h"
 #include "raymath.h"
 #include "../utils/parameters.h"
@@ -27,7 +28,6 @@
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyActivationListener.h>
 #include "Jolt/Physics/Character/CharacterVirtual.h"
-#include "Jolt/Physics/Collision/Shape/BoxShape.h"
 #define JPH_ENABLE_ASSERTS
 
 /*  NOTE: Thinking about writing the player collision here directly, could be too messy though
@@ -37,8 +37,12 @@
 *   NOTE: Upon further reading into the Jolt library I believe the best way forward will be to do an implementation of the Jolt 
 *         CharacterVirtual here directly, and adapt my original Quake inspired movement code. Input handling will be done by raylib,
 *         maybe all of the actual movement calculations can be done using raylibs Vector3 and at the end where we finally update the 
-*         player position we do a conversion into Jolt's Vec3? not sure yet, will use this as the first attempt.
+*         player position we do a conversion into Jolt's Vec3? Not sure yet, will use this as the first attempt.
 */
+
+
+// TODO:: Fix AirAcceleration feeling, currently we can accelerate too much instead of the smooth bunnies build up like quake. Also we have a weird jitter when surfing along ramps.
+//        This issue may be because of jolt character penetration or just some weird movement vector magnitude bug, intuition seems to point to Jolt being the issue here.
 
 #define MOUSE_SENSITIVITY 0.5f
 bool cursorEnabled;
@@ -46,21 +50,26 @@ bool cursorEnabled;
 float eyeOffset = 16.0f;
 
 // Movement constants for Quake PM impl.
-const float MAX_SPEED           = 640.0f;   // Maximum speed in m/s (adjusted from 250.0f)
-const float ACCELERATION        = 320.0f;   // Acceleration in m/s² (adjusted from 100.0f)
-const float FRICTION            = 4.0f;     // Friction coefficient
-const float STOP_SPEED          = 1.0f;     // Speed below which the player stops
-const float JUMP_FORCE          = 100.0f;    // Jump force
-const float AIR_ACCELERATION    = 1000.0f;   // Air acceleration in m/s^2
-const float MAX_AIR_SPEED       = 1000.0f;   // Maximum speed while in air
-const float GRAVITY             = -98.1f;   
+const float     MAX_SPEED           = 100.0f;        // Maximum speed in m/s (adjusted from 250.0f)
+const float     ACCELERATION        = 5.0f;          // Acceleration in m/s² (adjusted from 100.0f)
+static float    FRICTION            = 2.0f;          // Friction coefficient
+const float     STOP_SPEED          = 10.0f;         // Speed below which the player stops
+const float     JUMP_FORCE          = 80.0f;         // Jump force
+const float     AIR_WISH_SPEED_CAP  = 200.0f;        // Capping wishSpeed magnitude while in air.
+const float     AIR_ACCELERATION    = 100.0f;        // Air acceleration in m/s^2
+const float     GRAVITY             = -98.1f;        // Gravity constant
 
 Vector3 velocity = Vector3Zero();
 float playerYaw = 0.0f;
 float playerPitch = 0.0f;
 bool isGrounded = false;
 
+static bool s_allow_sliding     = true;             // Fix for sliding on slopes when idle. True while player is actively providing input.
+static bool s_has_move_input    = false;            // Check if the player is currently providing movement input.
+static bool s_skip_slope_cancel_this_frame = false; // Skip slope movement cancel this frame for better control feel.
+
 Vector3 wishDir     = Vector3Zero();
+Vector3 wishVel     = Vector3Zero();
 float   wishSpeed   = 0.0f;
 
 // --------- BEGIN Jolt Character Collision Impl. ---------
@@ -112,6 +121,34 @@ public:
         HandleContact(inCharacter, inBodyID2, inSubShapeID2, inContactPosition, inContactNormal, ioSettings, false);
     }
 
+    virtual void OnContactSolve(const JPH::CharacterVirtual *inCharacter,
+                                const JPH::BodyID &inBodyID2,
+                                const JPH::SubShapeID &inSubShapeID2,
+                                JPH::RVec3Arg inContactPosition,
+                                JPH::Vec3Arg inContactNormal,
+                                JPH::Vec3Arg inContactVelocity,
+                                const JPH::PhysicsMaterial *inContactMaterial,
+                                JPH::Vec3Arg inCharacterVelocity,
+                                JPH::Vec3 &ioNewCharacterVelocity) override
+    {
+        // Cancel only the into-plane component when idle on walkable slopes
+        if (inCharacter != gCharacter) return;
+        if (inCharacter->IsSlopeTooSteep(inContactNormal)) return;
+        if (s_has_move_input) return;
+        if (s_skip_slope_cancel_this_frame) return;
+
+        // If the surface isn't moving, kill only the normal component so gravity can't
+        // inject along-slope drift, but keep whatever tangential speed we already have.
+        if (inContactVelocity.IsNearZero())
+        {
+            JPH::Vec3 n = inContactNormal.Normalized();
+            float vn = ioNewCharacterVelocity.Dot(n);
+            if (vn < 0.0f) {
+                ioNewCharacterVelocity -= n * vn; // remove into-plane
+            }
+        }
+    }
+
     virtual void OnContactRemoved(const JPH::CharacterVirtual *inCharacter,
                                   const JPH::BodyID &inBodyID2,
                                   const JPH::SubShapeID &inSubShapeID2) override
@@ -119,7 +156,7 @@ public:
         JPH::BodyLockRead lock(s_physics_system->GetBodyLockInterfaceNoLock(), inBodyID2);
         if (!lock.Succeeded())
             return;
-        
+
         const JPH::Body &body = lock.GetBody();
 
         CollisionType ct = (CollisionType) body.GetUserData();
@@ -141,7 +178,7 @@ private:
         JPH::BodyLockRead lock(s_physics_system->GetBodyLockInterfaceNoLock(), inBodyID2);
         if (!lock.Succeeded())
             return;
-        
+
         const JPH::Body &body = lock.GetBody();
 
         CollisionType ct = (CollisionType) body.GetUserData(); // Potentially we store type in user data? use a int pointer?
@@ -165,7 +202,7 @@ private:
         if (body.GetObjectLayer() == Layers::MOVING) {
             ioSettings.mCanPushCharacter = false;
         }
-        
+
         else {
             // This is normal geometry
             // Possibly do normal character stuff
@@ -190,35 +227,37 @@ static MyCharacterLayerFilter s_char_layer_filter;
 // --------- END Jolt Character Collision Impl. ---------
 
 void InitJoltCharacter(Player *player, JPH::PhysicsSystem *physicsSystem) {
+    const float radius = 16.0f;
+    const float height = 56.0f;                // full height incl. hemispheres
+    const float cyl_h  = height - 2.0f * radius;
 
-    // Try this to debug slope bugs: JPH::RefConst<JPH::Shape> playerShape = new JPH::CapsuleShape(16.0f, 28.0f, 16.0f);
-
-    JPH::RefConst<JPH::Shape> playerShape = new JPH::BoxShape(JPH::Vec3(16.0f, 28.0f, 16.0f));
+    JPH::RefConst<JPH::CapsuleShape> cap = new JPH::CapsuleShape(0.5f * cyl_h, radius);
 
     JPH::Ref<JPH::CharacterVirtualSettings> settings = new JPH::CharacterVirtualSettings();
-    settings->mShape = playerShape;
-    settings->mMaxSlopeAngle = JPH::DegreesToRadians(45.0f);
-    settings->mMaxStrength   = 150.0f;
-    settings->mCharacterPadding = 0.02f;
-    settings->mPenetrationRecoverySpeed = 1.0f;
-    settings->mPredictiveContactDistance = 0.1f;
-    settings->mInnerBodyLayer = Layers::MOVING;
+    settings->mShape                       = cap;
+    settings->mMaxSlopeAngle               = JPH::DegreesToRadians(45.0f);
+    settings->mMaxStrength                 = 150.0f;
+    settings->mCharacterPadding            = 0.02f;
+    settings->mPenetrationRecoverySpeed    = 1.0f;
+    settings->mPredictiveContactDistance   = 0.1f;
+    settings->mBackFaceMode                = JPH::EBackFaceMode::CollideWithBackFaces;
+    settings->mEnhancedInternalEdgeRemoval = true;
+    settings->mSupportingVolume            = JPH::Plane(JPH::Vec3::sAxisY(), -radius);
+    settings->mInnerBodyLayer              = Layers::MOVING; // if you later add inner body
 
     gCharacter = new JPH::CharacterVirtual(
         settings,
-        JPH::RVec3(player->camera.position.x, 
+        JPH::RVec3(player->camera.position.x,
                    player->camera.position.y + eyeOffset,
                    player->camera.position.z),
         JPH::Quat::sIdentity(),
-        /* inUserData = */ 0,
+        0,
         physicsSystem
     );
-    
-    gCharacter->SetListener(&s_char_listener);
-    gQuakeVelocity = JPH::Vec3::sZero();
 
-    printf("\n\n JOLT CHARACTER VIRTUAL INITIALIZED\n\n");
-} 
+    gCharacter->SetListener(&s_char_listener);
+    gCharacter->SetUp(JPH::Vec3::sAxisY());   // explicit up
+}
 
 void InitPlayer(Player *player, Vector3 position, Vector3 target, Vector3 up, float fovy, int projection) {
     player->camera.position = (Vector3){
@@ -248,125 +287,170 @@ void InitPlayer(Player *player, Vector3 position, Vector3 target, Vector3 up, fl
 
 // --------- BEGIN Quake Movement Impl. ---------
 
+
+// Projection of the player's movement vector along slopes so we dont fight the force of gravity up and down slopes.
+static inline Vector3 ProjectOntoPlane(Vector3 v, Vector3 n) {
+    // n must be normalized
+    return Vector3Subtract(v, Vector3Scale(n, Vector3DotProduct(v, n)));
+}
+
+static inline bool OnWalkableGround() {
+    return isGrounded && !gCharacter->IsSlopeTooSteep(gGroundNormal);
+}
+
+static inline void PM_ClipVelocity(const Vector3 &in, const Vector3 &normal, Vector3 &out, float overbounce)
+{
+    float backoff = Vector3DotProduct(in, normal) * overbounce;
+
+    out.x = in.x - normal.x * backoff;
+    out.y = in.y - normal.y * backoff;
+    out.z = in.z - normal.z * backoff;
+
+    // stop tiny jitter
+    const float STOP_EPSILON = 0.1f;
+    if (out.x > -STOP_EPSILON && out.x < STOP_EPSILON) out.x = 0.0f;
+    if (out.y > -STOP_EPSILON && out.y < STOP_EPSILON) out.y = 0.0f;
+    if (out.z > -STOP_EPSILON && out.z < STOP_EPSILON) out.z = 0.0f;
+}
+
 // Apply friction when grounded
-void PM_Friction(float deltaTime) {
-    if (isGrounded) {
-        Vector3 vel = velocity;
-        vel.y = 0; // Ignore vertical component
-
-        float speed = Vector3Length(vel);
-        if (speed < 0.1f) {
-            velocity.x = 0.0f;
-            velocity.z = 0.0f;
-            return;
-        }
-
-        float control = (speed < STOP_SPEED) ? STOP_SPEED : speed;
-        float drop = control * FRICTION * deltaTime;
-
-        float newSpeed = speed - drop;
-        if (newSpeed < 0)
-            newSpeed = 0;
-
-        newSpeed /= speed;
-
-        // Scale the velocity
-        velocity.x *= newSpeed;
-        velocity.z *= newSpeed;
-    }
-}
-
-// Modified PM_Accelerate: Projects wishDir onto the slope plane if needed.
-static void PM_Accelerate(Vector3 wishDir, float wishSpeed, float accel, float dt)
+void PM_Friction(float dt)
 {
-    // If we're not fully grounded and we have a valid ground normal,
-    // project the wishDir onto the plane defined by gGroundNormal.
-    if (!isGrounded && gGroundNormal.Length() > 0.001f)
-    {
-        Vector3 n = { gGroundNormal.GetX(), gGroundNormal.GetY(), gGroundNormal.GetZ() };
-        float dot = Vector3DotProduct(wishDir, n);
-        Vector3 projected = Vector3Subtract(wishDir, Vector3Scale(n, dot));
-        if (Vector3Length(projected) > 0.001f)
-            wishDir = Vector3Normalize(projected);
+    // Must be on contact; Quake only frictions when grounded.
+    if (!isGrounded) return;
+
+    // Use the best normal we have; fall back to +Y.
+    Vector3 n = {0.0f, 1.0f, 0.0f};
+    if (gGroundNormal.LengthSq() > 1e-6f) {
+        n = (Vector3){ gGroundNormal.GetX(), gGroundNormal.GetY(), gGroundNormal.GetZ() };
+        float ln = Vector3Length(n);
+        if (ln > 0.0f) n = Vector3Scale(n, 1.0f / ln);
+        else           n = (Vector3){0.0f, 1.0f, 0.0f};
     }
 
-    float currentSpeed = Vector3DotProduct(velocity, wishDir);
-    float addSpeed = wishSpeed - currentSpeed;
-    if (addSpeed <= 0)
+    // Decompose velocity into normal + tangent (Quake did vel[2]=0 before friction;
+    // here we generalize by using the plane tangent).
+    float   vn    = Vector3DotProduct(velocity, n);
+    Vector3 vtan  = Vector3Subtract(velocity, Vector3Scale(n, vn));
+    float   speed = Vector3Length(vtan);
+
+    // Quake snap: if really slow, stop tangential motion (keeps normal component).
+    if (speed < 1.0f) { // matches Quake’s threshold
+        velocity = Vector3Scale(n, vn);
         return;
-
-    float accelSpeed = accel * dt;
-    if (accelSpeed > addSpeed)
-        accelSpeed = addSpeed;
-
-    // Add only along wishDir, preserving any velocity components that already exist.
-    velocity = Vector3Add(velocity, Vector3Scale(wishDir, accelSpeed));
-}
-
-// Modified PM_AirAccelerate: Same projection logic.
-static void PM_AirAccelerate(Vector3 wishDir, float wishSpeed, float accel, float dt)
-{
-    if (wishSpeed > MAX_AIR_SPEED)
-        wishSpeed = MAX_AIR_SPEED;
-
-    if (!isGrounded && gGroundNormal.Length() > 0.001f)
-    {
-        Vector3 n = { gGroundNormal.GetX(), gGroundNormal.GetY(), gGroundNormal.GetZ() };
-        float dot = Vector3DotProduct(wishDir, n);
-        Vector3 projected = Vector3Subtract(wishDir, Vector3Scale(n, dot));
-        if (Vector3Length(projected) > 0.001f)
-            wishDir = Vector3Normalize(projected);
     }
 
-    float currentSpeed = Vector3DotProduct(velocity, wishDir);
-    float addSpeed = wishSpeed - currentSpeed;
-    if (addSpeed <= 0)
-        return;
+    // (Optional) “ledge” check from Quake would double friction near drop-offs.
+    // Not implemented here because it needs a short trace; keep FRICTION as-is.
+    float friction = FRICTION;
 
-    float accelSpeed = accel * dt;
-    if (accelSpeed > addSpeed)
-        accelSpeed = addSpeed;
+    // Quake math: control = max(STOP_SPEED, speed), drop = control*friction*dt
+    float control = (speed < STOP_SPEED) ? STOP_SPEED : speed;
+    float drop    = control * friction * dt;
 
-    velocity = Vector3Add(velocity, Vector3Scale(wishDir, accelSpeed));
+    float newSpeed = speed - drop;
+    if (newSpeed < 0.0f) newSpeed = 0.0f;
+
+    float scale = (speed > 0.0f) ? (newSpeed / speed) : 0.0f;
+    vtan = Vector3Scale(vtan, scale);
+
+    // Recompose: keep normal component (don’t fight contact normal), reduce tangent.
+    velocity = Vector3Add(Vector3Scale(n, vn), vtan);
 }
 
-// PM_AirMove: Computes the wish direction from input.
-static void PM_AirMove(float dt)
+static inline void PM_BuildWish()
 {
-    float fmove = 0.0f;
-    float smove = 0.0f;
+    float fmove = 0.0f, smove = 0.0f;
     if (IsKeyDown(KEY_W)) fmove += 1.0f;
     if (IsKeyDown(KEY_S)) fmove -= 1.0f;
     if (IsKeyDown(KEY_D)) smove += 1.0f;
     if (IsKeyDown(KEY_A)) smove -= 1.0f;
 
-    // Classic Quake uses yaw only (movement is in the horizontal plane)
-    float yawRad = DEG2RAD * playerYaw;
-    Vector3 forward = { cosf(yawRad), 0.0f, sinf(yawRad) };
-    Vector3 right   = { cosf(yawRad + PI * 0.5f), 0.0f, sinf(yawRad + PI * 0.5f) };
+    const float yawRad = DEG2RAD * playerYaw;
+    const Vector3 forward = { cosf(yawRad), 0.0f, sinf(yawRad) };
+    const Vector3 right   = { -sinf(yawRad), 0.0f, cosf(yawRad) };
 
-    forward = Vector3Normalize(forward);
-    right = Vector3Normalize(right);
+    // raw (unnormalized) horizontal wish velocity like Quake's wishveloc
+    wishVel = Vector3Add(Vector3Scale(forward, fmove), Vector3Scale(right, smove));
 
-    Vector3 inputVel = Vector3Add(Vector3Scale(forward, fmove), Vector3Scale(right, smove));
-    wishSpeed = Vector3Length(inputVel);
-    if (wishSpeed > 0.0001f)
-        wishDir = Vector3Scale(inputVel, 1.0f / wishSpeed);
-    else
-        wishDir = (Vector3){0, 0, 0};
+    const float inputMag = Vector3Length(wishVel);    // 0..sqrt(2)
+    s_has_move_input = (inputMag > 0.0001f);
 
-    // Clamp wishSpeed if necessary.
-    if (wishSpeed > MAX_SPEED)
-    {
-        inputVel = Vector3Scale(inputVel, MAX_SPEED / wishSpeed);
-        wishSpeed = MAX_SPEED;
+    // wishDir: unit vector (if any input)
+    wishDir = (inputMag > 0.0f) ? Vector3Scale(wishVel, 1.0f / inputMag) : Vector3Zero();
+
+    // Quake: wishspeed = min(length(wishvel), sv_maxspeed)
+    const float inputScale = fminf(1.0f, inputMag);
+    wishSpeed = MAX_SPEED * inputScale;
+}
+
+// Modified PM_Accelerate: Projects wishDir onto the slope plane if needed.
+static void PM_Accelerate(Vector3 wishDir, float wishSpeed, float accel, float dt)
+{
+    // NOTE: Removed slope projection logic from accelerate 
+    float currentSpeed = Vector3DotProduct(velocity, wishDir);
+    float addSpeed     = wishSpeed - currentSpeed;
+    if (addSpeed <= 0.0f) return;
+
+    // Quake: include wishSpeed
+    float accelSpeed = accel * dt * wishSpeed;
+    if (accelSpeed > addSpeed) accelSpeed = addSpeed;
+
+    velocity = Vector3Add(velocity, Vector3Scale(wishDir, accelSpeed));
+}
+
+// Air acceleration is where all the fun stuff happens.
+static void PM_AirAccelerate(Vector3 wishDir, Vector3 wishVel, float accel, float dt)
+{
+    // Optional slope handling (same as you had)
+    if (gGroundNormal.Length() > 0.001f) {
+        Vector3 n = { gGroundNormal.GetX(), gGroundNormal.GetY(), gGroundNormal.GetZ() };
+        float ln = Vector3Length(n); if (ln > 0.0f) n = Vector3Scale(n, 1.0f / ln);
+
+        if (Vector3DotProduct(velocity, n) < 0.0f) {
+            Vector3 clipped; PM_ClipVelocity(velocity, n, clipped, 1.0f); velocity = clipped;
+        }
+        if (Vector3DotProduct(wishDir, n) < 0.0f) {
+            Vector3 steerv = wishDir; PM_ClipVelocity(steerv, n, steerv, 1.0f);
+            float sl = Vector3Length(steerv);
+            if (sl > 0.0001f) wishDir = Vector3Scale(steerv, 1.0f / sl);
+        }
     }
 
-    // Use ground or air acceleration as appropriate.
-    if (isGrounded)
-        PM_Accelerate(wishDir, wishSpeed * 50, ACCELERATION, dt);
-    else
-        PM_AirAccelerate(wishDir, wishSpeed * 5, AIR_ACCELERATION, dt);
+    // Quake: wishspd = VectorNormalize(wishveloc);  (unit dir + keep original length)
+    float wishspd = Vector3Length(wishVel);
+    // Vector3 wishUnit = (wishspd > 0.0f) ? Vector3Scale(wishVel, 1.0f / wishspd) : Vector3Zero();
+
+    if (wishspd > AIR_WISH_SPEED_CAP) wishspd = AIR_WISH_SPEED_CAP;
+
+    float currentspeed = Vector3DotProduct(velocity, wishVel);
+    float addspeed     = wishspd - currentspeed;
+    if (addspeed <= 0.0f) return;
+
+    // Quake uses global wishSpeed (sv_maxspeed-clamped) here
+    float accelspeed = accel * wishSpeed * dt;
+    if (accelspeed > addspeed) accelspeed = addspeed;
+
+    velocity = Vector3Add(velocity, Vector3Scale(wishVel, accelspeed));
+}
+
+// PM_AirMove: Computes the wish direction from input.
+static void PM_AirMove(float dt, bool grounded)
+{ 
+    bool walkable = OnWalkableGround();
+    if (walkable && grounded) {
+        Vector3 n = { gGroundNormal.GetX(), gGroundNormal.GetY(), gGroundNormal.GetZ() };
+        float ln = Vector3Length(n); if (ln > 0.0f) n = Vector3Scale(n, 1.0f / ln);
+
+        Vector3 p = ProjectOntoPlane(wishDir, n);
+        float pl = Vector3Length(p);
+        if (pl > 0.0f) wishDir = Vector3Scale(p, 1.0f / pl);
+
+        PM_Friction(dt);
+        PM_Accelerate(wishDir, wishSpeed, ACCELERATION, dt);
+    } else {
+        PM_AirAccelerate(wishDir, wishVel, AIR_ACCELERATION, dt);
+    }
 }
 
 static void PM_ApplyGravity(float deltaTime) {
@@ -375,88 +459,109 @@ static void PM_ApplyGravity(float deltaTime) {
     }
 }
 
-// --------- END Quake Movement Impl. ---------
+// -------- END Quake Movement Impl. ---------
 
-void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *mPhysicsSystem, float deltaTime) {
-    // 1) Read current velocity from Jolt.
+void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt) {
+
+    bool was_grounded_this_frame_start = isGrounded; // last-frame value
+
+    // 1) Mouse look -> yaw/pitch/camera target
+    Vector2 md = GetMouseDelta();
+    playerYaw   += md.x * MOUSE_SENSITIVITY;
+    playerPitch -= md.y * MOUSE_SENSITIVITY;
+    playerPitch  = fmaxf(fminf(playerPitch, 89.0f), -89.0f);
+    player->yaw   = playerYaw;
+    player->pitch = playerPitch;
+
+    // 2) Ground/platform velocity refresh (cheap)
+    gCharacter->UpdateGroundVelocity();
+
+    // 3) Start from current velocity
     {
-        JPH::Vec3 curVel = gCharacter->GetLinearVelocity();
-        velocity.x = curVel.GetX();
-        velocity.y = curVel.GetY();
-        velocity.z = curVel.GetZ();
+        JPH::Vec3 v = gCharacter->GetLinearVelocity();
+        velocity = { v.GetX(), v.GetY(), v.GetZ() };
+    }
+     
+    // 4) Input → wish dir/speed (Quake style, horizontal only)
+    // NOTE: Do NOT apply friction here; we don't yet know the new ground state.
+    PM_BuildWish();
+
+    // 5) Jump
+    if ((IsKeyDown(KEY_SPACE) && isGrounded)) {
+        velocity.y   = JUMP_FORCE;
+        isGrounded   = false;
+        gGroundNormal = JPH::Vec3::sZero();
     }
 
-    // 2) Run ExtendedUpdate first to let the world (collisions, slopes, etc.) update.
-    JPH::CharacterVirtual::ExtendedUpdateSettings updateSettings;
+    // 6) Gravity (let CharacterVirtual also know gravity; keep this to influence your own vel)
+    PM_ApplyGravity(dt);
+
+    // 7) Write velocity to character (pre-solve)
+    gCharacter->SetLinearVelocity(JPH::Vec3(velocity.x, velocity.y, velocity.z));
+
+    s_allow_sliding = s_has_move_input;
+
+    // 8) Configure ExtendedUpdate (stick-to-floor / stair step)
+    JPH::CharacterVirtual::ExtendedUpdateSettings us;
+    const float step_up = 0.4f * 2.0f * 16.0f; // ~40% of diameter as an example
+    const float step_dn = step_up;
+    us.mWalkStairsStepUp     =  gCharacter->GetUp() * step_up;
+    us.mStickToFloorStepDown = -gCharacter->GetUp() * step_dn;
+
+    // 9) Gravity for CharacterVirtual (critical!)
+    const float g = 98.1f; // match your world units
+    const JPH::Vec3 gravity = -gCharacter->GetUp() * g;
+
+    // 10) Do the move
     gCharacter->ExtendedUpdate(
-        deltaTime,
-        JPH::Vec3::sZero(),
-        updateSettings,
-        mPhysicsSystem->JPH::PhysicsSystem::GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
-        s_char_layer_filter,
-        {},
-        {},
+        dt,
+        gravity,
+        us,
+        ps->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
+        s_char_layer_filter,   // your object layer filter
+        {}, {},                // body/shape filters
         *s_temp_allocator
     );
 
-    // 3) Read back the world-updated velocity.
+    // 11) Query ground state (truth source)
+    JPH::CharacterVirtual::EGroundState new_state = gCharacter->GetGroundState();
+    bool nowGrounded = (new_state == JPH::CharacterVirtual::EGroundState::OnGround);
+    JPH::Vec3 gn = gCharacter->GetGroundNormal();
+    gGroundNormal = gn;
+    bool walkable = nowGrounded && !gCharacter->IsSlopeTooSteep(gn);
+    isGrounded = nowGrounded; // update the global for the rest of the frame
+
+    // 12) Read back velocity (post-solve) and position
     {
-        JPH::Vec3 worldVel = gCharacter->GetLinearVelocity();
-        velocity.x = worldVel.GetX();
-        velocity.y = worldVel.GetY();
-        velocity.z = worldVel.GetZ();
+        JPH::Vec3 nv = gCharacter->GetLinearVelocity();
+        velocity = { nv.GetX(), nv.GetY(), nv.GetZ() };
+
+        JPH::RVec3 p = gCharacter->GetPosition();
+        player->center = { (float)p.GetX(), (float)p.GetY(), (float)p.GetZ() };
     }
 
-    // 4) Mouse look.
-    Vector2 mouseDelta = GetMouseDelta();
-    playerYaw   += mouseDelta.x * MOUSE_SENSITIVITY;
-    playerPitch -= mouseDelta.y * MOUSE_SENSITIVITY;
-    if (playerPitch > 89.0f) playerPitch = 89.0f;
-    if (playerPitch < -89.0f) playerPitch = -89.0f;
-
-    // 5) Handle jump.
-    if (IsKeyDown(KEY_SPACE) && isGrounded) {
-        velocity.y = JUMP_FORCE;
-        isGrounded = false;
-        gGroundNormal = JPH::Vec3::sZero();
-    }
-    if(isGrounded && gGroundState == JPH::CharacterVirtual::EGroundState::OnGround || gGroundState == JPH::CharacterVirtual::EGroundState::OnSteepGround) {
-        velocity.y = 0.0f;
+    // 13) Landing handling + friction (post-solve)
+    bool landedThisFrame = (!was_grounded_this_frame_start && walkable);
+    s_skip_slope_cancel_this_frame = landedThisFrame; // still useful for OnContactSolve idle-slope logic
+    
+    if (landedThisFrame) {
+        // 1 frame friction reset for momentum 
+        FRICTION = 0.0f;
+    } else {
+        FRICTION = 2.0f;
     }
  
-    // 6) Apply friction, input-based acceleration, gravity.
-    PM_Friction(deltaTime);
-    PM_AirMove(deltaTime);
-    PM_ApplyGravity(deltaTime);
-    
-    // 7) Update player angles.
-    player->yaw = playerYaw;
-    player->pitch = playerPitch;
+    // Quake: apply friction every grounded tick (including the landing tick)
+    PM_AirMove(dt, isGrounded);
 
-    // 8) Write updated velocity back to Jolt.
     gCharacter->SetLinearVelocity(JPH::Vec3(velocity.x, velocity.y, velocity.z));
 
-    // 9) Update player's position from Jolt.
-    JPH::RVec3 finalPos = gCharacter->GetPosition();
-    player->center.x = (float)finalPos.GetX();
-    player->center.y = (float)finalPos.GetY();
-    player->center.z = (float)finalPos.GetZ();
-
-    // 10) Update camera.
-    player->camera.position = (Vector3){ player->center.x, player->center.y + eyeOffset, player->center.z };
+    // 14) Set camera from center + orientation
+    player->camera.position = { player->center.x, player->center.y + eyeOffset, player->center.z };
     float yawRad = DEG2RAD * playerYaw;
     float pitchRad = DEG2RAD * playerPitch;
-    Vector3 camForward = { cosf(pitchRad)*sinf(yawRad), sinf(pitchRad), cosf(pitchRad)*cosf(yawRad) };
-    player->camera.target = Vector3Add(player->camera.position, camForward);
-
-    // 11) Toggle mouse cursor if needed.
-    if (IsKeyPressed(KEY_M)) {
-        cursorEnabled = !cursorEnabled;
-        if (cursorEnabled)
-            EnableCursor();
-        else
-            DisableCursor();
-    }
+    Vector3 fwd = { cosf(pitchRad) * sinf(yawRad), sinf(pitchRad), cosf(pitchRad) * cosf(yawRad) };
+    player->camera.target = Vector3Add(player->camera.position, fwd);
 }
 
 void UpdatePlayer(Player *player,JPH::PhysicsSystem *mPhysicsSystem ,float deltaTime) {
@@ -526,17 +631,17 @@ void UpdatePlayer(Player *player,JPH::PhysicsSystem *mPhysicsSystem ,float delta
         {}, // shape filter
         *s_temp_allocator 
     ); 
-     
+
     JPH::RVec3 finalPos = gCharacter->GetPosition();
-     // Apply movement
+    // Apply movement
     player->center = (Vector3) {
         gCharacter->GetPosition().GetX(),
         gCharacter->GetPosition().GetY(),
         gCharacter->GetPosition().GetZ()
     };
     player->camera.position = (Vector3) {player->center.x,
-                                         player->center.y + eyeOffset,
-                                         player->center.z};
+        player->center.y + eyeOffset,
+        player->center.z};
     player->camera.target = Vector3Add(player->camera.target, direction);
 
 
@@ -561,7 +666,7 @@ void UpdateCameraTarget(Player *player) {
 }
 
 void DebugDrawPlayerAABB(Player *player) {
-     Vector3 minPt = {
+    Vector3 minPt = {
         player->center.x - player->halfExt.x,
         player->center.y - player->halfExt.y,
         player->center.z - player->halfExt.z
@@ -582,42 +687,36 @@ void DebugDrawPlayerAABB(Player *player) {
 }
 
 void DebugDir(Player *player) {
-    // Choose a length for the debug arrows (adjust as needed)
-    const float arrowLength = 50.0f;
-    
-    // Starting point is the player's center.
     Vector3 start = player->center;
-    
-    // --- Draw Wish Direction ---
-    if (Vector3Length(wishDir) < 0.001f) {
-        // If no input, draw a small blue sphere at the player's center.
-        DrawSphere(start, 3.0f, YELLOW);
-    } else {
-        // Compute end point for the wish direction arrow.
-        Vector3 wishEnd = Vector3Add(start, Vector3Scale(wishDir, arrowLength));
-        // Draw a line representing the wish direction (green line).
+
+    // --- WishDir (unit vector, length always 1 if input present) ---
+    float wishDirLen = Vector3Length(wishDir);
+    if (wishDirLen > 0.0001f) {
+        Vector3 wishEnd = Vector3Add(start, wishDir * 50);
         DrawLine3D(start, wishEnd, GREEN);
-        // Draw a small red sphere at the tip.
-        DrawSphere(wishEnd, 2.0f, RED);
+        DrawSphere(wishEnd, 2.0f, LIME);
+    } else {
+        DrawSphere(start, 3.0f, YELLOW); // no input
     }
-    
-    // --- Draw Horizontal Velocity ---
-    // Ignore the Y component of the velocity vector.
+
+    // --- WishVel (raw vector before normalization) ---
+    float wishVelLen = Vector3Length(wishVel);
+    if (wishVelLen > 0.0001f) {
+        Vector3 wishVelEnd = Vector3Add(start, wishVel);
+        DrawLine3D(start, wishVelEnd, ORANGE);
+        DrawSphere(wishVelEnd, 2.0f, GOLD);
+    }
+
+    // --- Horizontal Velocity (actual, no scaling) ---
     Vector3 horizVelocity = velocity;
     horizVelocity.y = 0;
-    float horizMagnitude = Vector3Length(horizVelocity);
-    
-    if (horizMagnitude < 0.001f) {
-        // If horizontal velocity is nearly zero, draw a small sphere at the start.
-        DrawSphere(start, 3.0f, PURPLE);
-    } else {
-        // Normalize the horizontal velocity.
-        Vector3 velDir = Vector3Scale(horizVelocity, 1.0f / horizMagnitude);
-        // Compute end point for the horizontal velocity arrow.
-        Vector3 velEnd = Vector3Add(start, Vector3Scale(velDir, arrowLength));
-        // Draw a blue line representing horizontal velocity.
+    float horizMag = Vector3Length(horizVelocity);
+
+    if (horizMag > 0.0001f) {
+        Vector3 velEnd = Vector3Add(start, horizVelocity);
         DrawLine3D(start, velEnd, BLUE);
-        // Draw a dark blue sphere at the tip.
         DrawSphere(velEnd, 2.0f, DARKBLUE);
+    } else {
+        DrawSphere(start, 3.0f, PURPLE); // no horizontal velocity
     }
 }
