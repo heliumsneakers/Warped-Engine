@@ -1,5 +1,7 @@
 // src/player.cpp
 
+#include <cstdio>
+
 #include "player.h"
 #include "Jolt/Math/Math.h"
 #include "Jolt/Physics/Collision/Shape/CapsuleShape.h"
@@ -52,10 +54,10 @@ float eyeOffset = 16.0f;
 // Movement constants for Quake PM impl.
 const float     MAX_SPEED           = 100.0f;        // Maximum speed in m/s (adjusted from 250.0f)
 const float     ACCELERATION        = 5.0f;          // Acceleration in m/s² (adjusted from 100.0f)
-static float    FRICTION            = 2.0f;          // Friction coefficient
+static float    FRICTION            = 4.0f;          // Friction coefficient
 const float     STOP_SPEED          = 10.0f;         // Speed below which the player stops
 const float     JUMP_FORCE          = 80.0f;         // Jump force
-const float     AIR_WISH_SPEED_CAP  = 200.0f;        // Capping wishSpeed magnitude while in air.
+const float     AIR_WISH_SPEED_CAP  = 30.0f;        // Capping wishSpeed magnitude while in air.
 const float     AIR_ACCELERATION    = 100.0f;        // Air acceleration in m/s^2
 const float     GRAVITY             = -98.1f;        // Gravity constant
 
@@ -71,6 +73,28 @@ static bool s_skip_slope_cancel_this_frame = false; // Skip slope movement cance
 Vector3 wishDir     = Vector3Zero();
 Vector3 wishVel     = Vector3Zero();
 float   wishSpeed   = 0.0f;
+
+// =========
+// DEBUG
+// ========
+struct VelDebug {
+    float horiz = 0.0f;     // sqrt(vx^2 + vz^2)
+    float vert  = 0.0f;     // vy
+    float total = 0.0f;     // |v|
+    float peakH = 0.0f;     // peak horizontal speed this run
+    float lastH = 0.0f;     // last-frame horiz (for delta color)
+};
+static VelDebug g_velDbg;
+
+static inline float Clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+// Call this *after* you’ve read back post-solve velocity each frame
+void DebugUpdateVelMetrics() {
+    g_velDbg.horiz = sqrtf(velocity.x*velocity.x + velocity.z*velocity.z);
+    g_velDbg.vert  = velocity.y;
+    g_velDbg.total = Vector3Length(velocity);
+    if (g_velDbg.horiz > g_velDbg.peakH) g_velDbg.peakH = g_velDbg.horiz;
+}
 
 // --------- BEGIN Jolt Character Collision Impl. ---------
 
@@ -228,7 +252,7 @@ static MyCharacterLayerFilter s_char_layer_filter;
 
 void InitJoltCharacter(Player *player, JPH::PhysicsSystem *physicsSystem) {
     const float radius = 16.0f;
-    const float height = 56.0f;                // full height incl. hemispheres
+    const float height = 56.0f;
     const float cyl_h  = height - 2.0f * radius;
 
     JPH::RefConst<JPH::CapsuleShape> cap = new JPH::CapsuleShape(0.5f * cyl_h, radius);
@@ -243,43 +267,39 @@ void InitJoltCharacter(Player *player, JPH::PhysicsSystem *physicsSystem) {
     settings->mBackFaceMode                = JPH::EBackFaceMode::CollideWithBackFaces;
     settings->mEnhancedInternalEdgeRemoval = true;
     settings->mSupportingVolume            = JPH::Plane(JPH::Vec3::sAxisY(), -radius);
-    settings->mInnerBodyLayer              = Layers::MOVING; // if you later add inner body
+    settings->mInnerBodyLayer              = Layers::MOVING;
 
+    // IMPORTANT: spawn at the center
     gCharacter = new JPH::CharacterVirtual(
         settings,
-        JPH::RVec3(player->camera.position.x,
-                   player->camera.position.y + eyeOffset,
-                   player->camera.position.z),
+        JPH::RVec3(player->center.x, player->center.y, player->center.z),
         JPH::Quat::sIdentity(),
         0,
         physicsSystem
     );
 
     gCharacter->SetListener(&s_char_listener);
-    gCharacter->SetUp(JPH::Vec3::sAxisY());   // explicit up
+    gCharacter->SetUp(JPH::Vec3::sAxisY());
 }
 
-void InitPlayer(Player *player, Vector3 position, Vector3 target, Vector3 up, float fovy, int projection) {
-    player->camera.position = (Vector3){
-        position.x,
-        position.y - eyeOffset,
-        position.z
-    };
-    player->camera.target = target;
-    player->camera.up = up;
-    player->camera.fovy = fovy; 
+void InitPlayer(Player *player, Vector3 center, Vector3 target, Vector3 up, float fovy, int projection) {
+    player->center = center;
+
+    // Camera = center + eye offset (only place you add it)
+    player->camera.position   = (Vector3){ center.x, center.y + eyeOffset, center.z };
+    player->camera.target     = target;
+    player->camera.up         = up;
+    player->camera.fovy       = fovy;
     player->camera.projection = projection;
 
-    player->speed = 200.0f;             // Units per second
-    player->rotationSpeed = 90.0f;     // Degrees per second
+    // Initialize yaw/pitch however you like, then compute target from them
+    player->yaw = 0.0f;
+    player->pitch = 0.0f;
+    UpdateCameraTarget(player);
 
-    Vector3 direction = Vector3Normalize(Vector3Subtract(target, position));
-    player->yaw = atan2f(direction.z, direction.x) * RAD2DEG;
-    player->pitch = asinf(direction.y) * RAD2DEG;
-
-    player->center = position;
-    player->halfExt = (Vector3){16,28,16}; 
-
+    player->speed = 200.0f;
+    player->rotationSpeed = 90.0f;
+    player->halfExt = (Vector3){16,28,16};
     SetMousePosition(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
     DisableCursor();
     cursorEnabled = false;
@@ -480,6 +500,9 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt) {
     {
         JPH::Vec3 v = gCharacter->GetLinearVelocity();
         velocity = { v.GetX(), v.GetY(), v.GetZ() };
+
+         // movement debug
+        DebugUpdateVelMetrics();
     }
      
     // 4) Input → wish dir/speed (Quake style, horizontal only)
@@ -643,12 +666,7 @@ void UpdatePlayer(Player *player,JPH::PhysicsSystem *mPhysicsSystem ,float delta
         player->center.y + eyeOffset,
         player->center.z};
     player->camera.target = Vector3Add(player->camera.target, direction);
-
-
-    /*
-    printf("JOLT POS: x = %f | y = %f | z = %f\n", finalPos.GetX(), finalPos.GetY(), finalPos.GetZ());
-    printf("RAYLIB POS: x = %f | y = %f | z = %f\n", player->center.x, player->center.y, player->center.z);
-    */
+     
 }
 
 void UpdateCameraTarget(Player *player) {
@@ -719,4 +737,37 @@ void DebugDir(Player *player) {
     } else {
         DrawSphere(start, 3.0f, PURPLE); // no horizontal velocity
     }
+}
+
+void DebugDrawPlayerPos(const Player *player, int x, int y) { 
+    // Format position
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer),
+             "Player Pos: X=%.2f  Y=%.2f  Z=%.2f",
+             player->center.x, player->center.y, player->center.z);
+
+    DrawText(buffer, x, y, 20, RED);
+}
+
+void DebugDrawPlayerVel(int x, int y) {
+    // Color: green if speeding up, red if slowing, gray if ~same
+    float dh = g_velDbg.horiz - g_velDbg.lastH;
+    Color c = (dh > 0.1f) ? GREEN : (dh < -0.1f) ? RED : LIGHTGRAY;
+
+    char line[192];
+    snprintf(line, sizeof(line),
+             "H: %.2f   V: %.2f   |v|: %.2f   PeakH: %.2f   %s",
+             g_velDbg.horiz, g_velDbg.vert, g_velDbg.total, g_velDbg.peakH,
+             isGrounded ? "GROUND" : "AIR");
+
+    DrawText(line, x, y, 20, c);
+
+    // Horizontal speed bar (tune maxShow to your expected bhop speeds)
+    const float maxShow = 600.0f;     // display ceiling
+    const float w = 240.0f, h = 10.0f;
+    DrawRectangleLines(x, y + 26, (int)w, (int)h, GRAY);
+    float fill = w * Clamp01(g_velDbg.horiz / maxShow);
+    DrawRectangle(x + 1, y + 27, (int)(fill - 2 > 0 ? fill - 2 : 0), (int)h - 2, BLUE);
+
+    g_velDbg.lastH = g_velDbg.horiz;
 }

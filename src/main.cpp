@@ -25,42 +25,23 @@ int main() {
     // Initialize TextureManager
     TextureManager textureManager;
     InitTextureManager(textureManager);
-   
+
     // Culling Specification
     rlSetClipPlanes(0.01, 5000.0);
     printf("Near Cull dist: %f\n", rlGetCullDistanceNear());
     printf("Far Cull dist: %f \n", rlGetCullDistanceFar());
-   
-    // Initialize player 
-    Player player;
-    InitPlayer(&player, (Vector3){20.0f, 20.0f, 20.0f}, (Vector3){0.0f, 1.0f, 0.0f}, (Vector3){0.0f, 1.0f, 0.0f}, 90.0f, CAMERA_PERSPECTIVE);
 
-    // Parse the map
     Map map = ParseMapFile("../../assets/maps/test.map");
-    printf("Parsed Map: %zu entities\n", map.entities.size());
 
-    // Extract player start positions
-    std::vector<PlayerStart> playerStarts = GetPlayerStarts(map);
+    std::vector<PlayerStart> starts = GetPlayerStarts(map);
 
-    Vector3 playerPosition = {0.0f, 0.0f, 0.0f};
-    if (!playerStarts.empty()) {
-        playerPosition = playerStarts[0].position;
-        printf("Player Start Position: (%f, %f, %f)\n", playerPosition.x, playerPosition.y, playerPosition.z);
-    } else {
-        printf("No player start positions found.\n");
-    }
+    Vector3 spawnRL = starts.empty() ? (Vector3){0,0,0} : starts[0].position;
 
-    if (!playerStarts.empty()) {
-        player.camera.position = (Vector3){
-            playerPosition.x,
-            playerPosition.y + eyeOffset,
-            playerPosition.z
-        };
-        printf("\n\nplayer cam pos y = %f\n\n", player.camera.position.y);
-        player.camera.target = (Vector3){0.0f, 0.0f, 0.0f};
-        player.camera.up = (Vector3){0.0f, 1.0f, 0.0f};
-        printf("Player camera position set to player start position and target set to model.\n");
-    }
+    // Initialize player with center = spawn
+    Player player;
+    InitPlayer(&player, spawnRL, (Vector3){0,0,0}, (Vector3){0,1,0}, 90.0f, CAMERA_PERSPECTIVE);
+
+    printf("\n RL Spawn point:: x: %f y: %f z: %f \n\n", player.center.x, player.center.y, player.center.z);
 
     // Convert map to mesh and create model
     Model mapModel = MapToMesh(map, textureManager);
@@ -69,10 +50,7 @@ int main() {
 
 
     // Initialize physics here and generate collision hulls.
-
     InitPhysicsSystem();
-
-    InitJoltCharacter(&player, s_physics_system);
 
     JPH::BodyInterface *bodyInterface = &GetBodyInterface();
 
@@ -84,46 +62,47 @@ int main() {
     BuildMapPhysics(collisionData, bodyInterface);
 
     // TODO: Assign the players physics and add functionality to UpdatePlayer() to update with the physics tick.
- 
+
     SpawnDebugPhysObj(bodyInterface);
-    
-    //SpawnMinimalTest(*bodyInterface);
+
+    InitJoltCharacter(&player, s_physics_system);
+
+    printf("\n\n RL Spawn point at Jolt INIT:: x: %f y: %f z: %f \n\n", player.center.x, player.center.y, player.center.z);
 
     // Main game loop
     while (!WindowShouldClose()) {
-         
+
         UpdatePhysicsSystem(deltaTime, bodyInterface);
 
         if (DEVMODE) {
             UpdatePlayer(&player, s_physics_system, deltaTime);
         } else UpdatePlayerMove(&player, s_physics_system, deltaTime);
 
-            UpdateCameraTarget(&player);
-            
+        UpdateCameraTarget(&player);
+
         // Begin drawing
         BeginDrawing();
-            ClearBackground(RAYWHITE);
- 
-            BeginMode3D(player.camera);
+        ClearBackground(RAYWHITE);
 
-                DrawGrid(100, 5.0f);
+        BeginMode3D(player.camera);
 
-                DrawModel(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
+        DrawModel(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, WHITE);
 
-                if (bodyInterface->IsActive(debugSphereID)) {
-                    JPH::RVec3 pos = bodyInterface->GetCenterOfMassPosition(debugSphereID);
-                        Vector3 spherePos = {(float)pos.GetX(), (float)pos.GetY(), (float)pos.GetZ()};
-                    DrawSphere(spherePos, 10.0f, RED);
-                }
+        if (bodyInterface->IsActive(debugSphereID)) {
+            JPH::RVec3 pos = bodyInterface->GetCenterOfMassPosition(debugSphereID);
+            Vector3 spherePos = {(float)pos.GetX(), (float)pos.GetY(), (float)pos.GetZ()};
+            DrawSphere(spherePos, 10.0f, RED);
+        }
 
-                DebugDrawPlayerAABB(&player);
-                DebugDir(&player);
+        DebugDrawPlayerAABB(&player);
+        DebugDir(&player); 
+        //DrawModelWires(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, GREEN);
 
-                //DrawModelWires(mapModel, (Vector3){0.0f, 0.0f, 0.0f}, 1.0f, GREEN);
+        EndMode3D();
 
-            EndMode3D();
-
-            DrawFPS(10, 10);
+        DebugDrawPlayerPos(&player, 10, 30);
+        DebugDrawPlayerVel(640, 600);
+        DrawFPS(10, 10);
         EndDrawing();
     }
 

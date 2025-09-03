@@ -16,6 +16,9 @@
 #include <cmath> 
 #include <algorithm> 
 
+// meters per TB unit conversion
+static constexpr float TB_TO_WORLD = 1.0f / 32.0f;
+
 /* 
 ------------------------------------------------------------
  HELPER FUNCTIONS
@@ -135,16 +138,30 @@ bool GetIntersection(const Plane& p1, const Plane& p2, const Plane& p3, Vector3&
     return true;
 }
 
+// Convert coordinates for brush defined entities, this conversion ONLY works for brushes defined by the plane intersection logic.
 Vector3 ConvertTBtoRaylib(const Vector3& in) {
     //  TB: (x,  y,  z) = (right, forward, up)
     // Raylib: (x,  y,  z) = (right, up, forward)
     Vector3 out = { 
         -in.x,     // X
         -in.z,    // Y
-        in.y     // Z
+        in.y    // Z
     };
     return out;
 }
+
+// Convert coordinates for entities not defined by brushes or the plane intersection logic.
+Vector3 ConvertTBtoRaylibEntities(const Vector3& in) {
+    //  TB: (x,  y,  z) = (right, forward, up)
+    // Raylib: (x,  y,  z) = (right, up, forward)
+    Vector3 out = { 
+        in.x,     // X
+        in.z,    // Y
+        -in.y    // Z
+    };
+    return out;
+}
+
 
 /*
   --------------------------------------------------------
@@ -157,33 +174,46 @@ void InitTextureManager(TextureManager& manager) {
     printf("TextureManager initialized and cleared.\n");
 }
 
-Texture2D LoadTextureByName(TextureManager& manager, const std::string& textureName) { 
+static int NextPOT(int x) {
+    int p = 1; while (p < x) p <<= 1; return p;
+}
+
+Texture2D LoadTextureByName(TextureManager& manager, const std::string& textureName) {
     auto it = manager.textures.find(textureName);
-    if (it != manager.textures.end()) {
-        // LOGGING
-        // printf("Texture '%s' already loaded.\n", textureName.c_str());
-        return it->second;
-    } else {
-        std::string filePath = "../../assets/textures/" + textureName + ".png"; // Assuming PNG format
-        Texture2D tex = LoadTexture(filePath.c_str());
-        if (tex.id != 0) {
-            manager.textures[textureName] = tex;
-            // LOGGING
-            // printf("Successfully loaded texture: %s\n", filePath.c_str());
-        } else {
-            printf("Failed to load texture: %s\n", filePath.c_str());
-            std::string defaultPath = "../../assets/textures/default.png";
-            tex = LoadTexture(defaultPath.c_str());
-            if (tex.id != 0) {
-                manager.textures["default"] = tex;
-                // LOGGING
-                // printf("Loaded default texture: %s\n", defaultPath.c_str());
-            } else {
-                printf("Failed to load default texture: %s\n", defaultPath.c_str());
-            }
+    if (it != manager.textures.end()) return it->second;
+
+    std::string filePath = "../../assets/textures/" + textureName + ".png";
+
+    Image img = LoadImage(filePath.c_str());
+    if (img.data == nullptr) {
+        printf("Failed to load texture image: %s\n", filePath.c_str());
+        Image defImg = LoadImage("../../assets/textures/default.png");
+        if (defImg.data == nullptr) {
+            printf("Failed to load default image.\n");
+            return Texture2D{}; // id 0
         }
-        return tex;
+        img = defImg; // use default
     }
+
+    // Make POT for WebGL REPEAT support
+    int potW = NextPOT(img.width);
+    int potH = NextPOT(img.height);
+    if (potW != img.width || potH != img.height) {
+        ImageResize(&img, potW, potH);
+    }
+
+    Texture2D tex = LoadTextureFromImage(img);
+    UnloadImage(img);
+
+    if (tex.id != 0) {
+        // Force repeat (WebGL1: only works if POT)
+        SetTextureWrap(tex, TEXTURE_WRAP_REPEAT);
+        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR); // optional
+        manager.textures[textureName] = tex;
+    } else {
+        printf("LoadTextureFromImage failed for: %s\n", filePath.c_str());
+    }
+    return tex;
 }
 
 void UnloadAllTextures(TextureManager& manager) {
@@ -401,29 +431,34 @@ Map ParseMapFile(const std::string &filename) {
     ENTITY PARSING
  --------------------------------------------------------
 */
-// For reading "info_player_start" in TB coords
+
+// Parse the info_player_start entity
 std::vector<PlayerStart> GetPlayerStarts(const Map &map) {
     std::vector<PlayerStart> starts;
     for (auto &entity : map.entities) {
         auto it = entity.properties.find("classname");
-        if (it!=entity.properties.end() && it->second=="info_player_start") {
+        if (it != entity.properties.end() && it->second == "info_player_start") {
             auto orgIt = entity.properties.find("origin");
-            if (orgIt!=entity.properties.end()) {
+            if (orgIt != entity.properties.end()) {
                 auto coords = SplitBySpace(orgIt->second);
-                if (coords.size()==3) {
+                if (coords.size() == 3) {
                     try {
-                        Vector3 pos = {
+                        // Parse TB as-is: (x, y, z) = (right, forward, up)
+                        Vector3 posTB = {
                             std::stof(coords[0]),
-                            std::stof(coords[2]),
-                            std::stof(coords[1])
-                        }; 
+                            std::stof(coords[1]),
+                            std::stof(coords[2])
+                        };
+                        // Convert with the same function as geometry:
+                        Vector3 posRL = ConvertTBtoRaylibEntities(posTB);
+
                         PlayerStart ps;
-                        ps.position = pos; 
+                        ps.position = posRL;           // (optionally * TB_TO_WORLD)
                         starts.push_back(ps);
 
-                        printf("PlayerStart: TB(%.1f, %.1f, %.1f)\n",
-                               pos.x, pos.y, pos.z);
-                    } catch(...) {}
+                        printf("PlayerStart TB:(%.1f, %.1f, %.1f)  RL:(%.1f, %.1f, %.1f)\n",
+                               posTB.x, posTB.y, posTB.z, posRL.x, posRL.y, posRL.z);
+                    } catch (...) {}
                 }
             }
         }

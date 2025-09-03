@@ -33,3 +33,8 @@ void UpdateCameraTarget(Player *player);
 void DebugDrawPlayerAABB(Player *player);
 
 void DebugDir(Player *player);
+
+void DebugDrawPlayerPos(const Player *player, int x, int y);
+
+void DebugDrawPlayerVel(int x, int y);
+
