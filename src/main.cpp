@@ -61,8 +61,6 @@ int main() {
     //printf("\n\n BUILDING MAP PHYSICS");
     BuildMapPhysics(collisionData, bodyInterface);
 
-    // TODO: Assign the players physics and add functionality to UpdatePlayer() to update with the physics tick.
-
     SpawnDebugPhysObj(bodyInterface);
 
     InitJoltCharacter(&player, s_physics_system);
