@@ -496,7 +496,7 @@ Model MapToMesh(const Map &map, TextureManager &textureManager) {
 
         for (auto &brush : entity.brushes) {
 
-            // Here we explicitly skip trigger brushes if !DEVMODE
+            // Here we explicitly skip trigger brushes rendering if !DEVMODE
             if (isTriggerBrush && !DEVMODE) {
                 continue;
             }

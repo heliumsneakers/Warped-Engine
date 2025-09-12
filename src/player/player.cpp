@@ -45,10 +45,6 @@
 *         player position we do a conversion into Jolt's Vec3? Not sure yet, will use this as the first attempt.
 */
 
-
-// TODO:: Fix AirAcceleration feeling, currently we can accelerate too much instead of the smooth bunnies build up like quake. Also we have a weird jitter when surfing along ramps.
-//        This issue may be because of jolt character penetration or just some weird movement vector magnitude bug, intuition seems to point to Jolt being the issue here.
-
 #define MOUSE_SENSITIVITY 0.5f
 bool cursorEnabled;
 
@@ -451,7 +447,7 @@ static void PM_AirAccelerate(Vector3 wishDir, float wishSpeed, float accel, floa
     velocity = Vector3Add(velocity, Vector3Scale(wishVel, accelspeed));
 }
 
-// PM_AirMove: Computes the wish direction from input.
+// PM_AirMove: Applies the acceleration functions to impulse the player in the desired movement directions.
 static void PM_AirMove(float dt, bool grounded)
 { 
     bool walkable = OnWalkableGround();
@@ -561,7 +557,7 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt) {
 
     // 13) Landing handling + friction (post-solve)
     bool landedThisFrame = (!was_grounded_this_frame_start && walkable);
-    s_skip_slope_cancel_this_frame = landedThisFrame; // still useful for OnContactSolve idle-slope logic
+    s_skip_slope_cancel_this_frame = landedThisFrame; // OnContactSolve idle-slope logic
     
     // Quake: apply friction every grounded tick (including the landing tick)
     PM_AirMove(dt, isGrounded);

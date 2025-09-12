@@ -13,7 +13,7 @@ typedef struct Player {
     float yaw;                
     float pitch;
         
-    //Bounding box for collisions: We get the center of the bbox and the half extents.
+    // Bounding box for collisions
     Vector3 center;
     Vector3 halfExt;
 
