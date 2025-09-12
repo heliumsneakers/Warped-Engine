@@ -12,7 +12,17 @@
 #include "Jolt/Jolt.h"
 #include "Jolt/Physics/Body/BodyInterface.h"
 
-
+// move this into like a user_settings file at a later point, i'll keep it here for now
+void ToggleFullscreenWindow() {
+    if (!IsWindowFullscreen()) {
+        int monitor = GetCurrentMonitor();
+        SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
+        ToggleFullscreen();
+    } else if (IsWindowFullscreen()) {
+        ToggleFullscreen();
+        SetWindowSize(SCREEN_WIDTH, SCREEN_HEIGHT);
+    }
+}
 
 int main() {
 
@@ -70,6 +80,10 @@ int main() {
     // Main game loop
     while (!WindowShouldClose()) {
 
+        if (IsKeyPressed(KEY_TAB)) {
+            ToggleFullscreenWindow();
+        }
+
         UpdatePhysicsSystem(deltaTime, bodyInterface);
 
         if (DEVMODE) {
@@ -99,7 +113,7 @@ int main() {
         EndMode3D();
 
         DebugDrawPlayerPos(&player, 10, 30);
-        DebugDrawPlayerVel(640, 600);
+        DebugDrawPlayerVel(GetScreenWidth() / 2, GetScreenHeight() - 100);
         DrawFPS(10, 10);
         EndDrawing();
     }
