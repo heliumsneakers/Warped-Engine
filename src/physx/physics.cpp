@@ -77,9 +77,9 @@
  *        correctly. Since there is alot of operations done on the parsed geometry from the .map file we need to ensure
  *        the vertices are being read properly from the point cloud.
  *
- *  NOTE: Implement trigger volumes using Jolt's sensor system. I believe this can be achieved by reading the trigger
+ *  TODO: *DONE* Implement trigger volumes using Jolt's sensor system. I believe this can be achieved by reading the trigger
  *        entity data from the map parser and assigning it's geometry as a collision hull but without uploading it to
- *        the GPU since we don't want to draw it and cause any artifacts. 
+ *        the GPU since we don't want to draw it and cause any artifacts. *DONE*
  * */
 
 static void TraceImpl(const char *inFMT, ...)
@@ -405,10 +405,10 @@ void BuildMapPhysics(std::vector<MeshCollisionData> &meshCollisionData, JPH::Bod
                 break;
             }
             case CollisionType::TRIGGER: {
-                // Often you'd keep it static but on a special "trigger" layer,
-                // or still NON_MOVING if your filters treat triggers differently.
+                // Often we keep this static but on a special "trigger" layer,
+                // or still NON_MOVING if the filters treat triggers differently.
                 motionType = JPH::EMotionType::Static; 
-                objectLayer = Layers::SENSOR; // Or a custom TRIGGER layer if you have one
+                objectLayer = Layers::SENSOR; // Or a custom TRIGGER layer if we implement one.
                 break;
             }
             case CollisionType::DYNAMIC: {
@@ -447,40 +447,4 @@ void BuildMapPhysics(std::vector<MeshCollisionData> &meshCollisionData, JPH::Bod
 
     printf("\n\n %d MAP COLLISIONS SUCCESSFULLY CREATED \n\n", count);
 }
-
-/* ~~~
- *  Based of the Jolt hello world example to test the physics system implementation.
- * ~~~
- *
-// Add a static floor, then spawn a dynamic sphere at (0, 10, 0)
-void SpawnMinimalTest(JPH::BodyInterface &bodyInterface)
-{
-    // 1) Create floor shape / body
-    JPH::RefConst<JPH::Shape> floorShape = new JPH::BoxShape(JPH::Vec3(100.0f, 1.0f, 100.0f));
-    JPH::BodyCreationSettings floorSettings(
-        floorShape,
-        JPH::RVec3(0.0f, -1.0f, 0.0f),    // Or JPH::Vec3 if single-precision
-        JPH::Quat::sIdentity(),
-        JPH::EMotionType::Static,
-        Layers::NON_MOVING
-    );
-    JPH::Body *floorBody = bodyInterface.CreateBody(floorSettings);
-    bodyInterface.AddBody(floorBody->GetID(), JPH::EActivation::DontActivate);
-
-    // 2) Create a dynamic sphere
-    JPH::RefConst<JPH::Shape> sphereShape = new JPH::SphereShape(0.5f);
-    JPH::BodyCreationSettings sphereSettings(
-        sphereShape,
-        JPH::RVec3(0.0f, 10.0f, 0.0f),   // Or JPH::Vec3(0,10,0)
-        JPH::Quat::sIdentity(),
-        JPH::EMotionType::Dynamic,
-        Layers::MOVING
-    );
-    JPH::BodyID sphereID = bodyInterface.CreateAndAddBody(sphereSettings, JPH::EActivation::Activate);
-
-    // Give it a downward velocity
-    bodyInterface.SetLinearVelocity(sphereID, JPH::Vec3(0.0f, -5.0f, 0.0f));
-
-    printf("[SpawnMinimalTest] Floor + sphere created.\n");
-} */
 
