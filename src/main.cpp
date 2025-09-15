@@ -33,7 +33,7 @@ int main() {
     printf("WINDOW INIT\n");
 
     // Initialize TextureManager
-    TextureManager textureManager;
+    TextureManager textureManager; 
     InitTextureManager(textureManager);
 
     // Culling Specification
