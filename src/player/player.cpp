@@ -425,10 +425,10 @@ static void PM_AirAccelerate(Vector3 wishDir, float wishSpeed, float accel, floa
         float ln = Vector3Length(n); if (ln > 0.0f) n = Vector3Scale(n, 1.0f / ln);
 
         if (Vector3DotProduct(velocity, n) < 0.0f) {
-            Vector3 clipped; PM_ClipVelocity(velocity, n, clipped, 1.0f); velocity = clipped;
+            Vector3 clipped; PM_ClipVelocity(velocity, n, clipped, 0.8f); velocity = clipped;
         }
         if (Vector3DotProduct(wishDir, n) < 0.0f) {
-            Vector3 steerv = wishDir; PM_ClipVelocity(steerv, n, steerv, 1.0f);
+            Vector3 steerv = wishDir; PM_ClipVelocity(steerv, n, steerv, 0.8f);
             float sl = Vector3Length(steerv);
             if (sl > 0.0001f) wishDir = Vector3Scale(steerv, 1.0f / sl);
         }
