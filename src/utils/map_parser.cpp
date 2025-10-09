@@ -13,8 +13,8 @@
 #include <unordered_map>
 #include <vector>
 #include <string>
-#include <cmath> 
-#include <algorithm> 
+#include <cmath>
+#include <algorithm>
 
 // meters per TB unit conversion
 static constexpr float TB_TO_WORLD = 1.0f / 32.0f;

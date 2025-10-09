@@ -55,7 +55,7 @@ const float     MAX_SPEED           = 100.0f;        // Maximum speed in m/s
 const float     ACCELERATION        = 5.0f;          // Acceleration in m/s^2 
 static float    FRICTION            = 4.0f;          // Friction coefficient
 const float     STOP_SPEED          = 10.0f;         // Speed below which the player stops
-const float     JUMP_FORCE          = 80.0f;         // Jump force
+const float     JUMP_FORCE          = 100.0f;         // Jump force
 const float     AIR_WISH_SPEED_CAP  = 12.0f;         // Capping wishSpeed magnitude while in air. higher values = more speed gain
 const float     AIR_ACCELERATION    = 100.0f;        // Air acceleration in m/s^2 higher values = more air control
 const float     GRAVITY             = -98.1f;        // Gravity constant

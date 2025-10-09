@@ -59,6 +59,14 @@ The following should be refactored for better modularity of the engine:
     # TODO (2): Change certain movement feel to player movment code.
 
     * Currently the strafing logic is correct and works fine. But the ramp surf is a bit buggy, there is an issue when changing camera directions on a   ramp that we can set the movement of the player to start surfing backwards when aiming up a ramp instead of upwards like in src games. I need to   find a balance between the quake strafe logic and the source engine handling of slope surfing.
-
+  
+  
+    > [!NOTE] **FIXED**
+    > There seems to be a wierd bug on linux (OMARCHY / arch). When going full screen the game doesn't resize the UI properly like it does on macOS, also when
+    > going back to windowed it completely breaks the game by whitescreening until you return to fullscreen. the issue may be arising out of the current 
+    > graphics driver im using leaking memory, or maybe it's some windowing issue with raylib and x11? Not sure yet but ASAN does point to a driver issue.
+    >
+    > **FIX: The issue was due to the OMARCHY installation using the DKMS driver which seemed to have a memory leak at the nvidia-glcore.so file. I changed to the regular
+    >      'nvidia' instead of 'nvidia-dkms' (all kernels) and this seemed to solve the issue (RTX 4070 card with ADA104 architecture).**
 
 
