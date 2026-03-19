@@ -1,0 +1,9 @@
+[submodule "lib/sokol"]
+	path = lib/sokol
+	url = https://github.com/floooh/sokol.git
+[submodule "lib/JoltPhysics"]
+	path = lib/JoltPhysics
+	url = https://github.com/jrouwe/JoltPhysics.git
+[submodule "lib/raylib"]
+	path = lib/raylib
+	url = https://github.com/raysan5/raylib.git
