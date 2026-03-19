@@ -2,6 +2,7 @@
 *.tmp
 *.swp
 *.a
+.DS_Store
 
 # Ignore build artifacts
 /build/bin
