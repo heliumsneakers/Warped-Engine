@@ -1,7 +1,7 @@
 #pragma once
 
 #include <vector>
-#include "raylib.h"
+#include "../math/wmath.h"
 #include "../utils/map_parser.h"
 
 enum class CollisionType {
@@ -17,6 +17,4 @@ struct MeshCollisionData {
     CollisionType collisionType;
 };
 
-static CollisionType GetEntityCollisionType(const Entity &ent);
-static std::vector<Vector3> BuildBrushGeometry(const Brush &brush);
 std::vector<MeshCollisionData> ExtractCollisionData(const Map &map);

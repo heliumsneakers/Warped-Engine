@@ -30,9 +30,12 @@ if(APPLE OR (UNIX AND NOT WIN32))
 endif()
 
 # ------------------------------------------------------------------
-# Sanitizers (Clang or GCC)
+# Sanitizers (Clang or GCC) — off by default; ASan's shadow-memory
+# bookkeeping and quarantine sweeps cause runtime hitching, so only
+# enable on demand:  cmake -D WARPED_ENABLE_ASAN=ON ..
 # ------------------------------------------------------------------
-if (CMAKE_COMPILER_IS_GNUCXX OR (CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+option(WARPED_ENABLE_ASAN "Build with AddressSanitizer" OFF)
+if (WARPED_ENABLE_ASAN AND (CMAKE_COMPILER_IS_GNUCXX OR (CMAKE_CXX_COMPILER_ID MATCHES "Clang")))
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address)
 endif()
@@ -41,35 +44,6 @@ endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-
-# Include dirs
-include_directories(${PROJECT_SOURCE_DIR}/src/include)
-
-# ----------------------------
-# raylib
-# ----------------------------
-set(RAYLIB_VERSION 5.5)
-find_package(raylib ${RAYLIB_VERSION} QUIET)
-if (NOT raylib_FOUND)
-  include(FetchContent)
-  FetchContent_Declare(
-    raylib
-    DOWNLOAD_EXTRACT_TIMESTAMP OFF
-    URL https://github.com/raysan5/raylib/archive/refs/tags/${RAYLIB_VERSION}.tar.gz
-  )
-  FetchContent_GetProperties(raylib)
-  if (NOT raylib_POPULATED)
-    set(FETCHCONTENT_QUIET NO)
-    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(raylib)
-  endif()
-endif()
-
-# ----------------------------
-# raygui
-# ----------------------------
-set(RAYGUI_SRC ${PROJECT_SOURCE_DIR}/lib/raygui/src)
-include_directories(${RAYGUI_SRC})
 
 # ----------------------------
 # JoltPhysics
@@ -81,18 +55,32 @@ add_subdirectory(lib/JoltPhysics/Build)
 # ----------------------------
 # Sources
 # ----------------------------
-file(GLOB_RECURSE CUSTOM_SOURCES
+# C++ sources — everything under src/ except the sokol impl TU which is C/ObjC.
+file(GLOB_RECURSE WARPED_CXX_SOURCES
+    CONFIGURE_DEPENDS
     src/*.cpp
-    src/*.c
-    lib/raygui/src/*.c
-    lib/raygui/src/*.cpp
+)
+list(FILTER WARPED_CXX_SOURCES EXCLUDE REGEX "platform/sokol_impl")
+
+# Sokol implementation TU — compiled as Obj-C on Apple, plain C elsewhere.
+set(SOKOL_IMPL_SRC src/platform/sokol_impl.c)
+if (APPLE)
+    set_source_files_properties(${SOKOL_IMPL_SRC}
+        PROPERTIES
+            LANGUAGE OBJC
+            COMPILE_FLAGS "-fobjc-arc -x objective-c")
+endif()
+
+add_executable(WarpedGame
+    ${WARPED_CXX_SOURCES}
+    ${SOKOL_IMPL_SRC}
 )
 
-add_executable(WarpedGame ${CUSTOM_SOURCES})
-
 target_include_directories(WarpedGame PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-    ${RAYGUI_SRC}
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/lib/sokol
+    ${PROJECT_SOURCE_DIR}/lib/sokol/util
+    ${PROJECT_SOURCE_DIR}/lib/stb
 )
 
 # ----------------------------
@@ -100,14 +88,19 @@ target_include_directories(WarpedGame PRIVATE
 # ----------------------------
 set(PLATFORM_LIBS)
 if (APPLE)
-    find_library(COCOA_LIBRARY Cocoa)
-    find_library(IOKIT_LIBRARY IOKit)
+    enable_language(OBJC)
+    find_library(COCOA_LIBRARY          Cocoa)
+    find_library(QUARTZCORE_LIBRARY     QuartzCore)
+    find_library(UNIFORM_TYPE_IDENT_LIB UniformTypeIdentifiers)
+    find_library(IOKIT_LIBRARY          IOKit)
     find_library(COREFOUNDATION_LIBRARY CoreFoundation)
-    find_library(COREGRAPHICS_LIBRARY CoreGraphics)
-    find_library(COREVIDEO_LIBRARY CoreVideo)
-    find_library(OPENGL_LIBRARY OpenGL)
+    find_library(COREGRAPHICS_LIBRARY   CoreGraphics)
+    find_library(COREVIDEO_LIBRARY      CoreVideo)
+    find_library(OPENGL_LIBRARY         OpenGL)
     list(APPEND PLATFORM_LIBS
         ${COCOA_LIBRARY}
+        ${QUARTZCORE_LIBRARY}
+        ${UNIFORM_TYPE_IDENT_LIB}
         ${IOKIT_LIBRARY}
         ${COREFOUNDATION_LIBRARY}
         ${COREGRAPHICS_LIBRARY}
@@ -115,9 +108,9 @@ if (APPLE)
         ${OPENGL_LIBRARY}
     )
 elseif (UNIX)
-    list(APPEND PLATFORM_LIBS GL pthread dl m)
+    list(APPEND PLATFORM_LIBS X11 Xi Xcursor GL dl pthread m)
 elseif (WIN32)
-    list(APPEND PLATFORM_LIBS opengl32)
+    list(APPEND PLATFORM_LIBS opengl32 gdi32)
 endif()
 
 # ----------------------------
@@ -125,12 +118,6 @@ endif()
 # ----------------------------
 target_link_libraries(WarpedGame PRIVATE
     Jolt
-    raylib
     ${PLATFORM_LIBS}
     ${WARPED_LIBCXX_EXTRA_LIBS}
 )
-
-# ----------------------------
-# Defines
-# ----------------------------
-target_compile_definitions(WarpedGame PRIVATE RAYGUI_IMPLEMENTATION)

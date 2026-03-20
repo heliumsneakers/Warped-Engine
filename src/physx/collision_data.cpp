@@ -1,9 +1,10 @@
-#include "raylib.h"
-#include "raymath.h"
+#include "../math/wmath.h"
 #include "collision_data.h"
 #include "../utils/map_parser.h"
 #include <vector>
 #include <string>
+#include <algorithm>
+#include <cstdio>
 
 static CollisionType GetEntityCollisionType(const Entity &ent) {
     CollisionType ct = CollisionType::UNKNOWN;
