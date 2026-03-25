@@ -1,3 +1,0 @@
-/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/build_mc/CMakeFiles/compile_map.dir
-/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/build_mc/CMakeFiles/edit_cache.dir
-/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/build_mc/CMakeFiles/rebuild_cache.dir
