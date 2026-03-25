@@ -78,26 +78,69 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 # ----------------------------
-# Map compiler (offline CLI) — built standalone, no sokol/Jolt.
+# Map compiler (offline CLI) — built standalone, no app/runtime renderer/Jolt.
+# Uses sokol_gfx directly for the compute lightmap baker.
 #   cmake -B build_mc -DBUILD_MAP_COMPILER=ON && cmake --build build_mc
 #   ./build_mc/bin/compile_map assets/maps/test.map test
 # ----------------------------
 option(BUILD_MAP_COMPILER "Build only the compile_map CLI tool" OFF)
 
 if(BUILD_MAP_COMPILER)
+    if(APPLE)
+        enable_language(OBJC)
+        enable_language(OBJCXX)
+        set_source_files_properties(src/compiler/sokol_compute_impl.c
+            PROPERTIES
+                LANGUAGE OBJC
+                COMPILE_FLAGS "-fobjc-arc -x objective-c")
+    endif()
+
     add_executable(compile_map
         src/compiler/compile_map.cpp
         src/compiler/lightmap.cpp
+        src/compiler/lightmap_compute.cpp
+        src/compiler/sokol_compute_impl.c
         src/utils/map_parser.cpp
         src/utils/parameters.cpp
         src/physx/collision_data.cpp
     )
+    if(APPLE)
+        target_sources(compile_map PRIVATE src/compiler/lightmap_compute_metal.mm)
+    endif()
     target_compile_definitions(compile_map PRIVATE WARPED_COMPILER_BUILD)
+    if(WARPED_SOKOL_BACKEND STREQUAL "METAL")
+        target_compile_definitions(compile_map PRIVATE WARPED_SOKOL_BACKEND_METAL)
+    elseif(WARPED_SOKOL_BACKEND STREQUAL "D3D11")
+        target_compile_definitions(compile_map PRIVATE WARPED_SOKOL_BACKEND_D3D11)
+    elseif(WARPED_SOKOL_BACKEND STREQUAL "GLCORE")
+        target_compile_definitions(compile_map PRIVATE WARPED_SOKOL_BACKEND_GLCORE)
+    endif()
     target_include_directories(compile_map PRIVATE
         ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/lib/sokol
         ${PROJECT_SOURCE_DIR}/lib/stb
     )
-    target_link_libraries(compile_map PRIVATE ${WARPED_LIBCXX_EXTRA_LIBS})
+
+    set(COMPILER_PLATFORM_LIBS)
+    if(APPLE)
+        find_library(FOUNDATION_LIBRARY     Foundation)
+        find_library(METAL_LIBRARY          Metal)
+        find_library(QUARTZCORE_LIBRARY     QuartzCore)
+        list(APPEND COMPILER_PLATFORM_LIBS
+            ${FOUNDATION_LIBRARY}
+            ${METAL_LIBRARY}
+            ${QUARTZCORE_LIBRARY}
+        )
+    elseif(WIN32)
+        list(APPEND COMPILER_PLATFORM_LIBS d3d11 dxgi dxguid)
+    elseif(UNIX)
+        list(APPEND COMPILER_PLATFORM_LIBS X11 GL dl pthread m)
+    endif()
+
+    target_link_libraries(compile_map PRIVATE
+        ${COMPILER_PLATFORM_LIBS}
+        ${WARPED_LIBCXX_EXTRA_LIBS}
+    )
     return()   # don't configure the engine target
 endif()
 

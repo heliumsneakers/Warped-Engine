@@ -1,0 +1,198 @@
+@module warped_lightmap_bake
+
+@cs cs_bake
+layout(binding=0) uniform cs_face_params {
+    int atlas_width;
+    int atlas_height;
+    int rect_x;
+    int rect_y;
+    int rect_w;
+    int rect_h;
+    int light_count;
+    int tri_count;
+    float min_u;
+    float min_v;
+    float luxel_size;
+    float ambient;
+    float shadow_bias;
+    float ray_eps;
+    float _pad_scalar0;
+    float _pad_scalar1;
+    vec3 origin;
+    float _pad0;
+    vec3 axis_u;
+    float _pad1;
+    vec3 axis_v;
+    float _pad2;
+    vec3 normal;
+    float _pad3;
+};
+
+struct point_light {
+    vec3 position;
+    float intensity;
+    vec3 color;
+    float _pad0;
+};
+
+struct occluder_tri {
+    vec3 a;
+    float _pad0;
+    vec3 b;
+    float _pad1;
+    vec3 c;
+    float _pad2;
+    vec3 bounds_min;
+    float _pad3;
+    vec3 bounds_max;
+    float _pad4;
+};
+
+struct packed_pixel {
+    uint value;
+};
+
+layout(binding=0) readonly buffer cs_lights {
+    point_light lights[];
+};
+
+layout(binding=1) readonly buffer cs_occluders {
+    occluder_tri tris[];
+};
+
+layout(binding=2) buffer cs_output {
+    packed_pixel pixels[];
+};
+
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+
+const int AA_GRID = 4;
+const int SAMPLES = AA_GRID * AA_GRID;
+
+bool ray_aabb(vec3 ro, vec3 inv_rd, vec3 bb_min, vec3 bb_max, float tmax) {
+    float t1;
+    float t2;
+    float tn = 0.0;
+    float tf = tmax;
+
+    t1 = (bb_min.x - ro.x) * inv_rd.x;
+    t2 = (bb_max.x - ro.x) * inv_rd.x;
+    tn = max(tn, min(t1, t2));
+    tf = min(tf, max(t1, t2));
+
+    t1 = (bb_min.y - ro.y) * inv_rd.y;
+    t2 = (bb_max.y - ro.y) * inv_rd.y;
+    tn = max(tn, min(t1, t2));
+    tf = min(tf, max(t1, t2));
+
+    t1 = (bb_min.z - ro.z) * inv_rd.z;
+    t2 = (bb_max.z - ro.z) * inv_rd.z;
+    tn = max(tn, min(t1, t2));
+    tf = min(tf, max(t1, t2));
+
+    return tf >= tn;
+}
+
+bool ray_tri(vec3 ro, vec3 rd, occluder_tri tri, float tmin, float tmax) {
+    vec3 e1 = tri.b - tri.a;
+    vec3 e2 = tri.c - tri.a;
+    vec3 p = cross(rd, e2);
+    float det = dot(e1, p);
+    if (abs(det) < ray_eps) {
+        return false;
+    }
+    float inv = 1.0 / det;
+    vec3 s = ro - tri.a;
+    float u = dot(s, p) * inv;
+    if ((u < 0.0) || (u > 1.0)) {
+        return false;
+    }
+    vec3 q = cross(s, e1);
+    float v = dot(rd, q) * inv;
+    if ((v < 0.0) || ((u + v) > 1.0)) {
+        return false;
+    }
+    float t = dot(e2, q) * inv;
+    return (t > tmin) && (t < tmax);
+}
+
+vec3 safe_inverse_dir(vec3 rd) {
+    vec3 denom = rd;
+    if (abs(denom.x) <= ray_eps) {
+        denom.x = (denom.x >= 0.0) ? ray_eps : -ray_eps;
+    }
+    if (abs(denom.y) <= ray_eps) {
+        denom.y = (denom.y >= 0.0) ? ray_eps : -ray_eps;
+    }
+    if (abs(denom.z) <= ray_eps) {
+        denom.z = (denom.z >= 0.0) ? ray_eps : -ray_eps;
+    }
+    return 1.0 / denom;
+}
+
+bool occluded(vec3 ro, vec3 rd, float dist) {
+    vec3 inv_rd = safe_inverse_dir(rd);
+    for (int i = 0; i < tri_count; ++i) {
+        occluder_tri tri = tris[i];
+        if (!ray_aabb(ro, inv_rd, tri.bounds_min, tri.bounds_max, dist)) {
+            continue;
+        }
+        if (ray_tri(ro, rd, tri, ray_eps, dist)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint pack_rgba8(vec4 color) {
+    uvec4 c = uvec4(clamp(color, 0.0, 1.0) * 255.0 + 0.5);
+    return (c.x) | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
+}
+
+void main() {
+    ivec2 local_xy = ivec2(gl_GlobalInvocationID.xy);
+    if ((local_xy.x >= rect_w) || (local_xy.y >= rect_h)) {
+        return;
+    }
+
+    vec3 accum = vec3(0.0);
+    float inv_grid = 1.0 / float(AA_GRID);
+    for (int sy = 0; sy < AA_GRID; ++sy) {
+        for (int sx = 0; sx < AA_GRID; ++sx) {
+            float ju = float(local_xy.x - 2) + (float(sx) + 0.5) * inv_grid;
+            float jv = float(local_xy.y - 2) + (float(sy) + 0.5) * inv_grid;
+            vec3 wp = origin + axis_u * (ju * luxel_size) + axis_v * (jv * luxel_size);
+            vec3 ro = wp + normal * shadow_bias;
+
+            vec3 sample_rgb = vec3(ambient);
+            for (int li = 0; li < light_count; ++li) {
+                point_light light = lights[li];
+                vec3 to_light = light.position - ro;
+                float dist = length(to_light);
+                if ((dist > light.intensity) || (dist < 1e-3)) {
+                    continue;
+                }
+                vec3 dir = to_light / dist;
+                float ndl = dot(normal, dir);
+                if (ndl <= 0.0) {
+                    continue;
+                }
+                if (occluded(ro, dir, dist - shadow_bias)) {
+                    continue;
+                }
+                float attenuation = 1.0 - dist / light.intensity;
+                attenuation *= attenuation;
+                sample_rgb += light.color * ndl * attenuation;
+            }
+            accum += sample_rgb;
+        }
+    }
+
+    accum /= float(SAMPLES);
+    ivec2 atlas_xy = ivec2(rect_x + local_xy.x, rect_y + local_xy.y);
+    uint out_index = uint(atlas_xy.y * atlas_width + atlas_xy.x);
+    pixels[out_index].value = pack_rgba8(vec4(accum, 1.0));
+}
+@end
+
+@program bake cs_bake
