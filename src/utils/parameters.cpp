@@ -4,7 +4,7 @@ int SCREEN_WIDTH = 1280;
 int SCREEN_HEIGHT = 720;
 
 // Render-rate cap.  0 = uncapped (run as fast as the loop can drive).
-int FPS_MAX = 144;
+int FPS_MAX = 300;
 
 // Gameplay simulation tick rate.  Movement constants were tuned with the
 // raylib build running SetTargetFPS(144) + fixed deltaTime step per frame,

@@ -12,6 +12,7 @@
 
 /assets/
 /build/
+/build_compiler/
 /.cache/
 
 # Ignore IDE/editor configurations

@@ -18,6 +18,7 @@
 #include "render/renderer.h"
 #include "render/debug_draw.h"
 #include "utils/map_parser.h"
+#include "utils/bsp_loader.h"
 #include "utils/parameters.h"
 #include "physx/collision_data.h"
 #include "physx/physics.h"
@@ -108,10 +109,15 @@ static void init(void) {
 
     printf("[init] sokol gfx+app OK\n");
 
-    // --- Parse map ------------------------------------------------------
-    Map map = ParseMapFile("../../assets/maps/test.map");
+    // --- Load compiled map (.bsp) --------------------------------------
+    BSPData bsp;
+    if (!LoadBSP("../../assets/maps/test.bsp", bsp)) {
+        printf("[init] ERROR: run compile_map on assets/maps/test.map first.\n");
+        sapp_request_quit();
+        return;
+    }
 
-    std::vector<PlayerStart> starts = GetPlayerStarts(map);
+    std::vector<PlayerStart> starts = GetPlayerStarts(bsp);
     Vector3 spawnRL = starts.empty() ? (Vector3){0,0,0} : starts[0].position;
 
     // --- Player ---------------------------------------------------------
@@ -121,18 +127,15 @@ static void init(void) {
     printf("\n Spawn point:: x:%f y:%f z:%f\n\n",
            G.player.center.x, G.player.center.y, G.player.center.z);
 
-    // --- Upload render geometry ----------------------------------------
-    G.mapModel = Renderer_UploadMap(map, G.texMgr);
+    // --- Upload render geometry (pre-triangulated, with lightmap) -------
+    G.mapModel = Renderer_UploadBSP(bsp, G.texMgr);
 
     // --- Physics --------------------------------------------------------
     InitPhysicsSystem();
     G.bodyInterface = &GetBodyInterface();
 
-    printf("\n\n EXTRACTING COLLISION DATA");
-    std::vector<MeshCollisionData> collisionData = ExtractCollisionData(map);
-    printf("\n\n COLLISION DATA EXTRACTED SUCCESSFULLY");
-
-    BuildMapPhysics(collisionData, G.bodyInterface);
+    printf("\n\n LOADING COLLISION DATA FROM BSP");
+    BuildMapPhysics(bsp.hulls, G.bodyInterface);
     SpawnDebugPhysObj(G.bodyInterface);
 
     InitJoltCharacter(&G.player, s_physics_system);

@@ -1,0 +1,32 @@
+[
+{
+  "directory": "/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/build_mc",
+  "command": "/usr/bin/c++ -DWARPED_COMPILER_BUILD -I/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src -I/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/lib/stb -O2 -g -DNDEBUG -std=gnu++17 -arch arm64 -stdlib=libc++ -o CMakeFiles/compile_map.dir/src/compiler/compile_map.cpp.o -c /Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src/compiler/compile_map.cpp",
+  "file": "/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src/compiler/compile_map.cpp",
+  "output": "CMakeFiles/compile_map.dir/src/compiler/compile_map.cpp.o"
+},
+{
+  "directory": "/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/build_mc",
+  "command": "/usr/bin/c++ -DWARPED_COMPILER_BUILD -I/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src -I/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/lib/stb -O2 -g -DNDEBUG -std=gnu++17 -arch arm64 -stdlib=libc++ -o CMakeFiles/compile_map.dir/src/compiler/lightmap.cpp.o -c /Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src/compiler/lightmap.cpp",
+  "file": "/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src/compiler/lightmap.cpp",
+  "output": "CMakeFiles/compile_map.dir/src/compiler/lightmap.cpp.o"
+},
+{
+  "directory": "/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/build_mc",
+  "command": "/usr/bin/c++ -DWARPED_COMPILER_BUILD -I/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src -I/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/lib/stb -O2 -g -DNDEBUG -std=gnu++17 -arch arm64 -stdlib=libc++ -o CMakeFiles/compile_map.dir/src/utils/map_parser.cpp.o -c /Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src/utils/map_parser.cpp",
+  "file": "/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src/utils/map_parser.cpp",
+  "output": "CMakeFiles/compile_map.dir/src/utils/map_parser.cpp.o"
+},
+{
+  "directory": "/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/build_mc",
+  "command": "/usr/bin/c++ -DWARPED_COMPILER_BUILD -I/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src -I/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/lib/stb -O2 -g -DNDEBUG -std=gnu++17 -arch arm64 -stdlib=libc++ -o CMakeFiles/compile_map.dir/src/utils/parameters.cpp.o -c /Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src/utils/parameters.cpp",
+  "file": "/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src/utils/parameters.cpp",
+  "output": "CMakeFiles/compile_map.dir/src/utils/parameters.cpp.o"
+},
+{
+  "directory": "/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/build_mc",
+  "command": "/usr/bin/c++ -DWARPED_COMPILER_BUILD -I/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src -I/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/lib/stb -O2 -g -DNDEBUG -std=gnu++17 -arch arm64 -stdlib=libc++ -o CMakeFiles/compile_map.dir/src/physx/collision_data.cpp.o -c /Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src/physx/collision_data.cpp",
+  "file": "/Users/klo/projects/Data_Annotation/boxing/strudelv8/Warped-Engine/src/physx/collision_data.cpp",
+  "output": "CMakeFiles/compile_map.dir/src/physx/collision_data.cpp.o"
+}
+]

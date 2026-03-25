@@ -46,6 +46,30 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 # ----------------------------
+# Map compiler (offline CLI) — built standalone, no sokol/Jolt.
+#   cmake -B build_mc -DBUILD_MAP_COMPILER=ON && cmake --build build_mc
+#   ./build_mc/bin/compile_map assets/maps/test.map test
+# ----------------------------
+option(BUILD_MAP_COMPILER "Build only the compile_map CLI tool" OFF)
+
+if(BUILD_MAP_COMPILER)
+    add_executable(compile_map
+        src/compiler/compile_map.cpp
+        src/compiler/lightmap.cpp
+        src/utils/map_parser.cpp
+        src/utils/parameters.cpp
+        src/physx/collision_data.cpp
+    )
+    target_compile_definitions(compile_map PRIVATE WARPED_COMPILER_BUILD)
+    target_include_directories(compile_map PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/lib/stb
+    )
+    target_link_libraries(compile_map PRIVATE ${WARPED_LIBCXX_EXTRA_LIBS})
+    return()   # don't configure the engine target
+endif()
+
+# ----------------------------
 # JoltPhysics
 # ----------------------------
 set(BUILD_TESTS OFF CACHE BOOL "Disable building tests" FORCE)
@@ -61,6 +85,7 @@ file(GLOB_RECURSE WARPED_CXX_SOURCES
     src/*.cpp
 )
 list(FILTER WARPED_CXX_SOURCES EXCLUDE REGEX "platform/sokol_impl")
+list(FILTER WARPED_CXX_SOURCES EXCLUDE REGEX "compiler/")
 
 # Sokol implementation TU — compiled as Obj-C on Apple, plain C elsewhere.
 set(SOKOL_IMPL_SRC src/platform/sokol_impl.c)

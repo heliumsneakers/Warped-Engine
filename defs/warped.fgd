@@ -74,6 +74,12 @@
     angles(angle) : "Spotlight Direction" : "0 0 0" : "Direction of the light."
 ]
 
+// Point Light — baked into lightmap at compile time
+@PointClass base(Targetname, Origin) size(-8 -8 -8, 8 8 8) color(255 255 0) = light_point : "Baked Point Light" [
+    _color(color255) : "Light Color (R G B)" : "255 255 255" : "Color of the emitted light."
+    intensity(float) : "Intensity (emission radius, TB units)" : "300" : "Radius within which the light contributes."
+]
+
 // Trigger Once
 @SolidClass base(Targetname, Target) size(-8 -8 -8, 8 8 8) color(0 255 255) = trigger_once : "Trigger Once" [
     spawnflags(flags) =

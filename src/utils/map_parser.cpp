@@ -1,7 +1,9 @@
 // map_parser.cpp
 #include "map_parser.h"
 #include "parameters.h"
+#ifndef WARPED_COMPILER_BUILD
 #include "../render/renderer.h"       // TextureManager / LoadTextureByName
+#endif
 
 #include <fstream>
 #include <sstream>
@@ -360,6 +362,53 @@ Map ParseMapFile(const std::string &filename) {
  --------------------------------------------------------
 */
 
+static bool ParseVec3Prop(const Entity& e, const char* key, Vector3& out) {
+    auto it = e.properties.find(key);
+    if (it == e.properties.end()) return false;
+    auto t = SplitBySpace(it->second);
+    if (t.size() != 3) return false;
+    try { out = { std::stof(t[0]), std::stof(t[1]), std::stof(t[2]) }; }
+    catch (...) { return false; }
+    return true;
+}
+
+static bool ParseFloatProp(const Entity& e, const char* key, float& out) {
+    auto it = e.properties.find(key);
+    if (it == e.properties.end()) return false;
+    try { out = std::stof(it->second); }
+    catch (...) {
+        printf("  [warn] entity '%s' has non-numeric %s='%s', using default\n",
+               e.properties.count("classname") ? e.properties.at("classname").c_str() : "?",
+               key, it->second.c_str());
+        return false;
+    }
+    return true;
+}
+
+std::vector<PointLight> GetPointLights(const Map &map) {
+    std::vector<PointLight> lights;
+    for (auto &e : map.entities) {
+        auto it = e.properties.find("classname");
+        if (it == e.properties.end() || it->second != "light_point") continue;
+
+        Vector3 originTB{0,0,0}, color255{255,255,255};
+        ParseVec3Prop(e, "origin", originTB);
+        ParseVec3Prop(e, "_color", color255);
+
+        float intensity = 300.0f;
+        ParseFloatProp(e, "intensity", intensity);
+
+        PointLight pl;
+        pl.position  = ConvertTBtoRaylibEntities(originTB);
+        pl.color     = { color255.x/255.0f, color255.y/255.0f, color255.z/255.0f };
+        pl.intensity = intensity;
+        lights.push_back(pl);
+        printf("PointLight at (%.1f,%.1f,%.1f) radius=%.1f\n",
+               pl.position.x, pl.position.y, pl.position.z, pl.intensity);
+    }
+    return lights;
+}
+
 std::vector<PlayerStart> GetPlayerStarts(const Map &map) {
     std::vector<PlayerStart> starts;
     for (auto &entity : map.entities) {
@@ -393,178 +442,159 @@ std::vector<PlayerStart> GetPlayerStarts(const Map &map) {
 
 /*
 ------------------------------------------------------------
-    BUILD RENDER GEOMETRY  (CPU side — GPU upload is in renderer.cpp)
+    UV PROJECTION (shared by legacy path and .bsp compiler)
 ------------------------------------------------------------
 */
-
-std::vector<MapMeshBucket> BuildMapGeometry(const Map &map, TextureManager &textureManager)
+Vector2 ComputeFaceUV(const Vector3& vert,
+                      const Vector3& axisU, const Vector3& axisV,
+                      float offU, float offV, float rot,
+                      float scaleU, float scaleV,
+                      float texW, float texH)
 {
-    // texture-name → bucket-index
-    std::unordered_map<std::string, size_t> bucketIdx;
-    std::vector<MapMeshBucket> buckets;
+    float sx = Vector3DotProduct(vert, axisU) / scaleU;
+    float sy = Vector3DotProduct(vert, axisV) / scaleV;
 
-    auto GetBucket = [&](const std::string& name) -> MapMeshBucket& {
-        auto it = bucketIdx.find(name);
-        if (it != bucketIdx.end()) return buckets[it->second];
-        bucketIdx[name] = buckets.size();
-        buckets.push_back(MapMeshBucket{});
-        buckets.back().texture = name;
-        return buckets.back();
-    };
+    float rad = rot * DEG2RAD;
+    float cr = cosf(rad), sr = sinf(rad);
+    float sxR = sx*cr - sy*sr;
+    float syR = sx*sr + sy*cr;
+
+    // Negated for axis conversion.
+    sxR += -offU;
+    syR += -offV;
+
+    if (texW > 0.f) sxR /= texW;
+    if (texH > 0.f) syR /= texH;
+
+    // Orientation flip for axis conversion.
+    return (Vector2){ 1.0f - sxR, 1.0f - syR };
+}
+
+/*
+------------------------------------------------------------
+    BUILD POLYGONS  — renderer-agnostic (no TextureManager)
+    Does plane intersection → CCW-sorted world-space polys.
+    Used by the .bsp compiler and by BuildMapGeometry below.
+------------------------------------------------------------
+*/
+std::vector<MapPolygon> BuildMapPolygons(const Map &map, bool devMode)
+{
+    std::vector<MapPolygon> out;
 
     for (auto &entity : map.entities) {
-        // Logic for skipping trigger entity rendering if we are not in DEVMODE
-        bool isTriggerBrush = false;
-        auto it = entity.properties.find("classname");
-        if (it != entity.properties.end()) {
-            const std::string &classname = it->second;
-            if (classname == "trigger_once" || classname == "trigger_multiple") {
-                isTriggerBrush = true;
-            }
+        bool isTrigger = false;
+        auto cit = entity.properties.find("classname");
+        if (cit != entity.properties.end()) {
+            const std::string &cn = cit->second;
+            if (cn == "trigger_once" || cn == "trigger_multiple") isTrigger = true;
         }
 
         for (auto &brush : entity.brushes) {
+            if (isTrigger && !devMode) continue;
 
-            // Skip trigger brushes rendering if !DEVMODE
-            if (isTriggerBrush && !DEVMODE) {
-                continue;
+            int nF = (int)brush.faces.size();
+            if (nF < 3) continue;
+
+            std::vector<Plane> planes(nF);
+            for (int i=0;i<nF;++i) {
+                planes[i].normal = brush.faces[i].normal;
+                planes[i].d      = Vector3DotProduct(brush.faces[i].normal,
+                                                     brush.faces[i].vertices[0]);
             }
 
-            int numFaces = (int)brush.faces.size();
-            if (numFaces < 3) {
-                printf("Skipping brush (fewer than 3 faces).\n");
-                continue;
-            }
-
-            // Create planes in TB coords
-            std::vector<Plane> planes;
-            planes.reserve(numFaces);
-            for (auto &face : brush.faces) {
-                Plane plane;
-                plane.normal = face.normal;
-                plane.d      = Vector3DotProduct(face.normal, face.vertices[0]);
-                planes.push_back(plane);
-            }
-
-            // Build polygons per face
-            std::vector<std::vector<Vector3>> polys(numFaces);
-
-            for (int i=0; i<numFaces-2; ++i) {
-                for (int j=i+1; j<numFaces-1; ++j) {
-                    for (int k=j+1; k<numFaces; ++k) {
-                        Vector3 ip;
-                        if (GetIntersection(planes[i], planes[j], planes[k], ip)) {
-                            bool inside = true;
-                            for (int m=0; m<numFaces; ++m) {
-                                float dist = Vector3DotProduct(brush.faces[m].normal, ip) + planes[m].d;
-                                if (dist > (float)epsilon) {
-                                    inside = false;
-                                    break;
-                                }
-                            }
-                            if (inside) {
-                                polys[i].push_back(ip);
-                                polys[j].push_back(ip);
-                                polys[k].push_back(ip);
-                            }
-                        }
+            std::vector<std::vector<Vector3>> polys(nF);
+            for (int i=0;i<nF-2;++i)
+              for (int j=i+1;j<nF-1;++j)
+                for (int k=j+1;k<nF;++k) {
+                    Vector3 ip;
+                    if (!GetIntersection(planes[i],planes[j],planes[k],ip)) continue;
+                    bool inside = true;
+                    for (int m=0;m<nF;++m) {
+                        float d = Vector3DotProduct(brush.faces[m].normal, ip) + planes[m].d;
+                        if (d > (float)epsilon) { inside=false; break; }
                     }
+                    if (inside) { polys[i].push_back(ip); polys[j].push_back(ip); polys[k].push_back(ip); }
                 }
-            }
 
-            for (int i=0; i<numFaces; ++i) {
+            for (int i=0;i<nF;++i) {
                 RemoveDuplicatePoints(polys[i], (float)epsilon);
-                if (polys[i].size()<3) {
-                    continue;
-                }
+                if (polys[i].size()<3) continue;
 
-                Vector3 faceNormalTB = brush.faces[i].normal;
+                Vector3 nTB = brush.faces[i].normal;
+                SortPolygonVertices(polys[i], nTB);
+                for (auto &p : polys[i]) p = ConvertTBtoRaylib(p);
 
-                SortPolygonVertices(polys[i], faceNormalTB);
-
-                for (auto &pt : polys[i]) {
-                    pt = ConvertTBtoRaylib(pt);
-                }
-                Vector3 polyNormal = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
-
-                if (Vector3DotProduct(polyNormal, ConvertTBtoRaylib(faceNormalTB)) < 0.f) {
+                Vector3 nRL = CalculateNormal(polys[i][0],polys[i][1],polys[i][2]);
+                if (Vector3DotProduct(nRL, ConvertTBtoRaylib(nTB)) < 0.f) {
                     std::reverse(polys[i].begin(), polys[i].end());
-                    polyNormal = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
+                    nRL = CalculateNormal(polys[i][0],polys[i][1],polys[i][2]);
                 }
 
-                // Texture lookup (needed for width/height in UV divide)
-                std::string texName = brush.faces[i].texture;
-                const TextureEntry* tex = LoadTextureByName(textureManager, texName);
-                if (!tex || tex->width == 0) {
-                    tex = LoadTextureByName(textureManager, "default");
-                    texName = "default";
-                }
+                MapPolygon mp;
+                mp.verts    = std::move(polys[i]);
+                mp.normal   = nRL;
+                mp.texture  = brush.faces[i].texture;
+                mp.texAxisU = ConvertTBtoRaylib(brush.faces[i].textureAxes1);
+                mp.texAxisV = ConvertTBtoRaylib(brush.faces[i].textureAxes2);
+                mp.offU     = brush.faces[i].offsetX;
+                mp.offV     = brush.faces[i].offsetY;
+                mp.rot      = brush.faces[i].rotation;
+                mp.scaleU   = brush.faces[i].scaleX;
+                mp.scaleV   = brush.faces[i].scaleY;
+                out.push_back(std::move(mp));
+            }
+        }
+    }
+    printf("[MapParser] Built %zu polygons.\n", out.size());
+    return out;
+}
 
-                float texW = (float)tex->width;
-                float texH = (float)tex->height;
+#ifndef WARPED_COMPILER_BUILD
+/*
+------------------------------------------------------------
+    BUILD RENDER GEOMETRY  (legacy direct-from-.map path)
+------------------------------------------------------------
+*/
+std::vector<MapMeshBucket> BuildMapGeometry(const Map &map, TextureManager &textureManager)
+{
+    std::vector<MapPolygon> polys = BuildMapPolygons(map, DEVMODE);
 
-                Vector3 tAx1 = ConvertTBtoRaylib(brush.faces[i].textureAxes1);
-                Vector3 tAx2 = ConvertTBtoRaylib(brush.faces[i].textureAxes2);
+    std::unordered_map<std::string, size_t> bucketIdx;
+    std::vector<MapMeshBucket> buckets;
+    auto GetBucket = [&](const std::string& n) -> MapMeshBucket& {
+        auto it = bucketIdx.find(n);
+        if (it != bucketIdx.end()) return buckets[it->second];
+        bucketIdx[n] = buckets.size();
+        buckets.push_back(MapMeshBucket{});
+        buckets.back().texture = n;
+        return buckets.back();
+    };
 
-                float offsetX = brush.faces[i].offsetX;
-                float offsetY = brush.faces[i].offsetY;
-                float rotDeg  = brush.faces[i].rotation;
-                float scaleX  = brush.faces[i].scaleX;
-                float scaleY  = brush.faces[i].scaleY;
+    for (auto &p : polys) {
+        std::string texName = p.texture;
+        const TextureEntry* tex = LoadTextureByName(textureManager, texName);
+        if (!tex || tex->width == 0) {
+            tex = LoadTextureByName(textureManager, "default");
+            texName = "default";
+        }
+        float tW=(float)tex->width, tH=(float)tex->height;
 
-                auto ComputeUV = [&](const Vector3 &vertRL) -> Vector2 {
-                    float sx = Vector3DotProduct(vertRL, tAx1);
-                    float sy = Vector3DotProduct(vertRL, tAx2);
+        MapMeshBucket& b = GetBucket(texName);
+        Vector3 v0 = p.verts[0];
+        Vector2 uv0 = ComputeFaceUV(v0,p.texAxisU,p.texAxisV,p.offU,p.offV,p.rot,p.scaleU,p.scaleV,tW,tH);
 
-                    sx /= scaleX;
-                    sy /= scaleY;
-
-                    float rad  = rotDeg * DEG2RAD;
-                    float cosr = cosf(rad);
-                    float sinr = sinf(rad);
-
-                    float sxRot = sx * cosr - sy * sinr;
-                    float syRot = sx * sinr + sy * cosr;
-
-                    // NOTE: Negated for axis conversion.
-                    sxRot += -(offsetX);
-                    syRot += -(offsetY);
-
-                    sxRot /= texW;
-                    syRot /= texH;
-
-                    // Orientation flip for axis conversion.
-                    syRot = 1.0f - syRot;
-                    sxRot = 1.0f - sxRot;
-
-                    return (Vector2){sxRot, syRot};
-                };
-
-                MapMeshBucket& bucket = GetBucket(texName);
-
-                Vector3 v0 = polys[i][0];
-                for (size_t t=1; t+1<polys[i].size(); ++t) {
-                    Vector3 v1 = polys[i][t];
-                    Vector3 v2 = polys[i][t+1];
-
-                    uint32_t base = (uint32_t)bucket.vertices.size();
-
-                    Vector2 uv0 = ComputeUV(v0);
-                    Vector2 uv1 = ComputeUV(v1);
-                    Vector2 uv2 = ComputeUV(v2);
-
-                    bucket.vertices.push_back({v0.x,v0.y,v0.z, polyNormal.x,polyNormal.y,polyNormal.z, uv0.x,uv0.y});
-                    bucket.vertices.push_back({v1.x,v1.y,v1.z, polyNormal.x,polyNormal.y,polyNormal.z, uv1.x,uv1.y});
-                    bucket.vertices.push_back({v2.x,v2.y,v2.z, polyNormal.x,polyNormal.y,polyNormal.z, uv2.x,uv2.y});
-
-                    bucket.indices.push_back(base+0);
-                    bucket.indices.push_back(base+1);
-                    bucket.indices.push_back(base+2);
-                }
-            } // each face
-        } // each brush
-    } // each entity
-
+        for (size_t t=1; t+1<p.verts.size(); ++t) {
+            Vector3 v1=p.verts[t], v2=p.verts[t+1];
+            Vector2 uv1 = ComputeFaceUV(v1,p.texAxisU,p.texAxisV,p.offU,p.offV,p.rot,p.scaleU,p.scaleV,tW,tH);
+            Vector2 uv2 = ComputeFaceUV(v2,p.texAxisU,p.texAxisV,p.offU,p.offV,p.rot,p.scaleU,p.scaleV,tW,tH);
+            uint32_t base=(uint32_t)b.vertices.size();
+            b.vertices.push_back({v0.x,v0.y,v0.z, p.normal.x,p.normal.y,p.normal.z, uv0.x,uv0.y, 0,0});
+            b.vertices.push_back({v1.x,v1.y,v1.z, p.normal.x,p.normal.y,p.normal.z, uv1.x,uv1.y, 0,0});
+            b.vertices.push_back({v2.x,v2.y,v2.z, p.normal.x,p.normal.y,p.normal.z, uv2.x,uv2.y, 0,0});
+            b.indices.push_back(base); b.indices.push_back(base+1); b.indices.push_back(base+2);
+        }
+    }
     printf("[MapParser] Built %zu texture buckets.\n", buckets.size());
     return buckets;
 }
+#endif // !WARPED_COMPILER_BUILD

@@ -55,13 +55,20 @@ typedef struct PlayerStart {
     Vector3 position;
 } PlayerStart;
 
+struct PointLight {
+    Vector3 position;     // world-space (GL coords)
+    Vector3 color;        // 0..1
+    float   intensity;    // radius in world units
+};
+
 // --------------------------------------------------------------------------
-//  CPU-side render geometry (fed to Renderer_UploadMap)
+//  CPU-side render geometry (fed to Renderer_UploadMap / written to .bsp)
 // --------------------------------------------------------------------------
 struct MapVertex {
     float x, y, z;
     float nx, ny, nz;
-    float u, v;
+    float u, v;       // diffuse UV
+    float lu, lv;     // lightmap UV (0 if unlit / legacy path)
 };
 
 struct MapMeshBucket {
@@ -71,11 +78,38 @@ struct MapMeshBucket {
 };
 
 // --------------------------------------------------------------------------
+//  Renderer-agnostic polygon output (used by the offline .bsp compiler —
+//  no TextureManager / sokol dependency).
+// --------------------------------------------------------------------------
+struct MapPolygon {
+    std::vector<Vector3> verts;      // world-space (GL coords), CCW, ≥3
+    Vector3              normal;     // world-space
+    std::string          texture;
+    // Texture projection params (already converted to GL axes):
+    Vector3 texAxisU, texAxisV;
+    float   offU, offV;
+    float   rot, scaleU, scaleV;
+};
+
+// --------------------------------------------------------------------------
 //  Public API
 // --------------------------------------------------------------------------
-Map                       ParseMapFile(const std::string& filePath);
-std::vector<PlayerStart>  GetPlayerStarts(const Map& map);
+Map                        ParseMapFile(const std::string& filePath);
+std::vector<PlayerStart>   GetPlayerStarts(const Map& map);
+std::vector<PointLight>    GetPointLights(const Map& map);
+std::vector<MapPolygon>    BuildMapPolygons(const Map& map, bool devMode);
+
+// Legacy path: builds GPU-ready buckets directly (still used until a
+// .bsp is available).  Pulls texture dims from TextureManager.
 std::vector<MapMeshBucket> BuildMapGeometry(const Map& map, TextureManager& textureManager);
+
+// Compute diffuse UV for a world-space vertex given face projection params.
+// texW/texH normalise into [0..1]; pass 0 to skip normalisation.
+Vector2 ComputeFaceUV(const Vector3& vert,
+                      const Vector3& axisU, const Vector3& axisV,
+                      float offU, float offV, float rot,
+                      float scaleU, float scaleV,
+                      float texW, float texH);
 
 // Geometry helpers (reused by collision_data.cpp)
 Vector3 ConvertTBtoRaylib(const Vector3& in);

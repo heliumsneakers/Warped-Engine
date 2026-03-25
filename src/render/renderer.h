@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 struct Map;          // forward (from map_parser.h)
+struct BSPData;      // forward (from bsp_loader.h)
 
 // ---------------------------------------------------------------------------
 //  Texture manager  (stb_image → sg_image + texture view)
@@ -40,6 +41,8 @@ struct SubMesh {
 
 struct MapModel {
     std::vector<SubMesh> meshes;
+    sg_image lightmapImage{};
+    sg_view  lightmapView{};
 };
 
 // ---------------------------------------------------------------------------
@@ -49,6 +52,7 @@ void      Renderer_Init(void);
 void      Renderer_Shutdown(void);
 
 MapModel  Renderer_UploadMap(const Map& map, TextureManager& texMgr);
+MapModel  Renderer_UploadBSP(const BSPData& bsp, TextureManager& texMgr);
 void      Renderer_DrawMap(const MapModel& mdl,
                            const Matrix&   mvp,
                            const Matrix&   model,

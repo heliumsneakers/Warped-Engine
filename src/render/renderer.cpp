@@ -8,6 +8,7 @@
 #include "renderer.h"
 #include "shaders.h"
 #include "../utils/map_parser.h"
+#include "../utils/bsp_loader.h"
 #include "sokol_gfx.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -18,9 +19,12 @@
 // ---------------------------------------------------------------------------
 //  Internal state
 // ---------------------------------------------------------------------------
-static sg_shader   g_shader   = {};
-static sg_pipeline g_pipeline = {};
-static sg_sampler  g_sampler  = {};
+static sg_shader   g_shader    = {};
+static sg_pipeline g_pipeline  = {};
+static sg_sampler  g_sampler   = {};   // repeat, for diffuse
+static sg_sampler  g_lmSampler = {};   // clamp, for lightmap
+static sg_image    g_whiteLm   = {};   // 1×1 white fallback lightmap
+static sg_view     g_whiteLmV  = {};
 
 struct VsParams {
     float mvp  [16];
@@ -121,6 +125,25 @@ void Renderer_Init(void) {
     smp.label      = "map-sampler";
     g_sampler = sg_make_sampler(&smp);
 
+    // --- lightmap sampler (clamp so atlas edges don't bleed) ------------
+    sg_sampler_desc lsmp = {};
+    lsmp.min_filter = SG_FILTER_LINEAR;
+    lsmp.mag_filter = SG_FILTER_LINEAR;
+    lsmp.wrap_u     = SG_WRAP_CLAMP_TO_EDGE;
+    lsmp.wrap_v     = SG_WRAP_CLAMP_TO_EDGE;
+    lsmp.label      = "lightmap-sampler";
+    g_lmSampler = sg_make_sampler(&lsmp);
+
+    // --- 1×1 white fallback lightmap (legacy .map path / missing lm) ----
+    static uint32_t whitePix = 0xFFFFFFFFu;
+    sg_image_desc wid = {};
+    wid.width=1; wid.height=1; wid.pixel_format=SG_PIXELFORMAT_RGBA8;
+    wid.data.mip_levels[0] = { &whitePix, sizeof(whitePix) };
+    wid.label = "lightmap-white";
+    g_whiteLm = sg_make_image(&wid);
+    sg_view_desc wvd = {}; wvd.texture.image = g_whiteLm;
+    g_whiteLmV = sg_make_view(&wvd);
+
     // --- shader ---------------------------------------------------------
     sg_shader_desc sd = {};
     sd.label = "map-shader";
@@ -130,6 +153,7 @@ void Renderer_Init(void) {
     sd.attrs[0].glsl_name = "a_pos";
     sd.attrs[1].glsl_name = "a_nrm";
     sd.attrs[2].glsl_name = "a_uv";
+    sd.attrs[3].glsl_name = "a_lmuv";
 
     // uniform block 0 – vertex stage, two mat4
     sd.uniform_blocks[0].stage  = SG_SHADERSTAGE_VERTEX;
@@ -140,20 +164,29 @@ void Renderer_Init(void) {
     sd.uniform_blocks[0].glsl_uniforms[1].type      = SG_UNIFORMTYPE_MAT4;
     sd.uniform_blocks[0].glsl_uniforms[1].glsl_name = "u_model";
 
-    // texture at view slot 0  (fragment stage, 2D float)
+    // texture views — slot 0 diffuse, slot 1 lightmap
     sd.views[0].texture.stage       = SG_SHADERSTAGE_FRAGMENT;
     sd.views[0].texture.image_type  = SG_IMAGETYPE_2D;
     sd.views[0].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
+    sd.views[1].texture.stage       = SG_SHADERSTAGE_FRAGMENT;
+    sd.views[1].texture.image_type  = SG_IMAGETYPE_2D;
+    sd.views[1].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
 
-    // sampler at slot 0
+    // samplers — slot 0 wraps (diffuse), slot 1 clamps (lightmap)
     sd.samplers[0].stage        = SG_SHADERSTAGE_FRAGMENT;
     sd.samplers[0].sampler_type = SG_SAMPLERTYPE_FILTERING;
+    sd.samplers[1].stage        = SG_SHADERSTAGE_FRAGMENT;
+    sd.samplers[1].sampler_type = SG_SAMPLERTYPE_FILTERING;
 
-    // combined image-sampler pair → GLSL name in fragment shader
+    // combined image-sampler pairs → GLSL names
     sd.texture_sampler_pairs[0].stage        = SG_SHADERSTAGE_FRAGMENT;
     sd.texture_sampler_pairs[0].view_slot    = 0;
     sd.texture_sampler_pairs[0].sampler_slot = 0;
     sd.texture_sampler_pairs[0].glsl_name    = "u_tex";
+    sd.texture_sampler_pairs[1].stage        = SG_SHADERSTAGE_FRAGMENT;
+    sd.texture_sampler_pairs[1].view_slot    = 1;
+    sd.texture_sampler_pairs[1].sampler_slot = 1;
+    sd.texture_sampler_pairs[1].glsl_name    = "u_lm";
 
     g_shader = sg_make_shader(&sd);
 
@@ -164,7 +197,8 @@ void Renderer_Init(void) {
 
     pd.layout.attrs[0].format = SG_VERTEXFORMAT_FLOAT3;   // pos
     pd.layout.attrs[1].format = SG_VERTEXFORMAT_FLOAT3;   // normal
-    pd.layout.attrs[2].format = SG_VERTEXFORMAT_FLOAT2;   // uv
+    pd.layout.attrs[2].format = SG_VERTEXFORMAT_FLOAT2;   // diffuse uv
+    pd.layout.attrs[3].format = SG_VERTEXFORMAT_FLOAT2;   // lightmap uv
 
     pd.index_type           = SG_INDEXTYPE_UINT32;
     pd.cull_mode            = SG_CULLMODE_BACK;
@@ -179,24 +213,23 @@ void Renderer_Shutdown(void) {
     sg_destroy_pipeline(g_pipeline);
     sg_destroy_shader  (g_shader);
     sg_destroy_sampler (g_sampler);
-    g_pipeline = {};
-    g_shader   = {};
-    g_sampler  = {};
+    sg_destroy_sampler (g_lmSampler);
+    sg_destroy_view    (g_whiteLmV);
+    sg_destroy_image   (g_whiteLm);
+    g_pipeline = {}; g_shader = {}; g_sampler = {};
+    g_lmSampler = {}; g_whiteLm = {}; g_whiteLmV = {};
 }
 
 sg_sampler Renderer_DefaultSampler(void) { return g_sampler; }
 
 // ---------------------------------------------------------------------------
-//  Map upload
+//  Bucket upload (shared by .map and .bsp paths)
 // ---------------------------------------------------------------------------
-MapModel Renderer_UploadMap(const Map& map, TextureManager& texMgr) {
-
-    // CPU geometry, already Y-up, bucketed per texture
-    std::vector<MapMeshBucket> buckets = BuildMapGeometry(map, texMgr);
-
-    MapModel mdl;
+static void UploadBuckets(MapModel& mdl,
+                          const std::vector<MapMeshBucket>& buckets,
+                          TextureManager& texMgr)
+{
     mdl.meshes.reserve(buckets.size());
-
     for (auto& b : buckets) {
         if (b.indices.empty()) continue;
 
@@ -213,22 +246,43 @@ MapModel Renderer_UploadMap(const Map& map, TextureManager& texMgr) {
 
         const TextureEntry* tex = LoadTextureByName(texMgr, b.texture);
 
-        // world-space bounds for frustum culling
         AABB bounds = AABBInvalid();
-        for (auto& v : b.vertices) {
-            AABBExtend(&bounds, (Vector3){v.x, v.y, v.z});
-        }
+        for (auto& v : b.vertices) AABBExtend(&bounds, (Vector3){v.x,v.y,v.z});
 
         SubMesh sm;
-        sm.vbuf        = vbuf;
-        sm.ibuf        = ibuf;
-        sm.tex_view    = tex->view;
-        sm.index_count = (int)b.indices.size();
-        sm.bounds      = bounds;
+        sm.vbuf=vbuf; sm.ibuf=ibuf; sm.tex_view=tex->view;
+        sm.index_count=(int)b.indices.size(); sm.bounds=bounds;
         mdl.meshes.push_back(sm);
     }
+}
 
-    printf("[Renderer] Map uploaded: %zu submeshes.\n", mdl.meshes.size());
+MapModel Renderer_UploadMap(const Map& map, TextureManager& texMgr) {
+    std::vector<MapMeshBucket> buckets = BuildMapGeometry(map, texMgr);
+    MapModel mdl;
+    UploadBuckets(mdl, buckets, texMgr);
+    mdl.lightmapView = g_whiteLmV;            // no baked lm in legacy path
+    printf("[Renderer] Map uploaded: %zu submeshes (no lightmap).\n", mdl.meshes.size());
+    return mdl;
+}
+
+MapModel Renderer_UploadBSP(const BSPData& bsp, TextureManager& texMgr) {
+    MapModel mdl;
+    UploadBuckets(mdl, bsp.buckets, texMgr);
+
+    if (bsp.lightmapW>0 && !bsp.lightmapPixels.empty()) {
+        sg_image_desc id = {};
+        id.width=bsp.lightmapW; id.height=bsp.lightmapH;
+        id.pixel_format=SG_PIXELFORMAT_RGBA8;
+        id.data.mip_levels[0] = { bsp.lightmapPixels.data(), bsp.lightmapPixels.size() };
+        id.label="lightmap-atlas";
+        mdl.lightmapImage = sg_make_image(&id);
+        sg_view_desc vd={}; vd.texture.image=mdl.lightmapImage;
+        mdl.lightmapView = sg_make_view(&vd);
+    } else {
+        mdl.lightmapView = g_whiteLmV;
+    }
+    printf("[Renderer] BSP uploaded: %zu submeshes, lm %dx%d.\n",
+           mdl.meshes.size(), bsp.lightmapW, bsp.lightmapH);
     return mdl;
 }
 
@@ -255,7 +309,9 @@ void Renderer_DrawMap(const MapModel& mdl,
         bnd.vertex_buffers[0] = sm.vbuf;
         bnd.index_buffer      = sm.ibuf;
         bnd.views[0]          = sm.tex_view;
+        bnd.views[1]          = mdl.lightmapView;
         bnd.samplers[0]       = g_sampler;
+        bnd.samplers[1]       = g_lmSampler;
 
         sg_apply_bindings(&bnd);
         sg_apply_uniforms(0, { &vs, sizeof(vs) });
@@ -269,4 +325,9 @@ void Renderer_DestroyMap(MapModel& mdl) {
         sg_destroy_buffer(sm.ibuf);
     }
     mdl.meshes.clear();
+    if (mdl.lightmapImage.id) {
+        sg_destroy_view (mdl.lightmapView);
+        sg_destroy_image(mdl.lightmapImage);
+        mdl.lightmapImage={}; mdl.lightmapView={};
+    }
 }
