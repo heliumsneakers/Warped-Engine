@@ -22,7 +22,7 @@ When building a finalized map there is an included map compiler that creates a .
 
 The engine also supports fast loading of raw map files at runtime for testing in developer mode. This fast loading will not contain the finalized lightmaps or shadows from the compilation step.
 
-All geometry from the map file is parsed and uploaded to the GPU for rendering and sent to the physics system to build the collisionmesh.
+All geometry from the map file is parsed and uploaded to the GPU for rendering and sent to the physics system to build the collision mesh.
 
 > [!NOTE]
 > I'd like to thank **Stefan Hajnoczi** for his work in the 2001 paper ".MAP files, file format description, algorithms, and code" which can be found here:
