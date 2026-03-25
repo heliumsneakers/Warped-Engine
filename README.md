@@ -9,19 +9,25 @@ https://heliumsneakers.itch.io/mini-quake-demo
 
 The original project was compiled with emscripten for web, but I've reverted to local builds to accommodate the physics library, the web build version of this project is split into a separate project folder locally. I plan on uploading it in the future.
 
- The engine is structured around **3 libraries, and 1 external map editor**.
-- **Raylib**: Graphics library used for rendering and mathematics.
-- **RayGui**: GUI library used for the user interface, and in game hot reloading of changes.
-- **Jolt Physics**: The physics library used in the project for collisions and physics interactions, as well as the physics server.
+ The engine is structured around **2 libraries, and 1 external map editor**.
+- **Sokol**: Graphics library used for rendering, I plan to add full compatibility with Metal, DX11, and Vulkan.
+- **Jolt Physics**: The physics library used in the project.
 - **Trench Broom**: Quake map editor for creating convex geometry (maps) and entities. The format used in this project is Valve 220.
 
-The engine specifies entity definitions, and configurations in a .fgd file (Forge Game Data), and has the data parsed in engine for runtime assembly of the geometry and entities.
+## Engine Structure
 
-I'd like to thank **Stefan Hajnoczi** for his work in the 2001 paper ".MAP files, file format description, algorithms, and code" which can be found here:
+The engine specifies entity definitions and configurations in the warped.fgd file (Forge Game Data), this file is used by trenchbroom during map editing and contains all of our game information.
 
- https://github.com/stefanha/map-files/blob/master/MAPFiles.pdf
+When building a finalized map there is an included map compiler that creates a .bsp file compiled with a pre-processing step for baked lighting and shadow maps.
 
-The current version of the engine is stripped from the gameplay features of the web build for development purposes, they will be re-implemented over the next few iterations.
+The engine also supports fast loading of raw map files at runtime for testing in developer mode. This fast loading will not contain the finalized lightmaps or shadows from the compilation step.
+
+All geometry from the map file is parsed and uploaded to the GPU for rendering and sent to the physics system to build the collisionmesh.
+
+> [!NOTE]
+> I'd like to thank **Stefan Hajnoczi** for his work in the 2001 paper ".MAP files, file format description, algorithms, and code" which can be found here:
+>
+> https://github.com/stefanha/map-files/blob/master/MAPFiles.pdf
 
 ## Prerequisites
 
@@ -34,22 +40,43 @@ The current version of the engine is stripped from the gameplay features of the 
 git clone https://github.com/heliumsneakers/Warped-Engine.git
 cd Warped
 ```
+
 2. Submodules
 ``` bash
 git submodule init
 git submodule update
 ```
-**NOTE: Before building the project ensure that Jolt and Raylib are built:**
+
+**Before building the project ensure that Jolt is built for your platform:**
 ```
 https://github.com/jrouwe/JoltPhysics
 ```
-```
-https://github.com/raysan5/raylib
-```
-3. Build
+
+3. Building the engine
 ```bash 
 mkdir build
 cd build
 cmake .. 
 make
 ```
+
+4. Building the .bsp compiler
+```bash
+cmake -B build_mc -DBUILD_MAP_COMPILER=ON && cmake --build build_mc
+```
+
+## Map compiler usage
+
+When using the map compiler you should follow this structure:
+
+```bash
+./compile_map <PATH_TO_MAP_FILE>.map <COMPILED_MAP_DESTINATION>.bsp  
+```
+
+For example:
+
+On Linux and MacOS
+``` bash
+./compile_map ../../assets/maps/example.map ../../assets/maps/example.bsp
+```
+

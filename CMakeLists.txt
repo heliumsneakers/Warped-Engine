@@ -79,7 +79,7 @@ add_subdirectory(lib/JoltPhysics/Build)
 # ----------------------------
 # Sources
 # ----------------------------
-# C++ sources — everything under src/ except the sokol impl TU which is C/ObjC.
+# C++ sources - everything under src/ except the sokol impl TU which is C/ObjC.
 file(GLOB_RECURSE WARPED_CXX_SOURCES
     CONFIGURE_DEPENDS
     src/*.cpp
@@ -87,7 +87,7 @@ file(GLOB_RECURSE WARPED_CXX_SOURCES
 list(FILTER WARPED_CXX_SOURCES EXCLUDE REGEX "platform/sokol_impl")
 list(FILTER WARPED_CXX_SOURCES EXCLUDE REGEX "compiler/")
 
-# Sokol implementation TU — compiled as Obj-C on Apple, plain C elsewhere.
+# Sokol implementation TU - compiled as Obj-C on Apple, plain C elsewhere.
 set(SOKOL_IMPL_SRC src/platform/sokol_impl.c)
 if (APPLE)
     set_source_files_properties(${SOKOL_IMPL_SRC}
