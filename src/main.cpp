@@ -44,6 +44,21 @@ static struct {
     sg_pass_action      passAction;
 } G;
 
+static const char* GfxBackendName(sg_backend backend) {
+    switch (backend) {
+        case SG_BACKEND_GLCORE:          return "GLCORE";
+        case SG_BACKEND_GLES3:           return "GLES3";
+        case SG_BACKEND_D3D11:           return "D3D11";
+        case SG_BACKEND_METAL_IOS:       return "METAL_IOS";
+        case SG_BACKEND_METAL_MACOS:     return "METAL_MACOS";
+        case SG_BACKEND_METAL_SIMULATOR: return "METAL_SIMULATOR";
+        case SG_BACKEND_WGPU:            return "WGPU";
+        case SG_BACKEND_VULKAN:          return "VULKAN";
+        case SG_BACKEND_DUMMY:           return "DUMMY";
+        default:                         return "UNKNOWN";
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  Frame-rate limiter
 // ---------------------------------------------------------------------------
@@ -88,9 +103,13 @@ static void init(void) {
     gfx.logger.func = slog_func;
     sg_setup(&gfx);
 
-    // sokol_app's macOS/GL path hard-locks vsync; punch through and disable it
-    // so we can run past the display's adaptive-refresh ceiling.
+#if defined(__APPLE__)
+    // On macOS we override the platform frame driver when uncapped so the
+    // app is not pinned to AppKit / display-link refresh pacing.
     WarpedPlatform_SetSwapInterval(0);
+#endif
+
+    printf("[init] sokol backend: %s\n", GfxBackendName(sg_query_backend()));
 
     // --- debug text -----------------------------------------------------
     sdtx_desc_t dtx = {};

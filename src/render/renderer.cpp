@@ -7,6 +7,16 @@
 
 #include "renderer.h"
 #include "shaders.h"
+
+#if defined(WARPED_SOKOL_BACKEND_METAL) && !defined(SOKOL_METAL)
+#define SOKOL_METAL
+#elif defined(WARPED_SOKOL_BACKEND_D3D11) && !defined(SOKOL_D3D11)
+#define SOKOL_D3D11
+#elif defined(WARPED_SOKOL_BACKEND_GLCORE) && !defined(SOKOL_GLCORE)
+#define SOKOL_GLCORE
+#endif
+
+#include "shaders/generated/map.metal_dx11.h"
 #include "../utils/map_parser.h"
 #include "../utils/bsp_loader.h"
 #include "sokol_gfx.h"
@@ -14,6 +24,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include <cstddef>
 #include <cstdio>
 
 // ---------------------------------------------------------------------------
@@ -25,11 +36,129 @@ static sg_sampler  g_sampler   = {};   // repeat, for diffuse
 static sg_sampler  g_lmSampler = {};   // clamp, for lightmap
 static sg_image    g_whiteLm   = {};   // 1×1 white fallback lightmap
 static sg_view     g_whiteLmV  = {};
+static bool        g_logged_bind_diagnostics = false;
 
-struct VsParams {
-    float mvp  [16];
-    float model[16];
-};
+static const char* RendererBackendName(sg_backend backend) {
+    switch (backend) {
+        case SG_BACKEND_GLCORE:          return "GLCORE";
+        case SG_BACKEND_GLES3:           return "GLES3";
+        case SG_BACKEND_D3D11:           return "D3D11";
+        case SG_BACKEND_METAL_IOS:       return "METAL_IOS";
+        case SG_BACKEND_METAL_MACOS:     return "METAL_MACOS";
+        case SG_BACKEND_METAL_SIMULATOR: return "METAL_SIMULATOR";
+        case SG_BACKEND_WGPU:            return "WGPU";
+        case SG_BACKEND_VULKAN:          return "VULKAN";
+        case SG_BACKEND_DUMMY:           return "DUMMY";
+        default:                         return "UNKNOWN";
+    }
+}
+
+static const char* RendererResourceStateName(sg_resource_state state) {
+    switch (state) {
+        case SG_RESOURCESTATE_INITIAL: return "INITIAL";
+        case SG_RESOURCESTATE_ALLOC:   return "ALLOC";
+        case SG_RESOURCESTATE_VALID:   return "VALID";
+        case SG_RESOURCESTATE_FAILED:  return "FAILED";
+        case SG_RESOURCESTATE_INVALID: return "INVALID";
+        default:                       return "UNKNOWN";
+    }
+}
+
+static void Renderer_LogTextureState(const char* label, const TextureEntry& entry) {
+    printf("[Renderer] %s image=%s view=%s size=%dx%d\n",
+           label,
+           RendererResourceStateName(sg_query_image_state(entry.image)),
+           RendererResourceStateName(sg_query_view_state(entry.view)),
+           entry.width, entry.height);
+}
+
+static sg_shader Renderer_MakeGeneratedMapShader(sg_backend backend) {
+    const sg_shader_desc* desc = warped_map_shader_map_shader_desc(backend);
+    if (!desc) {
+        printf("[Renderer] No generated shader descriptor for backend %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    return sg_make_shader(desc);
+}
+
+static sg_shader Renderer_MakeGLMapShader(void) {
+    sg_shader_desc sd = {};
+    sd.label = "map-shader";
+    sd.vertex_func.source   = WARPED_VS_SRC;
+    sd.fragment_func.source = WARPED_FS_SRC;
+
+    sd.attrs[ATTR_warped_map_shader_map_a_pos].glsl_name  = "a_pos";
+    sd.attrs[ATTR_warped_map_shader_map_a_nrm].glsl_name  = "a_nrm";
+    sd.attrs[ATTR_warped_map_shader_map_a_uv].glsl_name   = "a_uv";
+    sd.attrs[ATTR_warped_map_shader_map_a_lmuv].glsl_name = "a_lmuv";
+
+    sd.uniform_blocks[UB_warped_map_shader_vs_params].stage  = SG_SHADERSTAGE_VERTEX;
+    sd.uniform_blocks[UB_warped_map_shader_vs_params].size   = sizeof(warped_map_shader_vs_params_t);
+    sd.uniform_blocks[UB_warped_map_shader_vs_params].layout = SG_UNIFORMLAYOUT_NATIVE;
+    sd.uniform_blocks[UB_warped_map_shader_vs_params].glsl_uniforms[0].type      = SG_UNIFORMTYPE_MAT4;
+    sd.uniform_blocks[UB_warped_map_shader_vs_params].glsl_uniforms[0].glsl_name = "u_mvp";
+    sd.uniform_blocks[UB_warped_map_shader_vs_params].glsl_uniforms[1].type      = SG_UNIFORMTYPE_MAT4;
+    sd.uniform_blocks[UB_warped_map_shader_vs_params].glsl_uniforms[1].glsl_name = "u_model";
+
+    sd.views[VIEW_warped_map_shader_u_tex].texture.stage       = SG_SHADERSTAGE_FRAGMENT;
+    sd.views[VIEW_warped_map_shader_u_tex].texture.image_type  = SG_IMAGETYPE_2D;
+    sd.views[VIEW_warped_map_shader_u_tex].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
+    sd.views[VIEW_warped_map_shader_u_lm].texture.stage        = SG_SHADERSTAGE_FRAGMENT;
+    sd.views[VIEW_warped_map_shader_u_lm].texture.image_type   = SG_IMAGETYPE_2D;
+    sd.views[VIEW_warped_map_shader_u_lm].texture.sample_type  = SG_IMAGESAMPLETYPE_FLOAT;
+
+    sd.samplers[SMP_warped_map_shader_u_tex_smp].stage        = SG_SHADERSTAGE_FRAGMENT;
+    sd.samplers[SMP_warped_map_shader_u_tex_smp].sampler_type = SG_SAMPLERTYPE_FILTERING;
+    sd.samplers[SMP_warped_map_shader_u_lm_smp].stage         = SG_SHADERSTAGE_FRAGMENT;
+    sd.samplers[SMP_warped_map_shader_u_lm_smp].sampler_type  = SG_SAMPLERTYPE_FILTERING;
+
+    sd.texture_sampler_pairs[0].stage        = SG_SHADERSTAGE_FRAGMENT;
+    sd.texture_sampler_pairs[0].view_slot    = VIEW_warped_map_shader_u_tex;
+    sd.texture_sampler_pairs[0].sampler_slot = SMP_warped_map_shader_u_tex_smp;
+    sd.texture_sampler_pairs[0].glsl_name    = "u_tex";
+    sd.texture_sampler_pairs[1].stage        = SG_SHADERSTAGE_FRAGMENT;
+    sd.texture_sampler_pairs[1].view_slot    = VIEW_warped_map_shader_u_lm;
+    sd.texture_sampler_pairs[1].sampler_slot = SMP_warped_map_shader_u_lm_smp;
+    sd.texture_sampler_pairs[1].glsl_name    = "u_lm";
+
+    return sg_make_shader(&sd);
+}
+
+static sg_shader Renderer_MakePlatformMapShader(sg_backend backend) {
+#if defined(WARPED_SOKOL_BACKEND_METAL)
+    if (backend != SG_BACKEND_METAL_MACOS) {
+        printf("[Renderer] Backend mismatch: expected METAL_MACOS, got %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    printf("[Renderer] Using generated Metal shader for backend %s.\n",
+           RendererBackendName(backend));
+    return Renderer_MakeGeneratedMapShader(backend);
+#elif defined(WARPED_SOKOL_BACKEND_D3D11)
+    if (backend != SG_BACKEND_D3D11) {
+        printf("[Renderer] Backend mismatch: expected D3D11, got %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    printf("[Renderer] Using generated HLSL shader for backend %s.\n",
+           RendererBackendName(backend));
+    return Renderer_MakeGeneratedMapShader(backend);
+#elif defined(WARPED_SOKOL_BACKEND_GLCORE)
+    if (backend != SG_BACKEND_GLCORE) {
+        printf("[Renderer] Backend mismatch: expected GLCORE, got %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    printf("[Renderer] Using GLSL shader for backend %s.\n",
+           RendererBackendName(backend));
+    return Renderer_MakeGLMapShader();
+#else
+    (void)backend;
+    printf("[Renderer] No shader path configured for this platform build.\n");
+    return {};
+#endif
+}
 
 // ---------------------------------------------------------------------------
 //  TextureManager
@@ -93,9 +222,11 @@ const TextureEntry* LoadTextureByName(TextureManager& mgr, const std::string& na
         entry.view   = view;
         entry.width  = w;
         entry.height = h;
+        Renderer_LogTextureState(name.c_str(), entry);
     } else {
         printf("[Renderer] Failed to load '%s' – using fallback.\n", path.c_str());
         entry = MakeFallbackTexture();
+        Renderer_LogTextureState("fallback-checker", entry);
     }
 
     auto [ins, ok] = mgr.textures.emplace(name, entry);
@@ -115,6 +246,7 @@ void UnloadAllTextures(TextureManager& mgr) {
 //  Renderer init / shutdown
 // ---------------------------------------------------------------------------
 void Renderer_Init(void) {
+    sg_backend backend = sg_query_backend();
 
     // --- sampler (repeat + bilinear) ------------------------------------
     sg_sampler_desc smp = {};
@@ -145,60 +277,29 @@ void Renderer_Init(void) {
     g_whiteLmV = sg_make_view(&wvd);
 
     // --- shader ---------------------------------------------------------
-    sg_shader_desc sd = {};
-    sd.label = "map-shader";
-    sd.vertex_func.source   = WARPED_VS_SRC;
-    sd.fragment_func.source = WARPED_FS_SRC;
-
-    sd.attrs[0].glsl_name = "a_pos";
-    sd.attrs[1].glsl_name = "a_nrm";
-    sd.attrs[2].glsl_name = "a_uv";
-    sd.attrs[3].glsl_name = "a_lmuv";
-
-    // uniform block 0 – vertex stage, two mat4
-    sd.uniform_blocks[0].stage  = SG_SHADERSTAGE_VERTEX;
-    sd.uniform_blocks[0].size   = sizeof(VsParams);
-    sd.uniform_blocks[0].layout = SG_UNIFORMLAYOUT_NATIVE;
-    sd.uniform_blocks[0].glsl_uniforms[0].type      = SG_UNIFORMTYPE_MAT4;
-    sd.uniform_blocks[0].glsl_uniforms[0].glsl_name = "u_mvp";
-    sd.uniform_blocks[0].glsl_uniforms[1].type      = SG_UNIFORMTYPE_MAT4;
-    sd.uniform_blocks[0].glsl_uniforms[1].glsl_name = "u_model";
-
-    // texture views — slot 0 diffuse, slot 1 lightmap
-    sd.views[0].texture.stage       = SG_SHADERSTAGE_FRAGMENT;
-    sd.views[0].texture.image_type  = SG_IMAGETYPE_2D;
-    sd.views[0].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
-    sd.views[1].texture.stage       = SG_SHADERSTAGE_FRAGMENT;
-    sd.views[1].texture.image_type  = SG_IMAGETYPE_2D;
-    sd.views[1].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
-
-    // samplers — slot 0 wraps (diffuse), slot 1 clamps (lightmap)
-    sd.samplers[0].stage        = SG_SHADERSTAGE_FRAGMENT;
-    sd.samplers[0].sampler_type = SG_SAMPLERTYPE_FILTERING;
-    sd.samplers[1].stage        = SG_SHADERSTAGE_FRAGMENT;
-    sd.samplers[1].sampler_type = SG_SAMPLERTYPE_FILTERING;
-
-    // combined image-sampler pairs → GLSL names
-    sd.texture_sampler_pairs[0].stage        = SG_SHADERSTAGE_FRAGMENT;
-    sd.texture_sampler_pairs[0].view_slot    = 0;
-    sd.texture_sampler_pairs[0].sampler_slot = 0;
-    sd.texture_sampler_pairs[0].glsl_name    = "u_tex";
-    sd.texture_sampler_pairs[1].stage        = SG_SHADERSTAGE_FRAGMENT;
-    sd.texture_sampler_pairs[1].view_slot    = 1;
-    sd.texture_sampler_pairs[1].sampler_slot = 1;
-    sd.texture_sampler_pairs[1].glsl_name    = "u_lm";
-
-    g_shader = sg_make_shader(&sd);
+    g_shader = Renderer_MakePlatformMapShader(backend);
+    if (!g_shader.id) {
+        printf("[Renderer] Failed to create map shader for backend %s.\n",
+               RendererBackendName(backend));
+        return;
+    }
+    printf("[Renderer] Shader state: %s\n",
+           RendererResourceStateName(sg_query_shader_state(g_shader)));
 
     // --- pipeline -------------------------------------------------------
     sg_pipeline_desc pd = {};
     pd.label  = "map-pipeline";
     pd.shader = g_shader;
 
-    pd.layout.attrs[0].format = SG_VERTEXFORMAT_FLOAT3;   // pos
-    pd.layout.attrs[1].format = SG_VERTEXFORMAT_FLOAT3;   // normal
-    pd.layout.attrs[2].format = SG_VERTEXFORMAT_FLOAT2;   // diffuse uv
-    pd.layout.attrs[3].format = SG_VERTEXFORMAT_FLOAT2;   // lightmap uv
+    pd.layout.buffers[0].stride = sizeof(MapVertex);
+    pd.layout.attrs[ATTR_warped_map_shader_map_a_pos].format  = SG_VERTEXFORMAT_FLOAT3;
+    pd.layout.attrs[ATTR_warped_map_shader_map_a_pos].offset  = offsetof(MapVertex, x);
+    pd.layout.attrs[ATTR_warped_map_shader_map_a_nrm].format  = SG_VERTEXFORMAT_FLOAT3;
+    pd.layout.attrs[ATTR_warped_map_shader_map_a_nrm].offset  = offsetof(MapVertex, nx);
+    pd.layout.attrs[ATTR_warped_map_shader_map_a_uv].format   = SG_VERTEXFORMAT_FLOAT2;
+    pd.layout.attrs[ATTR_warped_map_shader_map_a_uv].offset   = offsetof(MapVertex, u);
+    pd.layout.attrs[ATTR_warped_map_shader_map_a_lmuv].format = SG_VERTEXFORMAT_FLOAT2;
+    pd.layout.attrs[ATTR_warped_map_shader_map_a_lmuv].offset = offsetof(MapVertex, lu);
 
     pd.index_type           = SG_INDEXTYPE_UINT32;
     pd.cull_mode            = SG_CULLMODE_BACK;
@@ -207,15 +308,17 @@ void Renderer_Init(void) {
     pd.depth.write_enabled  = true;
 
     g_pipeline = sg_make_pipeline(&pd);
+    printf("[Renderer] Pipeline state: %s\n",
+           RendererResourceStateName(sg_query_pipeline_state(g_pipeline)));
 }
 
 void Renderer_Shutdown(void) {
-    sg_destroy_pipeline(g_pipeline);
-    sg_destroy_shader  (g_shader);
-    sg_destroy_sampler (g_sampler);
-    sg_destroy_sampler (g_lmSampler);
-    sg_destroy_view    (g_whiteLmV);
-    sg_destroy_image   (g_whiteLm);
+    if (g_pipeline.id)  sg_destroy_pipeline(g_pipeline);
+    if (g_shader.id)    sg_destroy_shader(g_shader);
+    if (g_sampler.id)   sg_destroy_sampler(g_sampler);
+    if (g_lmSampler.id) sg_destroy_sampler(g_lmSampler);
+    if (g_whiteLmV.id)  sg_destroy_view(g_whiteLmV);
+    if (g_whiteLm.id)   sg_destroy_image(g_whiteLm);
     g_pipeline = {}; g_shader = {}; g_sampler = {};
     g_lmSampler = {}; g_whiteLm = {}; g_whiteLmV = {};
 }
@@ -281,6 +384,9 @@ MapModel Renderer_UploadBSP(const BSPData& bsp, TextureManager& texMgr) {
     } else {
         mdl.lightmapView = g_whiteLmV;
     }
+    printf("[Renderer] Lightmap image=%s view=%s\n",
+           RendererResourceStateName(sg_query_image_state(mdl.lightmapImage.id ? mdl.lightmapImage : g_whiteLm)),
+           RendererResourceStateName(sg_query_view_state(mdl.lightmapView)));
     printf("[Renderer] BSP uploaded: %zu submeshes, lm %dx%d.\n",
            mdl.meshes.size(), bsp.lightmapW, bsp.lightmapH);
     return mdl;
@@ -294,10 +400,14 @@ void Renderer_DrawMap(const MapModel& mdl,
                       const Matrix&   model,
                       const Frustum&  frustum)
 {
-    VsParams vs;
+    if (!g_pipeline.id) {
+        return;
+    }
+
+    warped_map_shader_vs_params_t vs = {};
     float16 m = MatrixToFloat16(mvp);
     float16 n = MatrixToFloat16(model);
-    for (int i=0;i<16;++i) { vs.mvp[i]=m.v[i]; vs.model[i]=n.v[i]; }
+    for (int i=0;i<16;++i) { vs.u_mvp[i]=m.v[i]; vs.u_model[i]=n.v[i]; }
 
     sg_apply_pipeline(g_pipeline);
 
@@ -305,16 +415,25 @@ void Renderer_DrawMap(const MapModel& mdl,
         // CPU frustum cull — skip submeshes fully outside view + render-distance
         if (!FrustumAABB(&frustum, sm.bounds)) continue;
 
+        if (!g_logged_bind_diagnostics) {
+            printf("[Renderer] Draw bind states: diffuse_view=%s lightmap_view=%s diffuse_sampler=%s lightmap_sampler=%s\n",
+                   RendererResourceStateName(sg_query_view_state(sm.tex_view)),
+                   RendererResourceStateName(sg_query_view_state(mdl.lightmapView)),
+                   RendererResourceStateName(sg_query_sampler_state(g_sampler)),
+                   RendererResourceStateName(sg_query_sampler_state(g_lmSampler)));
+            g_logged_bind_diagnostics = true;
+        }
+
         sg_bindings bnd = {};
         bnd.vertex_buffers[0] = sm.vbuf;
         bnd.index_buffer      = sm.ibuf;
-        bnd.views[0]          = sm.tex_view;
-        bnd.views[1]          = mdl.lightmapView;
-        bnd.samplers[0]       = g_sampler;
-        bnd.samplers[1]       = g_lmSampler;
+        bnd.views[VIEW_warped_map_shader_u_tex]       = sm.tex_view;
+        bnd.views[VIEW_warped_map_shader_u_lm]        = mdl.lightmapView;
+        bnd.samplers[SMP_warped_map_shader_u_tex_smp] = g_sampler;
+        bnd.samplers[SMP_warped_map_shader_u_lm_smp]  = g_lmSampler;
 
         sg_apply_bindings(&bnd);
-        sg_apply_uniforms(0, { &vs, sizeof(vs) });
+        sg_apply_uniforms(UB_warped_map_shader_vs_params, { &vs, sizeof(vs) });
         sg_draw(0, sm.index_count, 1);
     }
 }

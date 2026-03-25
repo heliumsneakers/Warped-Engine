@@ -11,6 +11,38 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ------------------------------------------------------------------
+# Renderer backend selection
+# ------------------------------------------------------------------
+if(NOT DEFINED WARPED_SOKOL_BACKEND OR WARPED_SOKOL_BACKEND STREQUAL "")
+    if(APPLE)
+        set(WARPED_SOKOL_BACKEND "METAL" CACHE STRING "Sokol renderer backend" FORCE)
+    elseif(WIN32)
+        set(WARPED_SOKOL_BACKEND "D3D11" CACHE STRING "Sokol renderer backend" FORCE)
+    elseif(UNIX)
+        set(WARPED_SOKOL_BACKEND "GLCORE" CACHE STRING "Sokol renderer backend" FORCE)
+    else()
+        message(FATAL_ERROR "Unsupported platform for Sokol backend selection: ${CMAKE_SYSTEM_NAME}")
+    endif()
+endif()
+
+set_property(CACHE WARPED_SOKOL_BACKEND PROPERTY STRINGS GLCORE METAL D3D11)
+string(TOUPPER "${WARPED_SOKOL_BACKEND}" WARPED_SOKOL_BACKEND)
+
+if(NOT WARPED_SOKOL_BACKEND MATCHES "^(GLCORE|METAL|D3D11)$")
+    message(FATAL_ERROR "Invalid WARPED_SOKOL_BACKEND='${WARPED_SOKOL_BACKEND}'. Expected GLCORE, METAL or D3D11.")
+endif()
+
+if(APPLE AND NOT WARPED_SOKOL_BACKEND STREQUAL "METAL")
+    message(FATAL_ERROR "macOS builds must use WARPED_SOKOL_BACKEND=METAL.")
+elseif(WIN32 AND NOT WARPED_SOKOL_BACKEND STREQUAL "D3D11")
+    message(FATAL_ERROR "Windows builds must use WARPED_SOKOL_BACKEND=D3D11.")
+elseif(UNIX AND NOT APPLE AND NOT WARPED_SOKOL_BACKEND STREQUAL "GLCORE")
+    message(FATAL_ERROR "Linux builds must use WARPED_SOKOL_BACKEND=GLCORE.")
+endif()
+
+message(STATUS "Warped renderer backend: ${WARPED_SOKOL_BACKEND}")
+
+# ------------------------------------------------------------------
 # Enforce Clang + libc++ on macOS and Linux
 # ------------------------------------------------------------------
 if(APPLE OR (UNIX AND NOT WIN32))
@@ -101,6 +133,14 @@ add_executable(WarpedGame
     ${SOKOL_IMPL_SRC}
 )
 
+if(WARPED_SOKOL_BACKEND STREQUAL "METAL")
+    target_compile_definitions(WarpedGame PRIVATE WARPED_SOKOL_BACKEND_METAL)
+elseif(WARPED_SOKOL_BACKEND STREQUAL "D3D11")
+    target_compile_definitions(WarpedGame PRIVATE WARPED_SOKOL_BACKEND_D3D11)
+elseif(WARPED_SOKOL_BACKEND STREQUAL "GLCORE")
+    target_compile_definitions(WarpedGame PRIVATE WARPED_SOKOL_BACKEND_GLCORE)
+endif()
+
 target_include_directories(WarpedGame PRIVATE
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/lib/sokol
@@ -115,27 +155,27 @@ set(PLATFORM_LIBS)
 if (APPLE)
     enable_language(OBJC)
     find_library(COCOA_LIBRARY          Cocoa)
+    find_library(METAL_LIBRARY          Metal)
     find_library(QUARTZCORE_LIBRARY     QuartzCore)
     find_library(UNIFORM_TYPE_IDENT_LIB UniformTypeIdentifiers)
     find_library(IOKIT_LIBRARY          IOKit)
     find_library(COREFOUNDATION_LIBRARY CoreFoundation)
     find_library(COREGRAPHICS_LIBRARY   CoreGraphics)
     find_library(COREVIDEO_LIBRARY      CoreVideo)
-    find_library(OPENGL_LIBRARY         OpenGL)
     list(APPEND PLATFORM_LIBS
         ${COCOA_LIBRARY}
+        ${METAL_LIBRARY}
         ${QUARTZCORE_LIBRARY}
         ${UNIFORM_TYPE_IDENT_LIB}
         ${IOKIT_LIBRARY}
         ${COREFOUNDATION_LIBRARY}
         ${COREGRAPHICS_LIBRARY}
         ${COREVIDEO_LIBRARY}
-        ${OPENGL_LIBRARY}
     )
 elseif (UNIX)
     list(APPEND PLATFORM_LIBS X11 Xi Xcursor GL dl pthread m)
 elseif (WIN32)
-    list(APPEND PLATFORM_LIBS opengl32 gdi32)
+    list(APPEND PLATFORM_LIBS d3d11 dxgi gdi32)
 endif()
 
 # ----------------------------

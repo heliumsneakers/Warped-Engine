@@ -5,8 +5,19 @@
  * talk to Cocoa.  On Linux/Windows it is plain C.
  */
 
+#if (defined(WARPED_SOKOL_BACKEND_METAL) + defined(WARPED_SOKOL_BACKEND_D3D11) + defined(WARPED_SOKOL_BACKEND_GLCORE)) != 1
+    #error "Exactly one WARPED_SOKOL_BACKEND_* define must be set by CMake."
+#endif
+
 #define SOKOL_IMPL
-#define SOKOL_GLCORE        /* desktop GL 3.3 backend on every platform */
+
+#if defined(WARPED_SOKOL_BACKEND_METAL)
+    #define SOKOL_METAL
+#elif defined(WARPED_SOKOL_BACKEND_D3D11)
+    #define SOKOL_D3D11
+#elif defined(WARPED_SOKOL_BACKEND_GLCORE)
+    #define SOKOL_GLCORE
+#endif
 
 #if defined(_WIN32)
     #define SOKOL_WIN32_FORCE_MAIN   /* use int main() instead of WinMain */
@@ -74,6 +85,77 @@
             if (m) {
                 method_setImplementation(m, (IMP)_warped_timerFired);
             }
+        }
+    }
+#elif defined(__APPLE__) && defined(SOKOL_METAL)
+    #import <QuartzCore/QuartzCore.h>
+    #import <objc/message.h>
+    #import <objc/runtime.h>
+
+    static NSTimer* g_warped_metal_timer = nil;
+
+    static void _warped_macos_mtl_frame(void) {
+        const CFTimeInterval cur_timestamp = CACurrentMediaTime();
+        if (_sapp.macos.mtl.timing.timestamp > 0.0) {
+            _sapp.macos.mtl.timing.frame_duration_sec = cur_timestamp - _sapp.macos.mtl.timing.timestamp;
+            if (_sapp.macos.mtl.timing.frame_duration_sec <= 0.00001) {
+                _sapp.macos.mtl.timing.frame_duration_sec = 1.0 / _sapp_macos_max_fps();
+            } else if (_sapp.macos.mtl.timing.frame_duration_sec > _SAPP_MACOS_MTL_MAX_FRAME_DURATION_IN_SECONDS) {
+                _sapp.macos.mtl.timing.frame_duration_sec = _SAPP_MACOS_MTL_MAX_FRAME_DURATION_IN_SECONDS;
+            }
+        }
+        _sapp.macos.mtl.timing.timestamp = cur_timestamp;
+
+        @autoreleasepool {
+            _sapp_frame();
+        }
+        if (_sapp.quit_requested || _sapp.quit_ordered) {
+            [_sapp.macos.window performClose:nil];
+        }
+    }
+
+    static void _warped_metalTimerFired(id self, SEL _cmd, NSTimer* timer) {
+        (void)self; (void)_cmd; (void)timer;
+        _warped_macos_mtl_frame();
+    }
+
+    static void _warped_displayLinkNoop(id self, SEL _cmd, id sender) {
+        (void)self; (void)_cmd; (void)sender;
+    }
+
+    void WarpedPlatform_SetSwapInterval(int interval) {
+        if ([_sapp.macos.mtl.layer respondsToSelector:@selector(setDisplaySyncEnabled:)]) {
+            typedef void (*warped_objc_msgsend_bool)(id, SEL, BOOL);
+            ((warped_objc_msgsend_bool)objc_msgSend)(_sapp.macos.mtl.layer, @selector(setDisplaySyncEnabled:), interval != 0);
+        }
+
+        if (interval != 0) {
+            return;
+        }
+
+        Class cls = [_sapp_macos_view class];
+        Method dl = class_getInstanceMethod(cls, @selector(displayLinkFired:));
+        Method ft = class_getInstanceMethod(cls, @selector(fallbackTimerFired:));
+        if (dl) {
+            method_setImplementation(dl, (IMP)_warped_displayLinkNoop);
+        }
+        if (ft) {
+            method_setImplementation(ft, (IMP)_warped_metalTimerFired);
+        }
+
+        if (_sapp.macos.mtl.display_link) {
+            _sapp.macos.mtl.display_link.paused = YES;
+        }
+
+        if (nil == g_warped_metal_timer) {
+            g_warped_metal_timer = [NSTimer
+                timerWithTimeInterval:0.001
+                target:_sapp.macos.view
+                selector:@selector(fallbackTimerFired:)
+                userInfo:nil
+                repeats:YES];
+            g_warped_metal_timer.tolerance = 0.0;
+            [[NSRunLoop currentRunLoop] addTimer:g_warped_metal_timer forMode:NSRunLoopCommonModes];
         }
     }
 #else
