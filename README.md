@@ -20,8 +20,6 @@ The engine specifies entity definitions and configurations in the warped.fgd fil
 
 When building a finalized map there is an included map compiler that creates a .bsp file compiled with a pre-processing step for baked lighting and shadow maps.
 
-The engine also supports fast loading of raw map files at runtime for testing in developer mode. This fast loading will not contain the finalized lightmaps or shadows from the compilation step.
-
 All geometry from the map file is parsed and uploaded to the GPU for rendering and sent to the physics system to build the collision mesh.
 
 > [!NOTE]
