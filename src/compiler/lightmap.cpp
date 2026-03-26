@@ -51,6 +51,7 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
             tr.b = p.verts[t];
             tr.c = p.verts[t + 1];
             tr.bounds = AABBInvalid();
+            tr.occluderGroup = p.occluderGroup;
             AABBExtend(&tr.bounds, tr.a);
             AABBExtend(&tr.bounds, tr.b);
             AABBExtend(&tr.bounds, tr.c);
@@ -91,7 +92,7 @@ static bool RayAABB(const Vector3& ro, const Vector3& inv_rd,
 }
 
 static bool Occluded(const OccluderSet& o, const Vector3& ro,
-                     const Vector3& rd, float dist)
+                     const Vector3& rd, float dist, int ignoreOccluderGroup)
 {
     Vector3 inv = {
         1.0f / (fabsf(rd.x) > RAY_EPS ? rd.x : RAY_EPS),
@@ -99,6 +100,9 @@ static bool Occluded(const OccluderSet& o, const Vector3& ro,
         1.0f / (fabsf(rd.z) > RAY_EPS ? rd.z : RAY_EPS)
     };
     for (const auto& tri : o.tris) {
+        if ((ignoreOccluderGroup >= 0) && (tri.occluderGroup == ignoreOccluderGroup)) {
+            continue;
+        }
         if (!RayAABB(ro, inv, tri.bounds, dist)) continue;
         if (RayTri(ro, rd, tri, RAY_EPS, dist)) return true;
     }
@@ -290,14 +294,21 @@ static void BakeLightmapCPU(const std::vector<MapPolygon>& polys,
                             const float dist = Vector3Length(toL);
                             if (dist > L.intensity || dist < 1e-3f) continue;
                             const Vector3 dir = Vector3Scale(toL, 1.f / dist);
+                            float emit = 1.0f;
+                            if (L.directional) {
+                                const Vector3 lightToSurface = Vector3Scale(dir, -1.0f);
+                                emit = Vector3DotProduct(L.emissionNormal, lightToSurface);
+                                if (emit <= 0.0f) continue;
+                            }
                             const float ndl = Vector3DotProduct(p.normal, dir);
                             if (ndl <= 0) continue;
-                            if (Occluded(occ, ro, dir, dist - SHADOW_BIAS)) continue;
+                            if (Occluded(occ, ro, dir, dist - SHADOW_BIAS, L.ignoreOccluderGroup)) continue;
                             float att = 1.f - dist / L.intensity;
                             att *= att;
-                            cr += L.color.x * ndl * att;
-                            cg += L.color.y * ndl * att;
-                            cb += L.color.z * ndl * att;
+                            const float contrib = emit * ndl * att;
+                            cr += L.color.x * contrib;
+                            cg += L.color.y * contrib;
+                            cb += L.color.z * contrib;
                         }
                         ar += cr; ag += cg; ab += cb;
                     }

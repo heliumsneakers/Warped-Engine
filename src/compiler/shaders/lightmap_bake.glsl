@@ -32,7 +32,9 @@ struct point_light {
     vec3 position;
     float intensity;
     vec3 color;
-    float _pad0;
+    int directional;
+    vec3 emission_normal;
+    int ignore_occluder_group;
 };
 
 struct occluder_tri {
@@ -43,7 +45,7 @@ struct occluder_tri {
     vec3 c;
     float _pad2;
     vec3 bounds_min;
-    float _pad3;
+    int occluder_group;
     vec3 bounds_max;
     float _pad4;
 };
@@ -130,10 +132,13 @@ vec3 safe_inverse_dir(vec3 rd) {
     return 1.0 / denom;
 }
 
-bool occluded(vec3 ro, vec3 rd, float dist) {
+bool occluded(vec3 ro, vec3 rd, float dist, int ignore_occluder_group) {
     vec3 inv_rd = safe_inverse_dir(rd);
     for (int i = 0; i < tri_count; ++i) {
         occluder_tri tri = tris[i];
+        if ((ignore_occluder_group >= 0) && (tri.occluder_group == ignore_occluder_group)) {
+            continue;
+        }
         if (!ray_aabb(ro, inv_rd, tri.bounds_min, tri.bounds_max, dist)) {
             continue;
         }
@@ -173,16 +178,23 @@ void main() {
                     continue;
                 }
                 vec3 dir = to_light / dist;
+                float emit = 1.0;
+                if (light.directional != 0) {
+                    emit = dot(light.emission_normal, -dir);
+                    if (emit <= 0.0) {
+                        continue;
+                    }
+                }
                 float ndl = dot(normal, dir);
                 if (ndl <= 0.0) {
                     continue;
                 }
-                if (occluded(ro, dir, dist - shadow_bias)) {
+                if (occluded(ro, dir, dist - shadow_bias, light.ignore_occluder_group)) {
                     continue;
                 }
                 float attenuation = 1.0 - dist / light.intensity;
                 attenuation *= attenuation;
-                sample_rgb += light.color * ndl * attenuation;
+                sample_rgb += light.color * (emit * ndl * attenuation);
             }
             accum += sample_rgb;
         }

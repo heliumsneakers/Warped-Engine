@@ -80,6 +80,12 @@
     intensity(float) : "Intensity (emission radius, TB units)" : "300" : "Radius within which the light contributes."
 ]
 
+// Brush Light — editable solid geometry which emits baked light outward from each face
+@SolidClass base(Targetname) color(255 255 180) = light_brush : "Brush Emitter Light" [
+    _color(color255) : "Emitter Color (R G B)" : "255 255 255" : "Solid render color and emitted light color."
+    intensity(float) : "Intensity (emission radius, TB units)" : "300" : "Radius used by each face emitter."
+]
+
 // Trigger Once
 @SolidClass base(Targetname, Target) size(-8 -8 -8, 8 8 8) color(0 255 255) = trigger_once : "Trigger Once" [
     spawnflags(flags) =

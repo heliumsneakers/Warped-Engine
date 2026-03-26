@@ -25,6 +25,7 @@ struct LightmapComputeOccluderTri {
     Vector3 b{};
     Vector3 c{};
     AABB bounds{};
+    int occluderGroup = -1;
 };
 
 bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,

@@ -385,11 +385,129 @@ static bool ParseFloatProp(const Entity& e, const char* key, float& out) {
     return true;
 }
 
+static bool EntityHasClass(const Entity& e, const char* classname) {
+    auto it = e.properties.find("classname");
+    return (it != e.properties.end()) && (it->second == classname);
+}
+
+static int ClampColor255Component(float value) {
+    return std::max(0, std::min(255, (int)std::lround(value)));
+}
+
+static Vector3 ReadLightBrushColor255(const Entity& e) {
+    Vector3 color255{255, 255, 255};
+    ParseVec3Prop(e, "_color", color255);
+    color255.x = (float)ClampColor255Component(color255.x);
+    color255.y = (float)ClampColor255Component(color255.y);
+    color255.z = (float)ClampColor255Component(color255.z);
+    return color255;
+}
+
+static float ReadLightBrushIntensity(const Entity& e) {
+    float intensity = 300.0f;
+    ParseFloatProp(e, "intensity", intensity);
+    return intensity;
+}
+
+static std::string EncodeLightBrushTextureName(const Vector3& color255) {
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "__light_brush_%d_%d_%d",
+             ClampColor255Component(color255.x),
+             ClampColor255Component(color255.y),
+             ClampColor255Component(color255.z));
+    return std::string(buffer);
+}
+
+static Vector3 PolygonCentroid(const std::vector<Vector3>& verts) {
+    Vector3 centroid{0, 0, 0};
+    if (verts.empty()) {
+        return centroid;
+    }
+    for (const Vector3& v : verts) {
+        centroid = Vector3Add(centroid, v);
+    }
+    return Vector3Scale(centroid, 1.0f / (float)verts.size());
+}
+
+static void FaceBasis(const Vector3& n, Vector3& u, Vector3& v) {
+    Vector3 ref = (fabsf(n.y) < 0.9f) ? (Vector3){0, 1, 0} : (Vector3){1, 0, 0};
+    u = Vector3Normalize(Vector3CrossProduct(n, ref));
+    v = Vector3CrossProduct(n, u);
+}
+
+static bool InsidePoly2D(const std::vector<Vector2>& poly, float px, float py) {
+    const size_t n = poly.size();
+    for (size_t i = 0; i < n; ++i) {
+        const size_t j = (i + 1) % n;
+        const float ex = poly[j].x - poly[i].x;
+        const float ey = poly[j].y - poly[i].y;
+        const float cx = px - poly[i].x;
+        const float cy = py - poly[i].y;
+        if (ex * cy - ey * cx < -1e-3f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::vector<Vector3> GenerateFaceEmitterSamples(const MapPolygon& poly) {
+    static constexpr float kSampleSpacing = 32.0f;
+    static constexpr int kMaxSamplesPerAxis = 8;
+
+    Vector3 axisU{};
+    Vector3 axisV{};
+    FaceBasis(poly.normal, axisU, axisV);
+
+    float minU = 1e30f, maxU = -1e30f, minV = 1e30f, maxV = -1e30f;
+    std::vector<Vector2> poly2d;
+    poly2d.reserve(poly.verts.size());
+    const Vector3 planeAnchor = poly.verts[0];
+    const float anchorU = Vector3DotProduct(planeAnchor, axisU);
+    const float anchorV = Vector3DotProduct(planeAnchor, axisV);
+    for (const Vector3& v : poly.verts) {
+        const float u = Vector3DotProduct(v, axisU);
+        const float vv = Vector3DotProduct(v, axisV);
+        minU = std::min(minU, u);
+        maxU = std::max(maxU, u);
+        minV = std::min(minV, vv);
+        maxV = std::max(maxV, vv);
+        poly2d.push_back({u, vv});
+    }
+
+    const float extentU = std::max(0.0f, maxU - minU);
+    const float extentV = std::max(0.0f, maxV - minV);
+    const int samplesU = std::max(1, std::min(kMaxSamplesPerAxis, (int)std::ceil(extentU / kSampleSpacing)));
+    const int samplesV = std::max(1, std::min(kMaxSamplesPerAxis, (int)std::ceil(extentV / kSampleSpacing)));
+    const float stepU = (samplesU > 0) ? (extentU / (float)samplesU) : 0.0f;
+    const float stepV = (samplesV > 0) ? (extentV / (float)samplesV) : 0.0f;
+
+    std::vector<Vector3> samples;
+    samples.reserve((size_t)samplesU * (size_t)samplesV);
+    for (int y = 0; y < samplesV; ++y) {
+        for (int x = 0; x < samplesU; ++x) {
+            const float u = minU + ((float)x + 0.5f) * stepU;
+            const float v = minV + ((float)y + 0.5f) * stepV;
+            if (!InsidePoly2D(poly2d, u, v)) {
+                continue;
+            }
+            Vector3 p = planeAnchor;
+            p = Vector3Add(p, Vector3Scale(axisU, u - anchorU));
+            p = Vector3Add(p, Vector3Scale(axisV, v - anchorV));
+            p = Vector3Add(p, Vector3Scale(poly.normal, 1.0f));
+            samples.push_back(p);
+        }
+    }
+
+    if (samples.empty()) {
+        samples.push_back(Vector3Add(PolygonCentroid(poly.verts), Vector3Scale(poly.normal, 1.0f)));
+    }
+    return samples;
+}
+
 std::vector<PointLight> GetPointLights(const Map &map) {
     std::vector<PointLight> lights;
     for (auto &e : map.entities) {
-        auto it = e.properties.find("classname");
-        if (it == e.properties.end() || it->second != "light_point") continue;
+        if (!EntityHasClass(e, "light_point")) continue;
 
         Vector3 originTB{0,0,0}, color255{255,255,255};
         ParseVec3Prop(e, "origin", originTB);
@@ -402,9 +520,95 @@ std::vector<PointLight> GetPointLights(const Map &map) {
         pl.position  = ConvertTBtoRaylibEntities(originTB);
         pl.color     = { color255.x/255.0f, color255.y/255.0f, color255.z/255.0f };
         pl.intensity = intensity;
+        pl.emissionNormal = { 0.0f, 0.0f, 0.0f };
+        pl.directional = 0;
+        pl.ignoreOccluderGroup = -1;
         lights.push_back(pl);
         printf("PointLight at (%.1f,%.1f,%.1f) radius=%.1f\n",
                pl.position.x, pl.position.y, pl.position.z, pl.intensity);
+    }
+
+    int nextLightBrushGroup = 0;
+    for (auto& entity : map.entities) {
+        if (!EntityHasClass(entity, "light_brush")) continue;
+
+        const Vector3 color255 = ReadLightBrushColor255(entity);
+        const float intensity = ReadLightBrushIntensity(entity);
+
+        for (const Brush& brush : entity.brushes) {
+            const int lightBrushGroup = nextLightBrushGroup++;
+            std::vector<MapPolygon> polys;
+            const int nF = (int)brush.faces.size();
+            if (nF < 3) continue;
+
+            std::vector<Plane> planes(nF);
+            for (int i = 0; i < nF; ++i) {
+                planes[i].normal = brush.faces[i].normal;
+                planes[i].d = Vector3DotProduct(brush.faces[i].normal,
+                                                brush.faces[i].vertices[0]);
+            }
+
+            std::vector<std::vector<Vector3>> facePolys(nF);
+            for (int i = 0; i < nF - 2; ++i)
+              for (int j = i + 1; j < nF - 1; ++j)
+                for (int k = j + 1; k < nF; ++k) {
+                    Vector3 ip;
+                    if (!GetIntersection(planes[i], planes[j], planes[k], ip)) continue;
+                    bool inside = true;
+                    for (int m = 0; m < nF; ++m) {
+                        float d = Vector3DotProduct(brush.faces[m].normal, ip) + planes[m].d;
+                        if (d > (float)epsilon) { inside = false; break; }
+                    }
+                    if (inside) {
+                        facePolys[i].push_back(ip);
+                        facePolys[j].push_back(ip);
+                        facePolys[k].push_back(ip);
+                    }
+                }
+
+            for (int i = 0; i < nF; ++i) {
+                RemoveDuplicatePoints(facePolys[i], (float)epsilon);
+                if (facePolys[i].size() < 3) continue;
+
+                Vector3 nTB = brush.faces[i].normal;
+                SortPolygonVertices(facePolys[i], nTB);
+                for (auto& p : facePolys[i]) p = ConvertTBtoRaylib(p);
+
+                Vector3 nRL = CalculateNormal(facePolys[i][0], facePolys[i][1], facePolys[i][2]);
+                if (Vector3DotProduct(nRL, ConvertTBtoRaylib(nTB)) < 0.f) {
+                    std::reverse(facePolys[i].begin(), facePolys[i].end());
+                    nRL = CalculateNormal(facePolys[i][0], facePolys[i][1], facePolys[i][2]);
+                }
+
+                MapPolygon mp;
+                mp.verts = std::move(facePolys[i]);
+                mp.normal = nRL;
+                mp.occluderGroup = lightBrushGroup;
+                polys.push_back(std::move(mp));
+            }
+
+            for (const MapPolygon& poly : polys) {
+                const std::vector<Vector3> samples = GenerateFaceEmitterSamples(poly);
+                const float invSampleCount = 1.0f / (float)samples.size();
+                const Vector3 sampleColor = {
+                    (color255.x / 255.0f) * invSampleCount,
+                    (color255.y / 255.0f) * invSampleCount,
+                    (color255.z / 255.0f) * invSampleCount
+                };
+                for (const Vector3& samplePos : samples) {
+                    PointLight pl;
+                    pl.position = samplePos;
+                    pl.color = sampleColor;
+                    pl.intensity = intensity;
+                    pl.emissionNormal = poly.normal;
+                    pl.directional = 1;
+                    pl.ignoreOccluderGroup = -1;
+                    lights.push_back(pl);
+                }
+                printf("LightBrush face emitters: %zu samples radius=%.1f normal=(%.2f,%.2f,%.2f)\n",
+                       samples.size(), intensity, poly.normal.x, poly.normal.y, poly.normal.z);
+            }
+        }
     }
     return lights;
 }
@@ -477,73 +681,82 @@ Vector2 ComputeFaceUV(const Vector3& vert,
     Used by the .bsp compiler and by BuildMapGeometry below.
 ------------------------------------------------------------
 */
+static void AppendBrushEntityPolygons(const Entity& entity, bool devMode, int* nextLightBrushGroup, std::vector<MapPolygon>& out) {
+    const bool isTrigger = EntityHasClass(entity, "trigger_once") || EntityHasClass(entity, "trigger_multiple");
+    const bool isLightBrush = EntityHasClass(entity, "light_brush");
+    const std::string lightBrushTexture = isLightBrush
+        ? EncodeLightBrushTextureName(ReadLightBrushColor255(entity))
+        : std::string();
+
+    for (auto& brush : entity.brushes) {
+        if (isTrigger && !devMode) continue;
+        const int lightBrushGroup = (isLightBrush && nextLightBrushGroup) ? (*nextLightBrushGroup)++ : -1;
+
+        const int nF = (int)brush.faces.size();
+        if (nF < 3) continue;
+
+        std::vector<Plane> planes(nF);
+        for (int i = 0; i < nF; ++i) {
+            planes[i].normal = brush.faces[i].normal;
+            planes[i].d = Vector3DotProduct(brush.faces[i].normal,
+                                            brush.faces[i].vertices[0]);
+        }
+
+        std::vector<std::vector<Vector3>> polys(nF);
+        for (int i = 0; i < nF - 2; ++i)
+          for (int j = i + 1; j < nF - 1; ++j)
+            for (int k = j + 1; k < nF; ++k) {
+                Vector3 ip;
+                if (!GetIntersection(planes[i], planes[j], planes[k], ip)) continue;
+                bool inside = true;
+                for (int m = 0; m < nF; ++m) {
+                    float d = Vector3DotProduct(brush.faces[m].normal, ip) + planes[m].d;
+                    if (d > (float)epsilon) { inside = false; break; }
+                }
+                if (inside) {
+                    polys[i].push_back(ip);
+                    polys[j].push_back(ip);
+                    polys[k].push_back(ip);
+                }
+            }
+
+        for (int i = 0; i < nF; ++i) {
+            RemoveDuplicatePoints(polys[i], (float)epsilon);
+            if (polys[i].size() < 3) continue;
+
+            Vector3 nTB = brush.faces[i].normal;
+            SortPolygonVertices(polys[i], nTB);
+            for (auto& p : polys[i]) p = ConvertTBtoRaylib(p);
+
+            Vector3 nRL = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
+            if (Vector3DotProduct(nRL, ConvertTBtoRaylib(nTB)) < 0.f) {
+                std::reverse(polys[i].begin(), polys[i].end());
+                nRL = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
+            }
+
+            MapPolygon mp;
+            mp.verts    = std::move(polys[i]);
+            mp.normal   = nRL;
+            mp.texture  = isLightBrush ? lightBrushTexture : brush.faces[i].texture;
+            mp.occluderGroup = lightBrushGroup;
+            mp.texAxisU = ConvertTBtoRaylib(brush.faces[i].textureAxes1);
+            mp.texAxisV = ConvertTBtoRaylib(brush.faces[i].textureAxes2);
+            mp.offU     = brush.faces[i].offsetX;
+            mp.offV     = brush.faces[i].offsetY;
+            mp.rot      = brush.faces[i].rotation;
+            mp.scaleU   = brush.faces[i].scaleX;
+            mp.scaleV   = brush.faces[i].scaleY;
+            out.push_back(std::move(mp));
+        }
+    }
+}
+
 std::vector<MapPolygon> BuildMapPolygons(const Map &map, bool devMode)
 {
     std::vector<MapPolygon> out;
-
-    for (auto &entity : map.entities) {
-        bool isTrigger = false;
-        auto cit = entity.properties.find("classname");
-        if (cit != entity.properties.end()) {
-            const std::string &cn = cit->second;
-            if (cn == "trigger_once" || cn == "trigger_multiple") isTrigger = true;
-        }
-
-        for (auto &brush : entity.brushes) {
-            if (isTrigger && !devMode) continue;
-
-            int nF = (int)brush.faces.size();
-            if (nF < 3) continue;
-
-            std::vector<Plane> planes(nF);
-            for (int i=0;i<nF;++i) {
-                planes[i].normal = brush.faces[i].normal;
-                planes[i].d      = Vector3DotProduct(brush.faces[i].normal,
-                                                     brush.faces[i].vertices[0]);
-            }
-
-            std::vector<std::vector<Vector3>> polys(nF);
-            for (int i=0;i<nF-2;++i)
-              for (int j=i+1;j<nF-1;++j)
-                for (int k=j+1;k<nF;++k) {
-                    Vector3 ip;
-                    if (!GetIntersection(planes[i],planes[j],planes[k],ip)) continue;
-                    bool inside = true;
-                    for (int m=0;m<nF;++m) {
-                        float d = Vector3DotProduct(brush.faces[m].normal, ip) + planes[m].d;
-                        if (d > (float)epsilon) { inside=false; break; }
-                    }
-                    if (inside) { polys[i].push_back(ip); polys[j].push_back(ip); polys[k].push_back(ip); }
-                }
-
-            for (int i=0;i<nF;++i) {
-                RemoveDuplicatePoints(polys[i], (float)epsilon);
-                if (polys[i].size()<3) continue;
-
-                Vector3 nTB = brush.faces[i].normal;
-                SortPolygonVertices(polys[i], nTB);
-                for (auto &p : polys[i]) p = ConvertTBtoRaylib(p);
-
-                Vector3 nRL = CalculateNormal(polys[i][0],polys[i][1],polys[i][2]);
-                if (Vector3DotProduct(nRL, ConvertTBtoRaylib(nTB)) < 0.f) {
-                    std::reverse(polys[i].begin(), polys[i].end());
-                    nRL = CalculateNormal(polys[i][0],polys[i][1],polys[i][2]);
-                }
-
-                MapPolygon mp;
-                mp.verts    = std::move(polys[i]);
-                mp.normal   = nRL;
-                mp.texture  = brush.faces[i].texture;
-                mp.texAxisU = ConvertTBtoRaylib(brush.faces[i].textureAxes1);
-                mp.texAxisV = ConvertTBtoRaylib(brush.faces[i].textureAxes2);
-                mp.offU     = brush.faces[i].offsetX;
-                mp.offV     = brush.faces[i].offsetY;
-                mp.rot      = brush.faces[i].rotation;
-                mp.scaleU   = brush.faces[i].scaleX;
-                mp.scaleV   = brush.faces[i].scaleY;
-                out.push_back(std::move(mp));
-            }
-        }
+    int nextLightBrushGroup = 0;
+    for (auto& entity : map.entities) {
+        AppendBrushEntityPolygons(entity, devMode, &nextLightBrushGroup, out);
     }
     printf("[MapParser] Built %zu polygons.\n", out.size());
     return out;

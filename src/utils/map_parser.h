@@ -59,6 +59,9 @@ struct PointLight {
     Vector3 position;     // world-space (GL coords)
     Vector3 color;        // 0..1
     float   intensity;    // radius in world units
+    Vector3 emissionNormal{0.0f, 0.0f, 0.0f};
+    int     directional = 0;
+    int     ignoreOccluderGroup = -1;
 };
 
 // --------------------------------------------------------------------------
@@ -85,6 +88,7 @@ struct MapPolygon {
     std::vector<Vector3> verts;      // world-space (GL coords), CCW, ≥3
     Vector3              normal;     // world-space
     std::string          texture;
+    int                  occluderGroup = -1;
     // Texture projection params (already converted to GL axes):
     Vector3 texAxisU, texAxisV;
     float   offU, offV;

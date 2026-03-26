@@ -36,6 +36,7 @@ struct SubMesh {
     sg_buffer ibuf{};
     sg_view   tex_view{};
     int       index_count = 0;
+    bool      fullbright = false;
     AABB      bounds{};           // world-space, for frustum culling
 };
 

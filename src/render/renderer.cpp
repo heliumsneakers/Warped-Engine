@@ -194,9 +194,55 @@ static TextureEntry MakeFallbackTexture(void) {
     return e;
 }
 
+static bool ParseLightBrushTextureName(const std::string& name, uint8_t& r, uint8_t& g, uint8_t& b) {
+    int ir = 0, ig = 0, ib = 0;
+    if (std::sscanf(name.c_str(), "__light_brush_%d_%d_%d", &ir, &ig, &ib) != 3) {
+        return false;
+    }
+    ir = std::max(0, std::min(255, ir));
+    ig = std::max(0, std::min(255, ig));
+    ib = std::max(0, std::min(255, ib));
+    r = (uint8_t) ir;
+    g = (uint8_t) ig;
+    b = (uint8_t) ib;
+    return true;
+}
+
+static TextureEntry MakeSolidColorTexture(uint8_t r, uint8_t g, uint8_t b, const char* label) {
+    const uint8_t pixel[4] = { r, g, b, 255 };
+
+    sg_image_desc id = {};
+    id.width = 1;
+    id.height = 1;
+    id.pixel_format = SG_PIXELFORMAT_RGBA8;
+    id.data.mip_levels[0] = { pixel, sizeof(pixel) };
+    id.label = label;
+    sg_image img = sg_make_image(&id);
+
+    sg_view_desc vd = {};
+    vd.texture.image = img;
+    sg_view view = sg_make_view(&vd);
+
+    TextureEntry e;
+    e.image = img;
+    e.view = view;
+    e.width = 1;
+    e.height = 1;
+    return e;
+}
+
 const TextureEntry* LoadTextureByName(TextureManager& mgr, const std::string& name) {
     auto it = mgr.textures.find(name);
     if (it != mgr.textures.end()) return &it->second;
+
+    uint8_t lr = 0, lg = 0, lb = 0;
+    if (ParseLightBrushTextureName(name, lr, lg, lb)) {
+        TextureEntry entry = MakeSolidColorTexture(lr, lg, lb, name.c_str());
+        Renderer_LogTextureState(name.c_str(), entry);
+        auto [ins, ok] = mgr.textures.emplace(name, entry);
+        (void)ok;
+        return &ins->second;
+    }
 
     std::string path = "../../assets/textures/" + name + ".png";
 
@@ -348,6 +394,7 @@ static void UploadBuckets(MapModel& mdl,
         sg_buffer ibuf = sg_make_buffer(&ibd);
 
         const TextureEntry* tex = LoadTextureByName(texMgr, b.texture);
+        uint8_t lr = 0, lg = 0, lb = 0;
 
         AABB bounds = AABBInvalid();
         for (auto& v : b.vertices) AABBExtend(&bounds, (Vector3){v.x,v.y,v.z});
@@ -355,6 +402,7 @@ static void UploadBuckets(MapModel& mdl,
         SubMesh sm;
         sm.vbuf=vbuf; sm.ibuf=ibuf; sm.tex_view=tex->view;
         sm.index_count=(int)b.indices.size(); sm.bounds=bounds;
+        sm.fullbright = ParseLightBrushTextureName(b.texture, lr, lg, lb);
         mdl.meshes.push_back(sm);
     }
 }
@@ -414,11 +462,12 @@ void Renderer_DrawMap(const MapModel& mdl,
     for (auto& sm : mdl.meshes) {
         // CPU frustum cull — skip submeshes fully outside view + render-distance
         if (!FrustumAABB(&frustum, sm.bounds)) continue;
+        const sg_view lightmap_view = sm.fullbright ? g_whiteLmV : mdl.lightmapView;
 
         if (!g_logged_bind_diagnostics) {
             printf("[Renderer] Draw bind states: diffuse_view=%s lightmap_view=%s diffuse_sampler=%s lightmap_sampler=%s\n",
                    RendererResourceStateName(sg_query_view_state(sm.tex_view)),
-                   RendererResourceStateName(sg_query_view_state(mdl.lightmapView)),
+                   RendererResourceStateName(sg_query_view_state(lightmap_view)),
                    RendererResourceStateName(sg_query_sampler_state(g_sampler)),
                    RendererResourceStateName(sg_query_sampler_state(g_lmSampler)));
             g_logged_bind_diagnostics = true;
@@ -428,7 +477,7 @@ void Renderer_DrawMap(const MapModel& mdl,
         bnd.vertex_buffers[0] = sm.vbuf;
         bnd.index_buffer      = sm.ibuf;
         bnd.views[VIEW_warped_map_shader_u_tex]       = sm.tex_view;
-        bnd.views[VIEW_warped_map_shader_u_lm]        = mdl.lightmapView;
+        bnd.views[VIEW_warped_map_shader_u_lm]        = lightmap_view;
         bnd.samplers[SMP_warped_map_shader_u_tex_smp] = g_sampler;
         bnd.samplers[SMP_warped_map_shader_u_lm_smp]  = g_lmSampler;
 
