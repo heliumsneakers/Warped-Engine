@@ -5,12 +5,17 @@
 #include <vector>
 #include <cstdint>
 
+struct BSPDataLightmapPage {
+    int                  width = 0;
+    int                  height = 0;
+    std::vector<uint8_t> pixels;
+};
+
 struct BSPData {
     std::vector<MapMeshBucket>     buckets;    // per-texture, ready for upload
     std::vector<MeshCollisionData> hulls;
     std::vector<Entity>            entities;   // point entities only
-    std::vector<uint8_t>           lightmapPixels;   // RGBA8
-    int lightmapW = 0, lightmapH = 0;
+    std::vector<BSPDataLightmapPage> lightmapPages;
     std::string                    assetPackPath;
 };
 

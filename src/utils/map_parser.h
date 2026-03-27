@@ -76,6 +76,7 @@ struct MapVertex {
 
 struct MapMeshBucket {
     std::string            texture;
+    uint32_t               lightmapPage = 0;
     std::vector<MapVertex> vertices;
     std::vector<uint32_t>  indices;
 };

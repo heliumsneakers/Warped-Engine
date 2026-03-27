@@ -38,7 +38,7 @@ bool LightmapComputePlatform_ReadbackBuffer_Impl(sg_buffer buffer, size_t numByt
 namespace {
 
 constexpr int kWorkgroupSize = 8;
-constexpr float kLuxelSize = 1.0f;
+constexpr int kDispatchBatchSize = 32;
 constexpr float kAmbient = 0.12f;
 constexpr float kShadowBias = 0.25f;
 constexpr float kRayEps = 1e-4f;
@@ -515,52 +515,79 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     }
 
     pass.compute = true;
-    sg_begin_pass(&pass);
-    sg_apply_pipeline(pipeline);
+    printf("[Lightmap] compute pass begin (%zu rects, %dx%d)\n", rects.size(), atlasWidth, atlasHeight);
+    fflush(stdout);
+
     bindings.views[VIEW_warped_lightmap_bake_cs_lights] = lightsView;
     bindings.views[VIEW_warped_lightmap_bake_cs_occluders] = occluderView;
     bindings.views[VIEW_warped_lightmap_bake_cs_output] = outputView;
-    sg_apply_bindings(&bindings);
 
-    for (const LightmapComputeFaceRect& rect : rects) {
-        GpuFaceParams params{};
-        params.atlas_width = atlasWidth;
-        params.atlas_height = atlasHeight;
-        params.rect_x = rect.x;
-        params.rect_y = rect.y;
-        params.rect_w = rect.w;
-        params.rect_h = rect.h;
-        params.light_count = (int) lights.size();
-        params.tri_count = (int) occluders.size();
-        params.min_u = rect.minU;
-        params.min_v = rect.minV;
-        params.luxel_size = kLuxelSize;
-        params.ambient = kAmbient;
-        params.shadow_bias = kShadowBias;
-        params.ray_eps = kRayEps;
-        params._pad_scalar0 = 0.0f;
-        params._pad_scalar1 = 0.0f;
-        CopyVec3(params.origin, rect.origin);
-        params._pad0 = 0.0f;
-        CopyVec3(params.axis_u, rect.axisU);
-        params._pad1 = 0.0f;
-        CopyVec3(params.axis_v, rect.axisV);
-        params._pad2 = 0.0f;
-        CopyVec3(params.normal, rect.normal);
-        params._pad3 = 0.0f;
+    for (size_t batchStart = 0; batchStart < rects.size(); batchStart += kDispatchBatchSize) {
+        const size_t batchEnd = std::min(batchStart + (size_t)kDispatchBatchSize, rects.size());
+        sg_begin_pass(&pass);
+        sg_apply_pipeline(pipeline);
+        sg_apply_bindings(&bindings);
 
-        const sg_range paramsRange = ByteRange(&params, sizeof(params));
-        sg_apply_uniforms(UB_warped_lightmap_bake_cs_face_params, &paramsRange);
-        const int groupsX = (rect.w + (kWorkgroupSize - 1)) / kWorkgroupSize;
-        const int groupsY = (rect.h + (kWorkgroupSize - 1)) / kWorkgroupSize;
-        sg_dispatch(groupsX, groupsY, 1);
+        for (size_t rectIndex = batchStart; rectIndex < batchEnd; ++rectIndex) {
+            const LightmapComputeFaceRect& rect = rects[rectIndex];
+            GpuFaceParams params{};
+            params.atlas_width = atlasWidth;
+            params.atlas_height = atlasHeight;
+            params.rect_x = rect.x;
+            params.rect_y = rect.y;
+            params.rect_w = rect.w;
+            params.rect_h = rect.h;
+            params.light_count = (int) lights.size();
+            params.tri_count = (int) occluders.size();
+            params.min_u = rect.minU;
+            params.min_v = rect.minV;
+            params.luxel_size = rect.luxelSize;
+            params.ambient = kAmbient;
+            params.shadow_bias = kShadowBias;
+            params.ray_eps = kRayEps;
+            params._pad_scalar0 = 0.0f;
+            params._pad_scalar1 = 0.0f;
+            CopyVec3(params.origin, rect.origin);
+            params._pad0 = 0.0f;
+            CopyVec3(params.axis_u, rect.axisU);
+            params._pad1 = 0.0f;
+            CopyVec3(params.axis_v, rect.axisV);
+            params._pad2 = 0.0f;
+            CopyVec3(params.normal, rect.normal);
+            params._pad3 = 0.0f;
+            params.poly_count = rect.polyCount;
+            params._pad_poly_count[0] = 0.0f;
+            params._pad_poly_count[1] = 0.0f;
+            params._pad_poly_count[2] = 0.0f;
+            for (int i = 0; i < LIGHTMAP_COMPUTE_MAX_POLY_VERTS; ++i) {
+                params.poly_verts[i][0] = rect.polyVerts[i][0];
+                params.poly_verts[i][1] = rect.polyVerts[i][1];
+                params.poly_verts[i][2] = rect.polyVerts[i][2];
+                params.poly_verts[i][3] = rect.polyVerts[i][3];
+            }
+
+            const sg_range paramsRange = ByteRange(&params, sizeof(params));
+            sg_apply_uniforms(UB_warped_lightmap_bake_cs_face_params, &paramsRange);
+            const int groupsX = (rect.w + (kWorkgroupSize - 1)) / kWorkgroupSize;
+            const int groupsY = (rect.h + (kWorkgroupSize - 1)) / kWorkgroupSize;
+            sg_dispatch(groupsX, groupsY, 1);
+        }
+
+        sg_end_pass();
+        sg_commit();
+        printf("[Lightmap] compute batch %zu-%zu/%zu committed\n",
+               batchStart + 1, batchEnd, rects.size());
+        fflush(stdout);
     }
-    sg_end_pass();
-    sg_commit();
+
+    printf("[Lightmap] compute pass committed, reading back buffer\n");
+    fflush(stdout);
 
     if (!LightmapComputePlatform_ReadbackBuffer(outputBuffer, packedPixels.size() * sizeof(GpuPackedPixel), packedPixels.data(), error)) {
         goto cleanup;
     }
+    printf("[Lightmap] compute readback complete\n");
+    fflush(stdout);
 
     for (size_t i = 0; i < packedPixels.size(); ++i) {
         const uint32_t packed = packedPixels[i].value;
@@ -572,6 +599,7 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
 
     printf("[Lightmap] compute bake succeeded on backend %s (%zu rects).\n",
            BackendName(sg_query_backend()), rects.size());
+    fflush(stdout);
     success = true;
 
 cleanup:

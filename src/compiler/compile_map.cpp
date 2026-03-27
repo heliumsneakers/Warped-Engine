@@ -115,8 +115,8 @@ int main(int argc, char** argv)
     std::vector<uint32_t>   indices;
     std::vector<BSPMesh>    meshes;
 
-    struct Bucket { uint32_t firstIdx, firstVtx; std::vector<BSPVertex> v; std::vector<uint32_t> i; };
-    std::unordered_map<uint32_t,Bucket> buckets;
+    struct Bucket { uint32_t firstIdx, firstVtx; uint32_t lightmapPage = 0; std::vector<BSPVertex> v; std::vector<uint32_t> i; };
+    std::unordered_map<uint64_t,Bucket> buckets;
 
     auto GetTex = [&](const std::string& n)->uint32_t {
         auto it = texIdx.find(n);
@@ -133,17 +133,21 @@ int main(int argc, char** argv)
         texIdx[n]=idx; return idx;
     };
 
-    for (size_t pi=0; pi<polys.size(); ++pi) {
-        const MapPolygon& p = polys[pi];
+    for (size_t pi=0; pi<lm.patches.size(); ++pi) {
+        const LightmapPatch& patch = lm.patches[pi];
+        const MapPolygon& p = patch.poly;
         uint32_t ti = GetTex(p.texture);
         TexInfo  td = texCache[p.texture];
-        Bucket& b = buckets[ti];
+        const uint32_t lightmapPage = patch.page;
+        const uint64_t bucketKey = ((uint64_t)lightmapPage << 32) | (uint64_t)ti;
+        Bucket& b = buckets[bucketKey];
+        b.lightmapPage = lightmapPage;
 
         auto MakeV = [&](size_t vi)->BSPVertex {
             const Vector3& vp = p.verts[vi];
             Vector2 uv = ComputeFaceUV(vp,p.texAxisU,p.texAxisV,p.offU,p.offV,
                                        p.rot,p.scaleU,p.scaleV,(float)td.w,(float)td.h);
-            const Vector2& luv = lm.polyUV[pi].uv[vi];
+            const Vector2& luv = patch.uv[vi];
             return BSPVertex{vp.x,vp.y,vp.z, p.normal.x,p.normal.y,p.normal.z,
                              uv.x,uv.y, luv.x,luv.y};
         };
@@ -160,7 +164,8 @@ int main(int argc, char** argv)
     // flatten buckets → lumps
     for (auto& kv : buckets) {
         BSPMesh m{};
-        m.textureIndex = kv.first;
+        m.textureIndex = (uint32_t)(kv.first & 0xFFFFFFFFu);
+        m.lightmapPage = kv.second.lightmapPage;
         m.firstVertex  = (uint32_t)vertices.size();
         m.vertexCount  = (uint32_t)kv.second.v.size();
         m.firstIndex   = (uint32_t)indices.size();
@@ -195,10 +200,33 @@ int main(int argc, char** argv)
     entText += '\0';
 
     // ----- lightmap lump ---------------------------------------------------
-    std::vector<uint8_t> lmLump(sizeof(BSPLightmapHeader)+lm.pixels.size());
-    BSPLightmapHeader lh{(uint32_t)lm.width,(uint32_t)lm.height};
-    memcpy(lmLump.data(), &lh, sizeof(lh));
-    memcpy(lmLump.data()+sizeof(lh), lm.pixels.data(), lm.pixels.size());
+    size_t lmLumpSize = sizeof(BSPLightmapLumpHeader) + lm.pages.size() * sizeof(BSPLightmapPageHeader);
+    for (const LightmapPage& page : lm.pages) {
+        lmLumpSize += page.pixels.size();
+    }
+    std::vector<uint8_t> lmLump(lmLumpSize);
+    uint8_t* lmWrite = lmLump.data();
+
+    BSPLightmapLumpHeader lmHeader{ (uint32_t)lm.pages.size() };
+    memcpy(lmWrite, &lmHeader, sizeof(lmHeader));
+    lmWrite += sizeof(lmHeader);
+
+    for (const LightmapPage& page : lm.pages) {
+        BSPLightmapPageHeader pageHeader{
+            (uint32_t)page.width,
+            (uint32_t)page.height,
+            (uint32_t)page.pixels.size()
+        };
+        memcpy(lmWrite, &pageHeader, sizeof(pageHeader));
+        lmWrite += sizeof(pageHeader);
+    }
+
+    for (const LightmapPage& page : lm.pages) {
+        if (!page.pixels.empty()) {
+            memcpy(lmWrite, page.pixels.data(), page.pixels.size());
+            lmWrite += page.pixels.size();
+        }
+    }
 
     // ----- write -----------------------------------------------------------
     FILE* f = fopen(outName.c_str(),"wb");
@@ -226,8 +254,8 @@ int main(int argc, char** argv)
     printf("\n[compile_map] wrote %s\n", outName.c_str());
     printf("[compile_map] wrote %s\n", outPackName.c_str());
     printf("  textures : %zu\n  vertices : %zu\n  indices  : %zu\n"
-           "  meshes   : %zu\n  hulls    : %zu\n  lightmap : %dx%d\n",
+           "  meshes   : %zu\n  hulls    : %zu\n  lightmap pages : %zu\n",
            textures.size(), vertices.size(), indices.size(),
-           meshes.size(), hulls.size(), lm.width, lm.height);
+           meshes.size(), hulls.size(), lm.pages.size());
     return 0;
 }

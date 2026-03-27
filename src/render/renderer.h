@@ -36,6 +36,7 @@ struct SubMesh {
     sg_buffer vbuf{};
     sg_buffer ibuf{};
     sg_view   tex_view{};
+    uint32_t  lightmap_page = 0;
     int       index_count = 0;
     bool      fullbright = false;
     AABB      bounds{};           // world-space, for frustum culling
@@ -43,8 +44,8 @@ struct SubMesh {
 
 struct MapModel {
     std::vector<SubMesh> meshes;
-    sg_image lightmapImage{};
-    sg_view  lightmapView{};
+    std::vector<sg_image> lightmapImages;
+    std::vector<sg_view>  lightmapViews;
 };
 
 // ---------------------------------------------------------------------------

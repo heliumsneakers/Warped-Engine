@@ -6,7 +6,7 @@
 #include <cstdint>
 
 #define WBSP_MAGIC    0x50534257u   // 'WBSP' little-endian
-#define WBSP_VERSION  1u
+#define WBSP_VERSION  2u
 
 enum {
     LUMP_TEXTURES = 0,   // BSPTexture[]
@@ -16,7 +16,7 @@ enum {
     LUMP_HULLS,          // BSPHull[]
     LUMP_HULL_PTS,       // BSPVec3[]
     LUMP_ENTITIES,       // char[]  (key/value text, \0-terminated)
-    LUMP_LIGHTMAP,       // BSPLightmapHeader + rgba8 pixels
+    LUMP_LIGHTMAP,       // BSPLightmapLumpHeader + BSPLightmapPageHeader[] + rgba8 page data
     LUMP_COUNT
 };
 
@@ -48,6 +48,7 @@ struct BSPVertex {
 
 struct BSPMesh {
     uint32_t textureIndex;
+    uint32_t lightmapPage;
     uint32_t firstIndex;
     uint32_t indexCount;
     uint32_t firstVertex;
@@ -64,10 +65,14 @@ struct BSPHull {
     uint32_t collisionType;   // maps to enum CollisionType
 };
 
-struct BSPLightmapHeader {
+struct BSPLightmapLumpHeader {
+    uint32_t pageCount;
+};
+
+struct BSPLightmapPageHeader {
     uint32_t width;
     uint32_t height;
-    // followed by width*height*4 bytes of RGBA8
+    uint32_t byteLength;
 };
 
 #pragma pack(pop)

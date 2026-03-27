@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 project(Warped)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -188,8 +188,10 @@ endif()
 
 target_include_directories(WarpedGame PRIVATE
     ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/lib/clay
     ${PROJECT_SOURCE_DIR}/lib/sokol
     ${PROJECT_SOURCE_DIR}/lib/sokol/util
+    ${PROJECT_SOURCE_DIR}/lib/sokol/tests/ext
     ${PROJECT_SOURCE_DIR}/lib/stb
     ${PROJECT_SOURCE_DIR}/lib/rres/src
 )

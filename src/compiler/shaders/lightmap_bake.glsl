@@ -26,6 +26,9 @@ layout(binding=0) uniform cs_face_params {
     float _pad2;
     vec3 normal;
     float _pad3;
+    int poly_count;
+    vec3 _pad_poly_count;
+    vec4 poly_verts[32];
 };
 
 struct point_light {
@@ -70,6 +73,20 @@ layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
 
 const int AA_GRID = 4;
 const int SAMPLES = AA_GRID * AA_GRID;
+
+bool inside_poly_2d(float px, float py) {
+    for (int i = 0; i < poly_count; ++i) {
+        int j = (i + 1) % poly_count;
+        vec2 a = poly_verts[i].xy;
+        vec2 b = poly_verts[j].xy;
+        vec2 edge = b - a;
+        vec2 rel = vec2(px, py) - a;
+        if ((edge.x * rel.y - edge.y * rel.x) < -1e-3) {
+            return false;
+        }
+    }
+    return true;
+}
 
 bool ray_aabb(vec3 ro, vec3 inv_rd, vec3 bb_min, vec3 bb_max, float tmax) {
     float t1;
@@ -161,23 +178,27 @@ void main() {
     }
 
     vec3 accum = vec3(0.0);
+    int used_samples = 0;
     float inv_grid = 1.0 / float(AA_GRID);
     for (int sy = 0; sy < AA_GRID; ++sy) {
         for (int sx = 0; sx < AA_GRID; ++sx) {
             float ju = float(local_xy.x - 2) + (float(sx) + 0.5) * inv_grid;
             float jv = float(local_xy.y - 2) + (float(sy) + 0.5) * inv_grid;
+            if (!inside_poly_2d(ju, jv)) {
+                continue;
+            }
             vec3 wp = origin + axis_u * (ju * luxel_size) + axis_v * (jv * luxel_size);
-            vec3 ro = wp + normal * shadow_bias;
 
             vec3 sample_rgb = vec3(ambient);
             for (int li = 0; li < light_count; ++li) {
                 point_light light = lights[li];
-                vec3 to_light = light.position - ro;
+                vec3 to_light = light.position - wp;
                 float dist = length(to_light);
                 if ((dist > light.intensity) || (dist < 1e-3)) {
                     continue;
                 }
                 vec3 dir = to_light / dist;
+                vec3 ro = wp + normal * shadow_bias + dir * shadow_bias;
                 float emit = 1.0;
                 if (light.directional != 0) {
                     emit = dot(light.emission_normal, -dir);
@@ -189,7 +210,7 @@ void main() {
                 if (ndl <= 0.0) {
                     continue;
                 }
-                if (occluded(ro, dir, dist - shadow_bias, light.ignore_occluder_group)) {
+                if (occluded(ro, dir, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group)) {
                     continue;
                 }
                 float attenuation = 1.0 - dist / light.intensity;
@@ -197,10 +218,13 @@ void main() {
                 sample_rgb += light.color * (emit * ndl * attenuation);
             }
             accum += sample_rgb;
+            used_samples += 1;
         }
     }
 
-    accum /= float(SAMPLES);
+    if (used_samples > 0) {
+        accum /= float(used_samples);
+    }
     ivec2 atlas_xy = ivec2(rect_x + local_xy.x, rect_y + local_xy.y);
     uint out_index = uint(atlas_xy.y * atlas_width + atlas_xy.x);
     pixels[out_index].value = pack_rgba8(vec4(accum, 1.0));

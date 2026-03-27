@@ -419,6 +419,7 @@ static void UploadBuckets(MapModel& mdl,
         SubMesh sm;
         sm.vbuf=vbuf; sm.ibuf=ibuf; sm.tex_view=tex->view;
         sm.index_count=(int)b.indices.size(); sm.bounds=bounds;
+        sm.lightmap_page = b.lightmapPage;
         sm.fullbright = ParseLightBrushTextureName(b.texture, lr, lg, lb);
         mdl.meshes.push_back(sm);
     }
@@ -428,7 +429,7 @@ MapModel Renderer_UploadMap(const Map& map, TextureManager& texMgr) {
     std::vector<MapMeshBucket> buckets = BuildMapGeometry(map, texMgr);
     MapModel mdl;
     UploadBuckets(mdl, buckets, texMgr);
-    mdl.lightmapView = g_whiteLmV;            // no baked lm in legacy path
+    mdl.lightmapViews.push_back(g_whiteLmV);  // no baked lm in legacy path
     printf("[Renderer] Map uploaded: %zu submeshes (no lightmap).\n", mdl.meshes.size());
     return mdl;
 }
@@ -438,23 +439,28 @@ MapModel Renderer_UploadBSP(const BSPData& bsp, TextureManager& texMgr) {
     texMgr.activePackPath = bsp.assetPackPath;
     UploadBuckets(mdl, bsp.buckets, texMgr);
 
-    if (bsp.lightmapW>0 && !bsp.lightmapPixels.empty()) {
+    for (const BSPDataLightmapPage& page : bsp.lightmapPages) {
+        if (page.width <= 0 || page.height <= 0 || page.pixels.empty()) {
+            continue;
+        }
         sg_image_desc id = {};
-        id.width=bsp.lightmapW; id.height=bsp.lightmapH;
-        id.pixel_format=SG_PIXELFORMAT_RGBA8;
-        id.data.mip_levels[0] = { bsp.lightmapPixels.data(), bsp.lightmapPixels.size() };
-        id.label="lightmap-atlas";
-        mdl.lightmapImage = sg_make_image(&id);
-        sg_view_desc vd={}; vd.texture.image=mdl.lightmapImage;
-        mdl.lightmapView = sg_make_view(&vd);
-    } else {
-        mdl.lightmapView = g_whiteLmV;
+        id.width = page.width;
+        id.height = page.height;
+        id.pixel_format = SG_PIXELFORMAT_RGBA8;
+        id.data.mip_levels[0] = { page.pixels.data(), page.pixels.size() };
+        id.label = "lightmap-page";
+        sg_image image = sg_make_image(&id);
+        sg_view_desc vd = {};
+        vd.texture.image = image;
+        mdl.lightmapImages.push_back(image);
+        mdl.lightmapViews.push_back(sg_make_view(&vd));
     }
-    printf("[Renderer] Lightmap image=%s view=%s\n",
-           RendererResourceStateName(sg_query_image_state(mdl.lightmapImage.id ? mdl.lightmapImage : g_whiteLm)),
-           RendererResourceStateName(sg_query_view_state(mdl.lightmapView)));
-    printf("[Renderer] BSP uploaded: %zu submeshes, lm %dx%d.\n",
-           mdl.meshes.size(), bsp.lightmapW, bsp.lightmapH);
+
+    if (mdl.lightmapViews.empty()) {
+        mdl.lightmapViews.push_back(g_whiteLmV);
+    }
+    printf("[Renderer] BSP uploaded: %zu submeshes, %zu lightmap pages.\n",
+           mdl.meshes.size(), mdl.lightmapViews.size());
     return mdl;
 }
 
@@ -480,7 +486,8 @@ void Renderer_DrawMap(const MapModel& mdl,
     for (auto& sm : mdl.meshes) {
         // CPU frustum cull — skip submeshes fully outside view + render-distance
         if (!FrustumAABB(&frustum, sm.bounds)) continue;
-        const sg_view lightmap_view = sm.fullbright ? g_whiteLmV : mdl.lightmapView;
+        const bool hasPage = sm.lightmap_page < mdl.lightmapViews.size();
+        const sg_view lightmap_view = (sm.fullbright || !hasPage) ? g_whiteLmV : mdl.lightmapViews[sm.lightmap_page];
 
         if (!g_logged_bind_diagnostics) {
             printf("[Renderer] Draw bind states: diffuse_view=%s lightmap_view=%s diffuse_sampler=%s lightmap_sampler=%s\n",
@@ -511,9 +518,14 @@ void Renderer_DestroyMap(MapModel& mdl) {
         sg_destroy_buffer(sm.ibuf);
     }
     mdl.meshes.clear();
-    if (mdl.lightmapImage.id) {
-        sg_destroy_view (mdl.lightmapView);
-        sg_destroy_image(mdl.lightmapImage);
-        mdl.lightmapImage={}; mdl.lightmapView={};
+    for (size_t i = 0; i < mdl.lightmapImages.size(); ++i) {
+        if (i < mdl.lightmapViews.size() && mdl.lightmapViews[i].id) {
+            sg_destroy_view(mdl.lightmapViews[i]);
+        }
+        if (mdl.lightmapImages[i].id) {
+            sg_destroy_image(mdl.lightmapImages[i]);
+        }
     }
+    mdl.lightmapImages.clear();
+    mdl.lightmapViews.clear();
 }

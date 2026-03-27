@@ -38,6 +38,7 @@ bool LoadBSP(const char* path, BSPData& out)
     for (auto& m : meshes) {
         MapMeshBucket b;
         b.texture = textures[m.textureIndex].name;
+        b.lightmapPage = m.lightmapPage;
         b.vertices.reserve(m.vertexCount);
         for (uint32_t i=0;i<m.vertexCount;++i) {
             const BSPVertex& v = verts[m.firstVertex+i];
@@ -85,22 +86,35 @@ bool LoadBSP(const char* path, BSPData& out)
     // ----- lightmap ------------------------------------------------------
     {
         const BSPLump& l = hdr.lumps[LUMP_LIGHTMAP];
-        if (l.length >= sizeof(BSPLightmapHeader)) {
-            BSPLightmapHeader lh{};
-            fseek(f,l.offset,SEEK_SET); fread(&lh,sizeof(lh),1,f);
-            out.lightmapW = (int)lh.width;
-            out.lightmapH = (int)lh.height;
-            size_t px = (size_t)lh.width*lh.height*4;
-            out.lightmapPixels.resize(px);
-            fread(out.lightmapPixels.data(),1,px,f);
+        if (l.length >= sizeof(BSPLightmapLumpHeader)) {
+            fseek(f, l.offset, SEEK_SET);
+
+            BSPLightmapLumpHeader lh{};
+            fread(&lh, sizeof(lh), 1, f);
+
+            std::vector<BSPLightmapPageHeader> pageHeaders(lh.pageCount);
+            if (!pageHeaders.empty()) {
+                fread(pageHeaders.data(), sizeof(BSPLightmapPageHeader), pageHeaders.size(), f);
+            }
+
+            out.lightmapPages.resize(lh.pageCount);
+            for (uint32_t i = 0; i < lh.pageCount; ++i) {
+                BSPDataLightmapPage& page = out.lightmapPages[i];
+                page.width = (int)pageHeaders[i].width;
+                page.height = (int)pageHeaders[i].height;
+                page.pixels.resize(pageHeaders[i].byteLength);
+                if (!page.pixels.empty()) {
+                    fread(page.pixels.data(), 1, page.pixels.size(), f);
+                }
+            }
         }
     }
 
     fclose(f);
     out.assetPackPath = GetCompanionRresPath(path);
-    printf("[BSP] loaded %s: %zu meshes, %zu hulls, %zu ents, lm %dx%d\n",
+    printf("[BSP] loaded %s: %zu meshes, %zu hulls, %zu ents, %zu lightmap pages\n",
            path, out.buckets.size(), out.hulls.size(), out.entities.size(),
-           out.lightmapW, out.lightmapH);
+           out.lightmapPages.size());
     return true;
 }
 
