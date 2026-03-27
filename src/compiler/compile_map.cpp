@@ -8,6 +8,7 @@
 
 #include "../utils/map_parser.h"
 #include "../utils/bsp_format.h"
+#include "../utils/asset_pack.h"
 #include "../physx/collision_data.h"
 #include "lightmap.h"
 
@@ -24,6 +25,11 @@
 //  Texture-size probe (no GPU).  Mirrors renderer's lookup path.
 // --------------------------------------------------------------------------
 struct TexInfo { int w=64, h=64; };   // default if PNG missing
+
+static bool IsPackableTextureName(const std::string& name)
+{
+    return name.rfind("__light_brush_", 0) != 0;
+}
 
 static TexInfo ProbeTexture(const std::string& mapDir, const std::string& name,
                             std::unordered_map<std::string,TexInfo>& cache)
@@ -83,6 +89,7 @@ int main(int argc, char** argv)
     std::string outName = argv[2];
     if (outName.size()<4 || outName.substr(outName.size()-4)!=".bsp")
         outName += ".bsp";
+    std::string outPackName = GetCompanionRresPath(outName);
 
     std::string mapDir = ".";
     size_t slash = mapPath.find_last_of("/\\");
@@ -103,6 +110,7 @@ int main(int argc, char** argv)
     std::unordered_map<std::string,TexInfo> texCache;
     std::unordered_map<std::string,uint32_t> texIdx;
     std::vector<BSPTexture> textures;
+    std::vector<PackagedAssetEntry> packagedAssets;
     std::vector<BSPVertex>  vertices;
     std::vector<uint32_t>   indices;
     std::vector<BSPMesh>    meshes;
@@ -116,6 +124,12 @@ int main(int argc, char** argv)
         TexInfo ti = ProbeTexture(mapDir, n, texCache);
         BSPTexture bt{}; strncpy(bt.name, n.c_str(), 63); bt.width=ti.w; bt.height=ti.h;
         uint32_t idx=(uint32_t)textures.size(); textures.push_back(bt);
+        if (IsPackableTextureName(n)) {
+            packagedAssets.push_back({
+                "textures/" + n + ".png",
+                mapDir + "/../textures/" + n + ".png"
+            });
+        }
         texIdx[n]=idx; return idx;
     };
 
@@ -203,7 +217,14 @@ int main(int argc, char** argv)
     lw.End();
     fclose(f);
 
+    std::string packError;
+    if (!WriteAssetPackRres(outPackName, packagedAssets, &packError)) {
+        fprintf(stderr, "[compile_map] failed to write %s: %s\n", outPackName.c_str(), packError.c_str());
+        return 1;
+    }
+
     printf("\n[compile_map] wrote %s\n", outName.c_str());
+    printf("[compile_map] wrote %s\n", outPackName.c_str());
     printf("  textures : %zu\n  vertices : %zu\n  indices  : %zu\n"
            "  meshes   : %zu\n  hulls    : %zu\n  lightmap : %dx%d\n",
            textures.size(), vertices.size(), indices.size(),

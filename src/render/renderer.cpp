@@ -7,6 +7,7 @@
 
 #include "renderer.h"
 #include "shaders.h"
+#include "../utils/asset_pack.h"
 
 #if defined(WARPED_SOKOL_BACKEND_METAL) && !defined(SOKOL_METAL)
 #define SOKOL_METAL
@@ -165,6 +166,7 @@ static sg_shader Renderer_MakePlatformMapShader(sg_backend backend) {
 // ---------------------------------------------------------------------------
 void InitTextureManager(TextureManager& mgr) {
     mgr.textures.clear();
+    mgr.activePackPath.clear();
 }
 
 static TextureEntry MakeFallbackTexture(void) {
@@ -247,7 +249,22 @@ const TextureEntry* LoadTextureByName(TextureManager& mgr, const std::string& na
     std::string path = "../../assets/textures/" + name + ".png";
 
     int w = 0, h = 0, comp = 0;
-    unsigned char* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);   // force RGBA
+    unsigned char* pixels = nullptr;
+
+    if (!mgr.activePackPath.empty()) {
+        std::vector<unsigned char> packedBytes;
+        if (LoadRawAssetFromPack(mgr.activePackPath, "textures/" + name + ".png", packedBytes)) {
+            pixels = stbi_load_from_memory(packedBytes.data(), (int)packedBytes.size(), &w, &h, &comp, 4);
+            if (!pixels) {
+                printf("[Renderer] Failed to decode packaged texture '%s' from '%s'.\n",
+                       name.c_str(), mgr.activePackPath.c_str());
+            }
+        }
+    }
+
+    if (!pixels) {
+        pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
+    }
 
     TextureEntry entry;
     if (pixels) {
@@ -418,6 +435,7 @@ MapModel Renderer_UploadMap(const Map& map, TextureManager& texMgr) {
 
 MapModel Renderer_UploadBSP(const BSPData& bsp, TextureManager& texMgr) {
     MapModel mdl;
+    texMgr.activePackPath = bsp.assetPackPath;
     UploadBuckets(mdl, bsp.buckets, texMgr);
 
     if (bsp.lightmapW>0 && !bsp.lightmapPixels.empty()) {

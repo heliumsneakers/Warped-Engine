@@ -22,6 +22,7 @@ struct TextureEntry {
 
 struct TextureManager {
     std::unordered_map<std::string, TextureEntry> textures;
+    std::string activePackPath;
 };
 
 void                InitTextureManager(TextureManager& mgr);

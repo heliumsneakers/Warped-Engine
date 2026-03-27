@@ -10,5 +10,5 @@ int FPS_MAX = 300;
 int SIM_TICK_RATE = 144;
 
 bool DEVMODE = false;
-float deltaTime = 1.0f / 144.0f;
+float deltaTime = 1.0f / 144.0f; // denominator must match tick rate so we dont simulate faster than we update.
 float RENDER_DISTANCE = 4096.0f;

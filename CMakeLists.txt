@@ -100,6 +100,7 @@ if(BUILD_MAP_COMPILER)
         src/compiler/lightmap.cpp
         src/compiler/lightmap_compute.cpp
         src/compiler/sokol_compute_impl.c
+        src/utils/asset_pack.cpp
         src/utils/map_parser.cpp
         src/utils/parameters.cpp
         src/physx/collision_data.cpp
@@ -119,6 +120,7 @@ if(BUILD_MAP_COMPILER)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/lib/sokol
         ${PROJECT_SOURCE_DIR}/lib/stb
+        ${PROJECT_SOURCE_DIR}/lib/rres/src
     )
 
     set(COMPILER_PLATFORM_LIBS)
@@ -189,6 +191,7 @@ target_include_directories(WarpedGame PRIVATE
     ${PROJECT_SOURCE_DIR}/lib/sokol
     ${PROJECT_SOURCE_DIR}/lib/sokol/util
     ${PROJECT_SOURCE_DIR}/lib/stb
+    ${PROJECT_SOURCE_DIR}/lib/rres/src
 )
 
 # ----------------------------

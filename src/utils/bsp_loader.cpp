@@ -1,6 +1,7 @@
 // bsp_loader.cpp
 #include "bsp_loader.h"
 #include "bsp_format.h"
+#include "asset_pack.h"
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -14,6 +15,8 @@ static std::vector<T> ReadLump(FILE* f, const BSPLump& l) {
 
 bool LoadBSP(const char* path, BSPData& out)
 {
+    out = {};
+
     FILE* f = fopen(path, "rb");
     if (!f) { printf("[BSP] cannot open %s\n", path); return false; }
 
@@ -94,6 +97,7 @@ bool LoadBSP(const char* path, BSPData& out)
     }
 
     fclose(f);
+    out.assetPackPath = GetCompanionRresPath(path);
     printf("[BSP] loaded %s: %zu meshes, %zu hulls, %zu ents, lm %dx%d\n",
            path, out.buckets.size(), out.hulls.size(), out.entities.size(),
            out.lightmapW, out.lightmapH);

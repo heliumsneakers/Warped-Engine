@@ -4,6 +4,9 @@
 [submodule "lib/JoltPhysics"]
 	path = lib/JoltPhysics
 	url = https://github.com/jrouwe/JoltPhysics.git
-[submodule "lib/raylib"]
-	path = lib/raylib
-	url = https://github.com/raysan5/raylib.git
+[submodule "lib/rres"]
+	path = lib/rres
+	url = https://github.com/raysan5/rres.git
+[submodule "lib/clay"]
+	path = lib/clay
+	url = https://github.com/nicbarker/clay.git

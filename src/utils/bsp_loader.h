@@ -11,6 +11,7 @@ struct BSPData {
     std::vector<Entity>            entities;   // point entities only
     std::vector<uint8_t>           lightmapPixels;   // RGBA8
     int lightmapW = 0, lightmapH = 0;
+    std::string                    assetPackPath;
 };
 
 bool LoadBSP(const char* path, BSPData& out);
