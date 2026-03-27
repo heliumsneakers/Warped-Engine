@@ -1,10 +1,7 @@
 // src/player/player.cpp
 //
-// Quake-style movement + Jolt CharacterVirtual.
-// Migrated from raylib → sokol_app (input), sokol_gl (3D debug),
-// sokol_debugtext (on-screen overlays).
+// GoldSrc-style movement using manual Jolt capsule sweeps.
 
-#include <cstdio>
 #include <cmath>
 
 #include "player.h"
@@ -19,68 +16,63 @@
 
 #include "Jolt/Jolt.h"
 #include "Jolt/Math/Math.h"
-#include "Jolt/Math/MathTypes.h"
 #include "Jolt/Math/Real.h"
 #include "Jolt/Math/Vec3.h"
 #include "Jolt/Physics/PhysicsSystem.h"
-#include "Jolt/Physics/PhysicsSettings.h"
-#include "Jolt/Physics/Body/BodyID.h"
-#include "Jolt/Physics/Body/BodyInterface.h"
-#include "Jolt/Physics/Body/BodyCreationSettings.h"
-#include "Jolt/Physics/Body/BodyActivationListener.h"
+#include "Jolt/Physics/Body/Body.h"
+#include "Jolt/Physics/Body/BodyLock.h"
 #include "Jolt/Physics/Collision/ObjectLayer.h"
-#include "Jolt/Physics/Collision/Shape/Shape.h"
-#include "Jolt/Physics/Collision/Shape/BoxShape.h"
-#include "Jolt/Physics/Collision/Shape/CapsuleShape.h"
-#include "Jolt/Physics/Collision/Shape/SphereShape.h"
 #include "Jolt/Physics/Collision/NarrowPhaseQuery.h"
 #include "Jolt/Physics/Collision/RayCast.h"
 #include "Jolt/Physics/Collision/CastResult.h"
-#include "Jolt/Physics/Character/CharacterVirtual.h"
-#include <Jolt/RegisterTypes.h>
-#include <Jolt/Core/Factory.h>
-#include <Jolt/Core/TempAllocator.h>
-#include <Jolt/Core/JobSystemThreadPool.h>
+#include "Jolt/Physics/Collision/Shape/Shape.h"
+#include "Jolt/Physics/Collision/Shape/CapsuleShape.h"
+#include "Jolt/Physics/Collision/ShapeCast.h"
+#include "Jolt/Physics/Collision/CollideShape.h"
+#include "Jolt/Physics/Collision/CollisionCollectorImpl.h"
+
 #define JPH_ENABLE_ASSERTS
 
-/*  NOTE: Thinking about writing the player collision here directly, could be too messy though
-*         considering that all of the quake style movement code will go here as well.
-*         See to adding the collision code back into physics.cpp and just calling it here.
-*
-*   NOTE: Upon further reading into the Jolt library I believe the best way forward will be to do an implementation of the Jolt
-*         CharacterVirtual here directly, and adapt my original Quake inspired movement code. Input handling will be done by
-*         the sokol_app event pump, maybe all of the actual movement calculations can be done using our Vector3 and at the end
-*         where we finally update the player position we do a conversion into Jolt's Vec3? Not sure yet, will use this as the
-*         first attempt.
-*/
-
 #define MOUSE_SENSITIVITY 0.5f
-bool cursorEnabled;
 
+bool cursorEnabled = false;
 float eyeOffset = 16.0f;
 
-// Movement constants for Quake PM impl.
-const float     MAX_SPEED           = 100.0f;
-const float     ACCELERATION        = 5.0f;
-static float    FRICTION            = 4.0f;
-const float     STOP_SPEED          = 10.0f;
-const float     JUMP_FORCE          = 100.0f;
-const float     AIR_WISH_SPEED_CAP  = 12.0f;
-const float     AIR_ACCELERATION    = 100.0f;
-const float     GRAVITY             = -98.1f;
+static constexpr float MAX_SPEED = 250.0f;
+static constexpr float ACCELERATION = 10.0f;
+static constexpr float AIR_ACCELERATION = 100.0f;
+static constexpr float FRICTION = 6.0f;
+static constexpr float STOP_SPEED = 100.0f;
+static constexpr float AIR_WISH_SPEED_CAP = 30.0f;
+static constexpr float GRAVITY = 800.0f;
+static constexpr float JUMP_HEIGHT = 45.0f;
+static constexpr float STEP_HEIGHT = 18.0f;
+static constexpr float GROUND_NORMAL_MIN = 0.7f;
+static constexpr float OVERCLIP = 1.001f;
+static constexpr float STOP_EPSILON = 0.1f;
+static constexpr float GROUND_PROBE_DISTANCE = 2.0f;
+static constexpr float GROUND_CONTACT_DISTANCE = 0.25f;
+static constexpr float POSITION_EPSILON = 0.02f;
+static constexpr int MAX_CLIP_PLANES = 5;
+static constexpr int MAX_BUMPS = 4;
+static constexpr int MAX_PENETRATION_ITERS = 4;
+static constexpr float PLAYER_RADIUS = 16.0f;
+static constexpr float PLAYER_HEIGHT = 56.0f;
+static constexpr float PLAYER_CYLINDER_HALF_HEIGHT = (PLAYER_HEIGHT - 2.0f * PLAYER_RADIUS) * 0.5f;
+static constexpr float PLAYER_HALF_HEIGHT = PLAYER_CYLINDER_HALF_HEIGHT + PLAYER_RADIUS;
+static constexpr float JUMP_FORCE = 268.3281573f; // sqrt(2 * 800 * 45)
 
 Vector3 velocity = Vector3Zero();
 float playerYaw = 0.0f;
 float playerPitch = 0.0f;
 bool isGrounded = false;
 
-static bool s_allow_sliding     = true;
-static bool s_has_move_input    = false;
-static bool s_skip_slope_cancel_this_frame = false;
+Vector3 wishDir = Vector3Zero();
+Vector3 wishVel = Vector3Zero();
+float wishSpeed = 0.0f;
 
-Vector3 wishDir     = Vector3Zero();
-Vector3 wishVel     = Vector3Zero();
-float   wishSpeed   = 0.0f;
+static JPH::RefConst<JPH::CapsuleShape> gPlayerShape;
+static JPH::Vec3 gGroundNormal = JPH::Vec3::sAxisY();
 
 // Debug colors
 static const Color C_RED    = WCOLOR(230, 41, 55, 255);
@@ -93,9 +85,6 @@ static const Color C_BLUE   = WCOLOR(  0,121,241, 255);
 static const Color C_DBLUE  = WCOLOR(  0, 82,172, 255);
 static const Color C_PURPLE = WCOLOR(200,122,255, 255);
 
-// =========
-// DEBUG
-// ========
 struct VelDebug {
     float horiz = 0.0f;
     float vert  = 0.0f;
@@ -105,210 +94,193 @@ struct VelDebug {
 };
 static VelDebug g_velDbg;
 
-static inline float Clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+struct MoveTrace {
+    bool hit = false;
+    bool startSolid = false;
+    float fraction = 1.0f;
+    Vector3 endPos = Vector3Zero();
+    Vector3 normal = { 0.0f, 1.0f, 0.0f };
+    JPH::BodyID bodyID;
+};
 
-void DebugUpdateVelMetrics() {
-    g_velDbg.horiz = sqrtf(velocity.x*velocity.x + velocity.z*velocity.z);
-    g_velDbg.vert  = velocity.y;
-    g_velDbg.total = Vector3Length(velocity);
-    if (g_velDbg.horiz > g_velDbg.peakH) g_velDbg.peakH = g_velDbg.horiz;
-}
+struct GroundSupport {
+    bool found = false;
+    float centerY = 0.0f;
+    Vector3 normal = { 0.0f, 1.0f, 0.0f };
+};
 
-// --------- BEGIN Jolt Character Collision Impl. ---------
-
-static JPH::CharacterVirtual *gCharacter = nullptr;
-
-static JPH::Vec3 gQuakeVelocity = JPH::Vec3::sZero();
-static JPH::Vec3 gGroundNormal = JPH::Vec3::sZero();
-JPH::CharacterVirtual::EGroundState gGroundState;
-
-
-class MyCharacterLayerFilter : public JPH::ObjectLayerFilter
+class PlayerQueryLayerFilter : public JPH::ObjectLayerFilter
 {
 public:
     virtual bool ShouldCollide(JPH::ObjectLayer inLayer) const override
     {
-        if (inLayer == Layers::NON_MOVING ||
-            inLayer == Layers::MOVING     ||
-            inLayer == Layers::SENSOR)
-        {
-            return true;
-        }
-        return false;
+        return inLayer == Layers::NON_MOVING || inLayer == Layers::MOVING;
     }
 };
 
-class MyCharacterListener : public JPH::CharacterContactListener
+static PlayerQueryLayerFilter s_player_query_layer_filter;
+
+static inline float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+static inline float HorizontalLength(Vector3 v) { return sqrtf(v.x * v.x + v.z * v.z); }
+static inline float HorizontalLengthSq(Vector3 v) { return v.x * v.x + v.z * v.z; }
+static inline bool IsWalkableNormal(Vector3 n) { return n.y >= GROUND_NORMAL_MIN; }
+static inline bool OnWalkableGround() { return isGrounded && gGroundNormal.GetY() >= GROUND_NORMAL_MIN; }
+
+static inline JPH::Vec3 ToJoltVec3(Vector3 v) { return JPH::Vec3(v.x, v.y, v.z); }
+static inline JPH::RVec3 ToJoltRVec3(Vector3 v) { return JPH::RVec3(v.x, v.y, v.z); }
+static inline Vector3 FromJoltVec3(JPH::Vec3Arg v) { return { v.GetX(), v.GetY(), v.GetZ() }; }
+static inline Vector3 FromJoltRVec3(JPH::RVec3Arg v) { return { (float)v.GetX(), (float)v.GetY(), (float)v.GetZ() }; }
+
+static void DebugUpdateVelMetrics()
 {
-public:
-    virtual void OnContactAdded(const JPH::CharacterVirtual *inCharacter,
-                                const JPH::BodyID &inBodyID2,
-                                const JPH::SubShapeID &inSubShapeID2,
-                                JPH::RVec3Arg inContactPosition,
-                                JPH::Vec3Arg inContactNormal,
-                                JPH::CharacterContactSettings &ioSettings) override
-    {
-        HandleContact(inCharacter, inBodyID2, inSubShapeID2, inContactPosition, inContactNormal, ioSettings, true);
-    }
+    g_velDbg.horiz = HorizontalLength(velocity);
+    g_velDbg.vert = velocity.y;
+    g_velDbg.total = Vector3Length(velocity);
+    if (g_velDbg.horiz > g_velDbg.peakH) g_velDbg.peakH = g_velDbg.horiz;
+}
 
-    virtual void OnContactPersisted(const JPH::CharacterVirtual *inCharacter,
-                                    const JPH::BodyID &inBodyID2,
-                                    const JPH::SubShapeID &inSubShapeID2,
-                                    JPH::RVec3Arg inContactPosition,
-                                    JPH::Vec3Arg inContactNormal,
-                                    JPH::CharacterContactSettings &ioSettings) override
-    {
-        HandleContact(inCharacter, inBodyID2, inSubShapeID2, inContactPosition, inContactNormal, ioSettings, false);
-    }
+static MoveTrace CastPlayerShape(JPH::PhysicsSystem *ps, Vector3 start, Vector3 delta)
+{
+    MoveTrace trace;
+    trace.endPos = Vector3Add(start, delta);
 
-    virtual void OnContactSolve(const JPH::CharacterVirtual *inCharacter,
-                                const JPH::BodyID &inBodyID2,
-                                const JPH::SubShapeID &inSubShapeID2,
-                                JPH::RVec3Arg inContactPosition,
-                                JPH::Vec3Arg inContactNormal,
-                                JPH::Vec3Arg inContactVelocity,
-                                const JPH::PhysicsMaterial *inContactMaterial,
-                                JPH::Vec3Arg inCharacterVelocity,
-                                JPH::Vec3 &ioNewCharacterVelocity) override
-    {
-        if (inCharacter != gCharacter) return;
-        if (inCharacter->IsSlopeTooSteep(inContactNormal)) return;
-        if (s_has_move_input) return;
-        if (s_skip_slope_cancel_this_frame) return;
+    if (Vector3LengthSq(delta) <= 1e-10f)
+        return trace;
 
-        if (inContactVelocity.IsNearZero())
-        {
-            JPH::Vec3 n = inContactNormal.Normalized();
-            float vn = ioNewCharacterVelocity.Dot(n);
-            if (vn < 0.0f) {
-                ioNewCharacterVelocity -= n * vn;
-            }
-        }
-    }
-
-    virtual void OnContactRemoved(const JPH::CharacterVirtual *inCharacter,
-                                  const JPH::BodyID &inBodyID2,
-                                  const JPH::SubShapeID &inSubShapeID2) override
-    {
-        JPH::BodyLockRead lock(s_physics_system->GetBodyLockInterfaceNoLock(), inBodyID2);
-        if (!lock.Succeeded())
-            return;
-
-        const JPH::Body &body = lock.GetBody();
-
-        CollisionType ct = (CollisionType) body.GetUserData();
-        if (body.GetObjectLayer() == Layers::NON_MOVING && ct == CollisionType::STATIC) {
-            isGrounded = false;
-        }
-    }
-
-private:
-    void HandleContact(const JPH::CharacterVirtual *inCharacter,
-                       const JPH::BodyID &inBodyID2,
-                       const JPH::SubShapeID &inSubShapeID2,
-                       JPH::RVec3Arg inContactPosition,
-                       JPH::Vec3Arg inContactNormal,
-                       JPH::CharacterContactSettings &ioSettings,
-                       bool inIsNewContact)
-    {
-        JPH::BodyLockRead lock(s_physics_system->GetBodyLockInterfaceNoLock(), inBodyID2);
-        if (!lock.Succeeded())
-            return;
-
-        const JPH::Body &body = lock.GetBody();
-
-        CollisionType ct = (CollisionType) body.GetUserData();
-        if (body.GetObjectLayer() == Layers::SENSOR || ct == CollisionType::TRIGGER) {
-            ioSettings.mCanPushCharacter = false;
-            ioSettings.mCanReceiveImpulses = false;
-
-            if (inIsNewContact) {
-                printf("[CharacterListener] Overlapped TRIGGER, contact added!\n");
-            }
-        }
-
-        if (body.GetObjectLayer() == Layers::MOVING) {
-            ioSettings.mCanPushCharacter = false;
-        }
-
-        else {
-            if (body.GetObjectLayer() == Layers::NON_MOVING) {
-                float norm = gCharacter->GetGroundNormal().GetY();
-                if (norm < 0.7f) {
-                    isGrounded = false;
-                    gGroundNormal = inContactNormal;
-                } else {
-                    isGrounded = true;
-                    gGroundNormal = inContactNormal;
-                }
-            }
-        }
-    }
-};
-
-static MyCharacterListener s_char_listener;
-static MyCharacterLayerFilter s_char_layer_filter;
-
-// --------- END Jolt Character Collision Impl. ---------
-
-void InitJoltCharacter(Player *player, JPH::PhysicsSystem *physicsSystem) {
-    const float radius = 16.0f;
-    const float height = 56.0f;
-    const float cyl_h  = height - 2.0f * radius;
-
-    JPH::RefConst<JPH::CapsuleShape> cap = new JPH::CapsuleShape(0.5f * cyl_h, radius);
-
-    JPH::Ref<JPH::CharacterVirtualSettings> settings = new JPH::CharacterVirtualSettings();
-    settings->mShape                       = cap;
-    settings->mMaxSlopeAngle               = JPH::DegreesToRadians(45.0f);
-    settings->mMaxStrength                 = 150.0f;
-    settings->mCharacterPadding            = 0.5f;
-    settings->mPenetrationRecoverySpeed    = 3.0f;
-    settings->mPredictiveContactDistance   = 2.0f;
-    settings->mBackFaceMode                = JPH::EBackFaceMode::CollideWithBackFaces;
-    settings->mEnhancedInternalEdgeRemoval = true;
-    settings->mSupportingVolume            = JPH::Plane(JPH::Vec3::sAxisY(), -radius);
-    settings->mInnerBodyLayer              = Layers::MOVING;
-
-    gCharacter = new JPH::CharacterVirtual(
-        settings,
-        JPH::RVec3(player->center.x, player->center.y, player->center.z),
-        JPH::Quat::sIdentity(),
-        0,
-        physicsSystem
+    const JPH::RShapeCast cast(
+        gPlayerShape.GetPtr(),
+        JPH::Vec3::sReplicate(1.0f),
+        JPH::RMat44::sTranslation(ToJoltRVec3(start)),
+        ToJoltVec3(delta)
     );
 
-    gCharacter->SetListener(&s_char_listener);
-    gCharacter->SetUp(JPH::Vec3::sAxisY());
+    JPH::ShapeCastSettings settings;
+    settings.mBackFaceModeTriangles = JPH::EBackFaceMode::CollideWithBackFaces;
+    settings.mBackFaceModeConvex = JPH::EBackFaceMode::CollideWithBackFaces;
+    settings.mUseShrunkenShapeAndConvexRadius = true;
+    settings.mReturnDeepestPoint = true;
+
+    JPH::ClosestHitCollisionCollector<JPH::CastShapeCollector> collector;
+    ps->GetNarrowPhaseQuery().CastShape(
+        cast,
+        settings,
+        JPH::RVec3::sZero(),
+        collector,
+        ps->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
+        s_player_query_layer_filter
+    );
+
+    if (!collector.HadHit())
+        return trace;
+
+    trace.hit = true;
+    trace.fraction = collector.mHit.mFraction;
+    trace.endPos = Vector3Add(start, Vector3Scale(delta, trace.fraction));
+
+    JPH::Vec3 axis = collector.mHit.mPenetrationAxis;
+    if (axis.LengthSq() > 1e-12f)
+        trace.normal = FromJoltVec3(-axis.Normalized());
+
+    trace.startSolid = trace.fraction <= 0.0f && collector.mHit.mPenetrationDepth > POSITION_EPSILON;
+    trace.bodyID = collector.mHit.mBodyID2;
+    return trace;
 }
 
-void InitPlayer(Player *player, Vector3 center, Vector3 target, Vector3 up, float fovy) {
-    player->center = center;
+static bool ResolvePlayerPenetration(JPH::PhysicsSystem *ps, Vector3 &position)
+{
+    bool moved = false;
 
-    player->camera.position = (Vector3){ center.x, center.y + eyeOffset, center.z };
-    player->camera.target   = target;
-    player->camera.up       = up;
-    player->camera.fovy     = fovy;
+    for (int i = 0; i < MAX_PENETRATION_ITERS; ++i)
+    {
+        JPH::CollideShapeSettings settings;
+        settings.mBackFaceMode = JPH::EBackFaceMode::CollideWithBackFaces;
 
-    player->yaw   = 0.0f;
-    player->pitch = 0.0f;
-    UpdateCameraTarget(player);
+        JPH::ClosestHitCollisionCollector<JPH::CollideShapeCollector> collector;
+        ps->GetNarrowPhaseQuery().CollideShapeWithInternalEdgeRemoval(
+            gPlayerShape.GetPtr(),
+            JPH::Vec3::sReplicate(1.0f),
+            JPH::RMat44::sTranslation(ToJoltRVec3(position)),
+            settings,
+            JPH::RVec3::sZero(),
+            collector,
+            ps->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
+            s_player_query_layer_filter
+        );
 
-    player->speed = 200.0f;
-    player->rotationSpeed = 90.0f;
-    player->halfExt = (Vector3){16,28,16};
-    Input_LockMouse(true);
-    cursorEnabled = false;
+        if (!collector.HadHit() || collector.mHit.mPenetrationDepth <= 0.0f)
+            return moved;
+
+        JPH::Vec3 axis = collector.mHit.mPenetrationAxis;
+        if (axis.LengthSq() <= 1e-12f)
+            return moved;
+
+        Vector3 resolve = FromJoltVec3(-axis.Normalized());
+        position = Vector3Add(position, Vector3Scale(resolve, collector.mHit.mPenetrationDepth + POSITION_EPSILON));
+        moved = true;
+    }
+
+    return moved;
 }
 
-// --------- BEGIN Quake Movement Impl. ---------
+static GroundSupport FindGroundSupport(JPH::PhysicsSystem *ps, Vector3 position, float maxDistance)
+{
+    static const Vector3 kSupportOffsets[] = {
+        {  0.0f, 0.0f,  0.0f },
+        { 12.0f, 0.0f,  0.0f },
+        {-12.0f, 0.0f,  0.0f },
+        {  0.0f, 0.0f, 12.0f },
+        {  0.0f, 0.0f,-12.0f },
+        { 10.0f, 0.0f, 10.0f },
+        { 10.0f, 0.0f,-10.0f },
+        {-10.0f, 0.0f, 10.0f },
+        {-10.0f, 0.0f,-10.0f },
+    };
 
-static inline Vector3 ProjectOntoPlane(Vector3 v, Vector3 n) {
-    return Vector3Subtract(v, Vector3Scale(n, Vector3DotProduct(v, n)));
-}
+    GroundSupport best;
+    const float rayStartLift = 1.0f;
+    const float rayLength = maxDistance + rayStartLift;
 
-static inline bool OnWalkableGround() {
-    return isGrounded && !gCharacter->IsSlopeTooSteep(gGroundNormal);
+    for (const Vector3 &offset : kSupportOffsets)
+    {
+        Vector3 origin = {
+            position.x + offset.x,
+            position.y - PLAYER_HALF_HEIGHT + rayStartLift,
+            position.z + offset.z
+        };
+
+        JPH::RayCastResult hit;
+        bool hadHit = ps->GetNarrowPhaseQuery().CastRay(
+            JPH::RRayCast(ToJoltRVec3(origin), JPH::Vec3(0.0f, -rayLength, 0.0f)),
+            hit,
+            ps->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
+            s_player_query_layer_filter
+        );
+
+        if (!hadHit)
+            continue;
+
+        JPH::BodyLockRead lock(ps->GetBodyLockInterface(), hit.mBodyID);
+        if (!lock.Succeeded())
+            continue;
+
+        const JPH::Body &body = lock.GetBody();
+        JPH::RVec3 hitPos = JPH::RRayCast(ToJoltRVec3(origin), JPH::Vec3(0.0f, -rayLength, 0.0f)).GetPointOnRay(hit.mFraction);
+        Vector3 normal = FromJoltVec3(body.GetWorldSpaceSurfaceNormal(hit.mSubShapeID2, hitPos));
+        if (!IsWalkableNormal(normal))
+            continue;
+
+        float hitY = (float)hitPos.GetY();
+        float centerY = hitY + PLAYER_HALF_HEIGHT;
+
+        if (!best.found || centerY > best.centerY)
+        {
+            best.found = true;
+            best.centerY = centerY;
+            best.normal = normal;
+        }
+    }
+
+    return best;
 }
 
 static inline void PM_ClipVelocity(const Vector3 &in, const Vector3 &normal, Vector3 &out, float overbounce)
@@ -319,50 +291,37 @@ static inline void PM_ClipVelocity(const Vector3 &in, const Vector3 &normal, Vec
     out.y = in.y - normal.y * backoff;
     out.z = in.z - normal.z * backoff;
 
-    const float STOP_EPSILON = 0.1f;
     if (out.x > -STOP_EPSILON && out.x < STOP_EPSILON) out.x = 0.0f;
     if (out.y > -STOP_EPSILON && out.y < STOP_EPSILON) out.y = 0.0f;
     if (out.z > -STOP_EPSILON && out.z < STOP_EPSILON) out.z = 0.0f;
 }
 
-void PM_Friction(float dt)
+static void PM_Friction(float dt)
 {
-    if (!isGrounded) return;
-
-    Vector3 n = {0.0f, 1.0f, 0.0f};
-    if (gGroundNormal.LengthSq() > 1e-6f) {
-        n = (Vector3){ gGroundNormal.GetX(), gGroundNormal.GetY(), gGroundNormal.GetZ() };
-        float ln = Vector3Length(n);
-        if (ln > 0.0f) n = Vector3Scale(n, 1.0f / ln);
-        else           n = (Vector3){0.0f, 1.0f, 0.0f};
-    }
-
-    float   vn    = Vector3DotProduct(velocity, n);
-    Vector3 vtan  = Vector3Subtract(velocity, Vector3Scale(n, vn));
-    float   speed = Vector3Length(vtan);
-
-    if (speed < 1.0f) {
-        velocity = Vector3Scale(n, vn);
+    if (!OnWalkableGround())
         return;
-    }
 
-    float friction = FRICTION;
+    float speed = HorizontalLength(velocity);
+    if (speed <= 0.0f)
+        return;
 
-    float control = (speed < STOP_SPEED) ? STOP_SPEED : speed;
-    float drop    = control * friction * dt;
+    float control = speed < STOP_SPEED ? STOP_SPEED : speed;
+    float drop = control * FRICTION * dt;
+    float newspeed = speed - drop;
+    if (newspeed < 0.0f) newspeed = 0.0f;
 
-    float newSpeed = speed - drop;
-    if (newSpeed < 0.0f) newSpeed = 0.0f;
+    if (speed > 0.0f)
+        newspeed /= speed;
 
-    float scale = (speed > 0.0f) ? (newSpeed / speed) : 0.0f;
-    vtan = Vector3Scale(vtan, scale);
-
-    velocity = Vector3Add(Vector3Scale(n, vn), vtan);
+    velocity.x *= newspeed;
+    velocity.z *= newspeed;
 }
 
 static inline void PM_BuildWish()
 {
-    float fmove = 0.0f, smove = 0.0f;
+    float fmove = 0.0f;
+    float smove = 0.0f;
+
     if (Input_KeyDown(WKEY_W)) fmove += 1.0f;
     if (Input_KeyDown(WKEY_S)) fmove -= 1.0f;
     if (Input_KeyDown(WKEY_D)) smove += 1.0f;
@@ -370,260 +329,356 @@ static inline void PM_BuildWish()
 
     const float yawRad = DEG2RAD * playerYaw;
     const Vector3 forward = { cosf(yawRad), 0.0f, sinf(yawRad) };
-    const Vector3 right   = { -sinf(yawRad), 0.0f, cosf(yawRad) };
+    const Vector3 right = { -sinf(yawRad), 0.0f, cosf(yawRad) };
 
     wishVel = Vector3Add(Vector3Scale(forward, fmove), Vector3Scale(right, smove));
 
-    const float inputMag = Vector3Length(wishVel);
-    s_has_move_input = (inputMag > 0.0001f);
-
-    wishDir = (inputMag > 0.0f) ? Vector3Scale(wishVel, 1.0f / inputMag) : Vector3Zero();
-
-    const float inputScale = fminf(1.0f, inputMag);
-    wishSpeed = MAX_SPEED * inputScale;
+    float inputMag = Vector3Length(wishVel);
+    wishDir = inputMag > 0.0f ? Vector3Scale(wishVel, 1.0f / inputMag) : Vector3Zero();
+    wishSpeed = MAX_SPEED * fminf(1.0f, inputMag);
 }
 
-static void PM_Accelerate(Vector3 wishDir, float wishSpeed, float accel, float dt)
+static void PM_Accelerate(Vector3 inWishDir, float inWishSpeed, float accel, float dt)
 {
-    float currentSpeed = Vector3DotProduct(velocity, wishDir);
-    float addSpeed     = wishSpeed - currentSpeed;
-    if (addSpeed <= 0.0f) return;
+    float currentSpeed = Vector3DotProduct(velocity, inWishDir);
+    float addSpeed = inWishSpeed - currentSpeed;
+    if (addSpeed <= 0.0f)
+        return;
 
-    float accelSpeed = accel * dt * wishSpeed;
-    if (accelSpeed > addSpeed) accelSpeed = addSpeed;
+    float accelSpeed = accel * inWishSpeed * dt;
+    if (accelSpeed > addSpeed)
+        accelSpeed = addSpeed;
 
-    velocity = Vector3Add(velocity, Vector3Scale(wishDir, accelSpeed));
+    velocity = Vector3Add(velocity, Vector3Scale(inWishDir, accelSpeed));
 }
 
-static void PM_AirAccelerate(Vector3 wishDir, float wishSpeed, float accel, float dt)
+static void PM_AirAccelerate(Vector3 inWishDir, float inWishSpeed, float accel, float dt)
 {
-   float wishspd = wishSpeed;
+    float wishspd = inWishSpeed;
+    if (wishspd > AIR_WISH_SPEED_CAP)
+        wishspd = AIR_WISH_SPEED_CAP;
 
-    if (gGroundNormal.Length() > 0.001f) {
-        Vector3 n = { gGroundNormal.GetX(), gGroundNormal.GetY(), gGroundNormal.GetZ() };
-        float ln = Vector3Length(n); if (ln > 0.0f) n = Vector3Scale(n, 1.0f / ln);
+    float currentSpeed = Vector3DotProduct(velocity, inWishDir);
+    float addSpeed = wishspd - currentSpeed;
+    if (addSpeed <= 0.0f)
+        return;
 
-        if (Vector3DotProduct(velocity, n) < 0.0f) {
-            Vector3 clipped; PM_ClipVelocity(velocity, n, clipped, 0.8f); velocity = clipped;
+    float accelSpeed = accel * inWishSpeed * dt;
+    if (accelSpeed > addSpeed)
+        accelSpeed = addSpeed;
+
+    velocity = Vector3Add(velocity, Vector3Scale(inWishDir, accelSpeed));
+}
+
+static inline void PM_Jump(float dt)
+{
+    velocity.y = JUMP_FORCE;
+    velocity.y -= GRAVITY * dt * 0.5f;
+}
+
+static void CategorizeGround(JPH::PhysicsSystem *ps, Vector3 &position, bool allowSnap)
+{
+    if (!allowSnap && velocity.y > 0.0f)
+    {
+        isGrounded = false;
+        gGroundNormal = JPH::Vec3::sZero();
+        return;
+    }
+
+    const float probeDistance = allowSnap ? GROUND_PROBE_DISTANCE : GROUND_CONTACT_DISTANCE;
+    GroundSupport support = FindGroundSupport(ps, position, probeDistance);
+
+    isGrounded = false;
+    gGroundNormal = JPH::Vec3::sZero();
+
+    if (!support.found)
+        return;
+
+    isGrounded = true;
+    gGroundNormal = ToJoltVec3(support.normal);
+
+    if (allowSnap)
+        position.y = support.centerY;
+
+    if (velocity.y < 0.0f)
+        velocity.y = 0.0f;
+}
+
+static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVelocity, float dt)
+{
+    float timeLeft = dt;
+    Vector3 planes[MAX_CLIP_PLANES];
+    int numPlanes = 0;
+    Vector3 primalVelocity = moveVelocity;
+
+    for (int bump = 0; bump < MAX_BUMPS; ++bump)
+    {
+        if (Vector3LengthSq(moveVelocity) <= 1e-8f)
+            break;
+
+        MoveTrace trace = CastPlayerShape(ps, position, Vector3Scale(moveVelocity, timeLeft));
+
+        if (trace.startSolid)
+        {
+            if (!ResolvePlayerPenetration(ps, position))
+            {
+                moveVelocity = Vector3Zero();
+                break;
+            }
+            continue;
         }
-        if (Vector3DotProduct(wishDir, n) < 0.0f) {
-            Vector3 steerv = wishDir; PM_ClipVelocity(steerv, n, steerv, 0.8f);
-            float sl = Vector3Length(steerv);
-            if (sl > 0.0001f) wishDir = Vector3Scale(steerv, 1.0f / sl);
+
+        if (trace.fraction > 0.0f)
+            position = trace.endPos;
+
+        if (!trace.hit || trace.fraction >= 1.0f)
+            break;
+
+        if (trace.fraction <= 0.0f && IsWalkableNormal(trace.normal) && moveVelocity.y >= 0.0f)
+        {
+            position = Vector3Add(position, Vector3Scale(trace.normal, POSITION_EPSILON));
+            continue;
         }
+
+        position = Vector3Add(position, Vector3Scale(trace.normal, POSITION_EPSILON));
+
+        if (trace.fraction <= 0.0f && IsWalkableNormal(trace.normal) && moveVelocity.y <= 0.0f)
+        {
+            continue;
+        }
+
+        if (numPlanes < MAX_CLIP_PLANES)
+            planes[numPlanes++] = trace.normal;
+
+        timeLeft *= fmaxf(0.0f, 1.0f - trace.fraction);
+
+        Vector3 oldVelocity = moveVelocity;
+        Vector3 clipped = Vector3Zero();
+        bool found = false;
+
+        for (int i = 0; i < numPlanes; ++i)
+        {
+            Vector3 candidate;
+            PM_ClipVelocity(primalVelocity, planes[i], candidate, OVERCLIP);
+
+            int j = 0;
+            for (; j < numPlanes; ++j)
+            {
+                if (j != i && Vector3DotProduct(candidate, planes[j]) < 0.0f)
+                    break;
+            }
+
+            if (j == numPlanes)
+            {
+                clipped = candidate;
+                found = true;
+                break;
+            }
+        }
+
+        if (!found)
+        {
+            if (numPlanes == 2)
+            {
+                Vector3 dir = Vector3CrossProduct(planes[0], planes[1]);
+                float lenSq = Vector3LengthSq(dir);
+                clipped = lenSq > 1e-8f ? Vector3Scale(dir, Vector3DotProduct(dir, moveVelocity) / lenSq) : Vector3Zero();
+            }
+            else
+            {
+                clipped = Vector3Zero();
+            }
+        }
+
+        moveVelocity = clipped;
+        if (Vector3DotProduct(moveVelocity, oldVelocity) <= 0.0f)
+        {
+            moveVelocity = Vector3Zero();
+            break;
+        }
+
+        primalVelocity = moveVelocity;
     }
-
-    if (wishspd > AIR_WISH_SPEED_CAP) wishspd = AIR_WISH_SPEED_CAP;
-
-    float currentspeed = Vector3DotProduct(velocity, wishVel);
-    float addspeed     = wishspd - currentspeed;
-    if (addspeed <= 0.0f) return;
-
-    float accelspeed = accel * wishSpeed * dt;
-    if (accelspeed > addspeed) accelspeed = addspeed;
-
-    velocity = Vector3Add(velocity, Vector3Scale(wishVel, accelspeed));
 }
 
-static void PM_AirMove(float dt, bool grounded)
+static void StepSlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVelocity, float dt)
 {
-    bool walkable = OnWalkableGround();
-    if (walkable && grounded) {
-        Vector3 n = { gGroundNormal.GetX(), gGroundNormal.GetY(), gGroundNormal.GetZ() };
-        float ln = Vector3Length(n); if (ln > 0.0f) n = Vector3Scale(n, 1.0f / ln);
+    Vector3 downPos = position;
+    Vector3 downVel = moveVelocity;
+    SlideMove(ps, downPos, downVel, dt);
 
-        Vector3 p = ProjectOntoPlane(wishDir, n);
-        float pl = Vector3Length(p);
-        if (pl > 0.0f) wishDir = Vector3Scale(p, 1.0f / pl);
+    MoveTrace upTrace = CastPlayerShape(ps, position, { 0.0f, STEP_HEIGHT, 0.0f });
+    if (upTrace.hit && upTrace.fraction < 1.0f)
+    {
+        position = downPos;
+        moveVelocity = downVel;
+        return;
+    }
 
-        PM_Friction(dt);
-        PM_Accelerate(wishDir, wishSpeed, ACCELERATION, dt);
-    } else {
-        PM_AirAccelerate(wishDir, wishSpeed, AIR_ACCELERATION, dt);
+    Vector3 upPos = upTrace.endPos;
+    Vector3 upVel = moveVelocity;
+    SlideMove(ps, upPos, upVel, dt);
+
+    MoveTrace downTrace = CastPlayerShape(ps, upPos, { 0.0f, -STEP_HEIGHT, 0.0f });
+    if (downTrace.hit && IsWalkableNormal(downTrace.normal))
+    {
+        upPos = downTrace.endPos;
+        if (upVel.y < 0.0f)
+            upVel.y = 0.0f;
+    }
+
+    float downDist = HorizontalLengthSq(Vector3Subtract(downPos, position));
+    float upDist = HorizontalLengthSq(Vector3Subtract(upPos, position));
+
+    if (upDist > downDist)
+    {
+        position = upPos;
+        moveVelocity = upVel;
+    }
+    else
+    {
+        position = downPos;
+        moveVelocity = downVel;
     }
 }
 
-static void PM_ApplyGravity(float deltaTime) {
-    if (!isGrounded) {
-        velocity.y += GRAVITY *deltaTime;
-    }
+void InitJoltCharacter(Player *player, JPH::PhysicsSystem *physicsSystem)
+{
+    (void)physicsSystem;
+
+    if (!gPlayerShape)
+        gPlayerShape = new JPH::CapsuleShape(PLAYER_CYLINDER_HALF_HEIGHT, PLAYER_RADIUS);
+
+    ResolvePlayerPenetration(s_physics_system, player->center);
+    CategorizeGround(s_physics_system, player->center, true);
 }
 
-// -------- END Quake Movement Impl. ---------
+void InitPlayer(Player *player, Vector3 center, Vector3 target, Vector3 up, float fovy)
+{
+    player->center = center;
 
-void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt) {
+    player->camera.position = { center.x, center.y + eyeOffset, center.z };
+    player->camera.target = target;
+    player->camera.up = up;
+    player->camera.fovy = fovy;
 
-    bool was_grounded_this_frame_start = isGrounded;
+    player->yaw = 0.0f;
+    player->pitch = 0.0f;
+    UpdateCameraTarget(player);
 
-    // 1) Mouse look -> yaw/pitch/camera target
+    player->speed = 320.0f;
+    player->rotationSpeed = 90.0f;
+    player->halfExt = { 16.0f, 28.0f, 16.0f };
+
+    Input_LockMouse(true);
+    cursorEnabled = false;
+}
+
+void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
+{
+    ResolvePlayerPenetration(ps, player->center);
+
     float mdx = Input_MouseDeltaX();
     float mdy = Input_MouseDeltaY();
-    playerYaw   += mdx * MOUSE_SENSITIVITY;
+    playerYaw += mdx * MOUSE_SENSITIVITY;
     playerPitch -= mdy * MOUSE_SENSITIVITY;
-    playerPitch  = fmaxf(fminf(playerPitch, 89.0f), -89.0f);
-    player->yaw   = playerYaw;
+    playerPitch = fmaxf(fminf(playerPitch, 89.0f), -89.0f);
+    player->yaw = playerYaw;
     player->pitch = playerPitch;
 
-    // 2) Ground/platform velocity refresh
-    gCharacter->UpdateGroundVelocity();
+    bool wasGrounded = isGrounded;
+    CategorizeGround(ps, player->center, wasGrounded && velocity.y <= 0.0f);
 
-    // 3) Start from current velocity
-    {
-        JPH::Vec3 v = gCharacter->GetLinearVelocity();
-        velocity = { v.GetX(), v.GetY(), v.GetZ() };
-        DebugUpdateVelMetrics();
-    }
-
-    // 4) Input → wish dir/speed
     PM_BuildWish();
 
-    // 5) Jump
-    if ((Input_KeyDown(WKEY_SPACE) && isGrounded)) {
-        velocity.y   = JUMP_FORCE;
-        isGrounded   = false;
-        gGroundNormal = JPH::Vec3::sZero();
-    }
-
-    // 6) Gravity
-    PM_ApplyGravity(dt);
-
-    // 7) Write velocity to character (pre-solve)
-    gCharacter->SetLinearVelocity(JPH::Vec3(velocity.x, velocity.y, velocity.z));
-
-    s_allow_sliding = s_has_move_input;
-
-    // 8) Configure ExtendedUpdate (stick-to-floor / stair step)
-    JPH::CharacterVirtual::ExtendedUpdateSettings us;
-    const float step_up = 10.0f;
-    const float step_dn = step_up;
-    us.mWalkStairsStepUp     =  gCharacter->GetUp() * step_up;
-    us.mStickToFloorStepDown = -gCharacter->GetUp() * step_dn;
-
-    // 9) Gravity for CharacterVirtual
-    const float g = 98.1f;
-    const JPH::Vec3 gravity = -gCharacter->GetUp() * g;
-
-    // 10) Do the move
-    gCharacter->ExtendedUpdate(
-        dt,
-        gravity,
-        us,
-        ps->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
-        s_char_layer_filter,
-        {}, {},
-        *s_temp_allocator
-    );
-
-    // 11) Query ground state
-    JPH::CharacterVirtual::EGroundState new_state = gCharacter->GetGroundState();
-    bool nowGrounded = (new_state == JPH::CharacterVirtual::EGroundState::OnGround);
-    JPH::Vec3 gn = gCharacter->GetGroundNormal();
-    gGroundNormal = gn;
-    bool walkable = nowGrounded && !gCharacter->IsSlopeTooSteep(gn);
-    isGrounded = nowGrounded;
-
-    // 12) Read back velocity (post-solve) and position
+    bool jumped = false;
+    if (OnWalkableGround())
     {
-        JPH::Vec3 nv = gCharacter->GetLinearVelocity();
-        velocity = { nv.GetX(), nv.GetY(), nv.GetZ() };
-
-        JPH::RVec3 p = gCharacter->GetPosition();
-        player->center = { (float)p.GetX(), (float)p.GetY(), (float)p.GetZ() };
+        if (Input_KeyDown(WKEY_SPACE))
+        {
+            PM_Jump(dt);
+            isGrounded = false;
+            gGroundNormal = JPH::Vec3::sZero();
+            jumped = true;
+            PM_AirAccelerate(wishDir, wishSpeed, AIR_ACCELERATION, dt);
+        }
+        else
+        {
+            PM_Friction(dt);
+            PM_Accelerate(wishDir, wishSpeed, ACCELERATION, dt);
+        }
+    }
+    else
+    {
+        PM_AirAccelerate(wishDir, wishSpeed, AIR_ACCELERATION, dt);
+        velocity.y -= GRAVITY * dt;
     }
 
-    // 13) Landing handling + friction (post-solve)
-    bool landedThisFrame = (!was_grounded_this_frame_start && walkable);
-    s_skip_slope_cancel_this_frame = landedThisFrame;
+    if (OnWalkableGround())
+        StepSlideMove(ps, player->center, velocity, dt);
+    else
+        SlideMove(ps, player->center, velocity, dt);
 
-    PM_AirMove(dt, isGrounded);
+    ResolvePlayerPenetration(ps, player->center);
+    CategorizeGround(ps, player->center, wasGrounded && !jumped && velocity.y <= 0.0f);
 
-    gCharacter->SetLinearVelocity(JPH::Vec3(velocity.x, velocity.y, velocity.z));
+    DebugUpdateVelMetrics();
 
-    // 14) Set camera from center + orientation
     player->camera.position = { player->center.x, player->center.y + eyeOffset, player->center.z };
     float yawRad = DEG2RAD * playerYaw;
     float pitchRad = DEG2RAD * playerPitch;
-    Vector3 fwd = { cosf(pitchRad) * sinf(yawRad), sinf(pitchRad), cosf(pitchRad) * cosf(yawRad) };
+    Vector3 fwd = { cosf(pitchRad) * cosf(yawRad), sinf(pitchRad), cosf(pitchRad) * sinf(yawRad) };
     player->camera.target = Vector3Add(player->camera.position, fwd);
 }
 
-void UpdatePlayer(Player *player, JPH::PhysicsSystem *mPhysicsSystem, float deltaTime) {
+void UpdatePlayer(Player *player, JPH::PhysicsSystem *mPhysicsSystem, float deltaTime)
+{
+    (void)mPhysicsSystem;
 
-    // ------ Mouse ------
     float mdx = Input_MouseDeltaX();
     float mdy = Input_MouseDeltaY();
 
-    player->yaw   += mdx * MOUSE_SENSITIVITY;
+    player->yaw += mdx * MOUSE_SENSITIVITY;
     player->pitch -= mdy * MOUSE_SENSITIVITY;
 
-    if (player->pitch > 89.0f)  player->pitch = 89.0f;
+    if (player->pitch > 89.0f) player->pitch = 89.0f;
     if (player->pitch < -89.0f) player->pitch = -89.0f;
 
     UpdateCameraTarget(player);
 
-    // ------ Keyboard ------
-    Vector3 direction = {0.0f, 0.0f, 0.0f};
+    Vector3 direction = { 0.0f, 0.0f, 0.0f };
     Vector3 forward = Vector3Normalize(Vector3Subtract(player->camera.target, player->camera.position));
-    Vector3 right   = Vector3Normalize(Vector3CrossProduct(forward, player->camera.up));
+    Vector3 right = Vector3Normalize(Vector3CrossProduct(forward, player->camera.up));
 
-    if (Input_KeyDown(WKEY_W)) {
-        direction = Vector3Add(direction, Vector3Scale(forward, player->speed * deltaTime));
-    }
-    if (Input_KeyDown(WKEY_S)) {
-        direction = Vector3Subtract(direction, Vector3Scale(forward, player->speed * deltaTime));
-    }
-    if (Input_KeyDown(WKEY_A)) {
-        direction = Vector3Subtract(direction, Vector3Scale(right, player->speed * deltaTime));
-    }
-    if (Input_KeyDown(WKEY_D)) {
-        direction = Vector3Add(direction, Vector3Scale(right, player->speed * deltaTime));
-    }
-    if (Input_KeyDown(WKEY_SPACE)) {
-        direction = Vector3Add(direction, Vector3Scale(player->camera.up, player->speed * deltaTime));
-    }
-    if (Input_KeyDown(WKEY_LEFT_SHIFT)) {
-        direction = Vector3Subtract(direction, Vector3Scale(player->camera.up, player->speed * deltaTime));
-    }
-    if (Input_KeyPressed(WKEY_M) && cursorEnabled == false) {
+    if (Input_KeyDown(WKEY_W)) direction = Vector3Add(direction, forward);
+    if (Input_KeyDown(WKEY_S)) direction = Vector3Subtract(direction, forward);
+    if (Input_KeyDown(WKEY_A)) direction = Vector3Subtract(direction, right);
+    if (Input_KeyDown(WKEY_D)) direction = Vector3Add(direction, right);
+    if (Input_KeyDown(WKEY_SPACE)) direction = Vector3Add(direction, player->camera.up);
+    if (Input_KeyDown(WKEY_LEFT_SHIFT)) direction = Vector3Subtract(direction, player->camera.up);
+
+    if (Input_KeyPressed(WKEY_M) && !cursorEnabled)
+    {
         Input_LockMouse(false);
         cursorEnabled = true;
-    } else if (Input_KeyPressed(WKEY_M) && cursorEnabled == true){
+    }
+    else if (Input_KeyPressed(WKEY_M) && cursorEnabled)
+    {
         Input_LockMouse(true);
         cursorEnabled = false;
     }
 
-    Vector3 desiredVel = Vector3Scale(Vector3Normalize(direction), player->speed);
+    if (Vector3LengthSq(direction) > 0.0f)
+        direction = Vector3Normalize(direction);
 
-    JPH::Vec3 charVelocity(desiredVel.x, desiredVel.y, desiredVel.z);
-    gCharacter->SetLinearVelocity(charVelocity);
-
-    JPH::CharacterVirtual::ExtendedUpdateSettings updateSettings;
-
-    gCharacter->ExtendedUpdate(
-        deltaTime,
-        JPH::Vec3(0, 0, 0),
-        updateSettings,
-        mPhysicsSystem->JPH::PhysicsSystem::GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
-        s_char_layer_filter,
-        {},
-        {},
-        *s_temp_allocator
-    );
-
-    JPH::RVec3 finalPos = gCharacter->GetPosition();
-    player->center = (Vector3) {
-        gCharacter->GetPosition().GetX(),
-        gCharacter->GetPosition().GetY(),
-        gCharacter->GetPosition().GetZ()
-    };
-    player->camera.position = (Vector3) {player->center.x,
-        player->center.y + eyeOffset,
-        player->center.z};
-    player->camera.target = Vector3Add(player->camera.target, direction);
+    player->center = Vector3Add(player->center, Vector3Scale(direction, player->speed * deltaTime));
+    player->camera.position = { player->center.x, player->center.y + eyeOffset, player->center.z };
+    player->camera.target = Vector3Add(player->camera.position, direction);
 }
 
-void UpdateCameraTarget(Player *player) {
-    float yawRad   = player->yaw   * DEG2RAD;
+void UpdateCameraTarget(Player *player)
+{
+    float yawRad = player->yaw * DEG2RAD;
     float pitchRad = player->pitch * DEG2RAD;
 
     Vector3 direction;
@@ -632,69 +687,68 @@ void UpdateCameraTarget(Player *player) {
     direction.z = cosf(pitchRad) * sinf(yawRad);
 
     direction = Vector3Normalize(direction);
-
     player->camera.target = Vector3Add(player->camera.position, direction);
 }
 
-// ---------------------------------------------------------------------------
-//  3-D debug (sokol_gl, called between Debug_NewFrame / Debug_Flush)
-// ---------------------------------------------------------------------------
-
-void DebugDrawPlayerAABB(Player *player) {
+void DebugDrawPlayerAABB(Player *player)
+{
     Debug_WireBox(player->center, player->halfExt, C_RED);
 }
 
-void DebugDir(Player *player) {
+void DebugDir(Player *player)
+{
     Vector3 start = player->center;
 
-    // --- WishDir ---
     float wishDirLen = Vector3Length(wishDir);
-    if (wishDirLen > 0.0001f) {
-        Vector3 wishEnd = Vector3Add(start, wishDir * 50);
+    if (wishDirLen > 0.0001f)
+    {
+        Vector3 wishEnd = Vector3Add(start, wishDir * 50.0f);
         Debug_Line(start, wishEnd, C_GREEN);
         Debug_Point(wishEnd, 4.0f, C_LIME);
-    } else {
+    }
+    else
+    {
         Debug_Point(start, 6.0f, C_YELLOW);
     }
 
-    // --- WishVel ---
     float wishVelLen = Vector3Length(wishVel);
-    if (wishVelLen > 0.0001f) {
+    if (wishVelLen > 0.0001f)
+    {
         Vector3 wishVelEnd = Vector3Add(start, wishVel);
         Debug_Line(start, wishVelEnd, C_ORANGE);
         Debug_Point(wishVelEnd, 4.0f, C_GOLD);
     }
 
-    // --- Horizontal Velocity ---
     Vector3 horizVelocity = velocity;
-    horizVelocity.y = 0;
+    horizVelocity.y = 0.0f;
     float horizMag = Vector3Length(horizVelocity);
 
-    if (horizMag > 0.0001f) {
+    if (horizMag > 0.0001f)
+    {
         Vector3 velEnd = Vector3Add(start, horizVelocity);
         Debug_Line(start, velEnd, C_BLUE);
         Debug_Point(velEnd, 4.0f, C_DBLUE);
-    } else {
+    }
+    else
+    {
         Debug_Point(start, 6.0f, C_PURPLE);
     }
 }
 
-// ---------------------------------------------------------------------------
-//  2-D overlays (sokol_debugtext) – (col,row) in character cells
-// ---------------------------------------------------------------------------
-
-void DebugDrawPlayerPos(const Player *player, int col, int row) {
+void DebugDrawPlayerPos(const Player *player, int col, int row)
+{
     sdtx_pos((float)col, (float)row);
     sdtx_color3b(230, 41, 55);
     sdtx_printf("Player Pos: X=%.2f  Y=%.2f  Z=%.2f",
                 player->center.x, player->center.y, player->center.z);
 }
 
-void DebugDrawPlayerVel(int col, int row) {
+void DebugDrawPlayerVel(int col, int row)
+{
     float dh = g_velDbg.horiz - g_velDbg.lastH;
 
-    if      (dh >  0.1f) sdtx_color3b(  0,228, 48);  // speeding up
-    else if (dh < -0.1f) sdtx_color3b(230, 41, 55);  // slowing
+    if      (dh >  0.1f) sdtx_color3b(  0,228, 48);
+    else if (dh < -0.1f) sdtx_color3b(230, 41, 55);
     else                 sdtx_color3b(200,200,200);
 
     sdtx_pos((float)col, (float)row);
@@ -702,13 +756,12 @@ void DebugDrawPlayerVel(int col, int row) {
                 g_velDbg.horiz, g_velDbg.vert, g_velDbg.total, g_velDbg.peakH,
                 isGrounded ? "GROUND" : "AIR");
 
-    // Horizontal speed bar (ASCII, 30 cells)
     const float maxShow = 600.0f;
     int cells = (int)(30.0f * Clamp01(g_velDbg.horiz / maxShow));
     sdtx_pos((float)col, (float)row + 1.0f);
-    sdtx_color3b( 0,121,241);
+    sdtx_color3b(0, 121, 241);
     sdtx_putc('[');
-    for (int i=0;i<30;++i) sdtx_putc(i < cells ? '=' : ' ');
+    for (int i = 0; i < 30; ++i) sdtx_putc(i < cells ? '=' : ' ');
     sdtx_putc(']');
 
     g_velDbg.lastH = g_velDbg.horiz;
