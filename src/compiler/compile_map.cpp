@@ -101,10 +101,11 @@ int main(int argc, char** argv)
 
     // ----- geometry + lights ----------------------------------------------
     std::vector<MapPolygon> polys  = BuildMapPolygons(map, /*devMode=*/false);
+    std::vector<MapPolygon> occluderPolys = BuildExteriorMapPolygons(map, /*devMode=*/false);
     std::vector<PointLight> lights = GetPointLights(map);
 
     printf("[compile_map] baking lightmap...\n");
-    LightmapAtlas lm = BakeLightmap(polys, lights);
+    LightmapAtlas lm = BakeLightmap(polys, occluderPolys, lights);
 
     // ----- triangulate into buckets ---------------------------------------
     std::unordered_map<std::string,TexInfo> texCache;

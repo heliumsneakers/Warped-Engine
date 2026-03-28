@@ -90,6 +90,8 @@ struct MapPolygon {
     Vector3              normal;     // world-space
     std::string          texture;
     int                  occluderGroup = -1;
+    int                  sourceBrushId = -1;
+    int                  sourceFaceIndex = -1;
     // Texture projection params (already converted to GL axes):
     Vector3 texAxisU, texAxisV;
     float   offU, offV;
@@ -103,6 +105,7 @@ Map                        ParseMapFile(const std::string& filePath);
 std::vector<PlayerStart>   GetPlayerStarts(const Map& map);
 std::vector<PointLight>    GetPointLights(const Map& map);
 std::vector<MapPolygon>    BuildMapPolygons(const Map& map, bool devMode);
+std::vector<MapPolygon>    BuildExteriorMapPolygons(const Map& map, bool devMode);
 
 // Legacy path: builds GPU-ready buckets directly (still used until a
 // .bsp is available).  Pulls texture dims from TextureManager.

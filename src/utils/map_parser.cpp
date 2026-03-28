@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include <iterator>
 #include <cmath>
 #include <algorithm>
 
@@ -111,6 +112,186 @@ void SortPolygonVertices(std::vector<Vector3>& poly, const Vector3& normal) {
     for (size_t i=0; i<ap.size(); i++) {
         poly[i] = ap[i].point;
     }
+}
+
+struct BrushSolidPlane {
+    Vector3 point;
+    Vector3 normal;
+};
+
+struct BrushSolid {
+    int sourceBrushId = -1;
+    std::vector<BrushSolidPlane> planes;
+};
+
+struct PolygonPlaneSplit {
+    std::vector<Vector3> front;
+    std::vector<Vector3> back;
+    bool hasStrictFront = false;
+};
+
+static void CleanupClippedPolygon(std::vector<Vector3>& poly, const Vector3& expectedNormal) {
+    RemoveDuplicatePoints(poly, (float)epsilon);
+    if (poly.size() < 3) {
+        poly.clear();
+        return;
+    }
+
+    std::vector<Vector3> cleaned;
+    cleaned.reserve(poly.size());
+    const float collinearEpsSq = (float)(epsilon * epsilon);
+    for (size_t i = 0; i < poly.size(); ++i) {
+        const Vector3& prev = poly[(i + poly.size() - 1) % poly.size()];
+        const Vector3& curr = poly[i];
+        const Vector3& next = poly[(i + 1) % poly.size()];
+        const Vector3 e0 = Vector3Subtract(curr, prev);
+        const Vector3 e1 = Vector3Subtract(next, curr);
+        if (Vector3LengthSq(e0) <= collinearEpsSq || Vector3LengthSq(e1) <= collinearEpsSq) {
+            continue;
+        }
+        const Vector3 cross = Vector3CrossProduct(e0, e1);
+        if (Vector3LengthSq(cross) <= collinearEpsSq) {
+            continue;
+        }
+        cleaned.push_back(curr);
+    }
+
+    RemoveDuplicatePoints(cleaned, (float)epsilon);
+    if (cleaned.size() < 3) {
+        poly.clear();
+        return;
+    }
+
+    Vector3 clippedNormal = CalculateNormal(cleaned[0], cleaned[1], cleaned[2]);
+    if (Vector3DotProduct(clippedNormal, expectedNormal) < 0.0f) {
+        std::reverse(cleaned.begin(), cleaned.end());
+    }
+    poly.swap(cleaned);
+}
+
+static PolygonPlaneSplit SplitPolygonByPlane(const std::vector<Vector3>& poly,
+                                             const Vector3& planePoint,
+                                             const Vector3& planeNormal) {
+    PolygonPlaneSplit split;
+    if (poly.size() < 3) {
+        return split;
+    }
+
+    for (size_t i = 0; i < poly.size(); ++i) {
+        const Vector3& a = poly[i];
+        const Vector3& b = poly[(i + 1) % poly.size()];
+        const float da = Vector3DotProduct(planeNormal, Vector3Subtract(a, planePoint));
+        const float db = Vector3DotProduct(planeNormal, Vector3Subtract(b, planePoint));
+        const bool aFront = da > (float)epsilon;
+        const bool aBack = da < -(float)epsilon;
+
+        if (aFront) {
+            split.hasStrictFront = true;
+        }
+        if (!aBack) {
+            split.front.push_back(a);
+        }
+        if (!aFront) {
+            split.back.push_back(a);
+        }
+
+        if ((da > (float)epsilon && db < -(float)epsilon) ||
+            (da < -(float)epsilon && db > (float)epsilon)) {
+            const float t = da / (da - db);
+            const Vector3 hit = Vector3Add(a, Vector3Scale(Vector3Subtract(b, a), t));
+            split.front.push_back(hit);
+            split.back.push_back(hit);
+            split.hasStrictFront = true;
+        }
+    }
+
+    return split;
+}
+
+static std::vector<BrushSolid> BuildBrushSolids(const std::vector<MapPolygon>& polys) {
+    std::vector<BrushSolid> solids;
+    std::unordered_map<int, size_t> solidIndexByBrushId;
+    for (const MapPolygon& poly : polys) {
+        if (poly.sourceBrushId < 0 || poly.verts.empty()) {
+            continue;
+        }
+        auto [it, inserted] = solidIndexByBrushId.emplace(poly.sourceBrushId, solids.size());
+        if (inserted) {
+            BrushSolid solid;
+            solid.sourceBrushId = poly.sourceBrushId;
+            solids.push_back(std::move(solid));
+        }
+        solids[it->second].planes.push_back({ poly.verts[0], Vector3Normalize(poly.normal) });
+    }
+    return solids;
+}
+
+static std::vector<MapPolygon> SubtractSolidFromPolygon(const MapPolygon& poly, const BrushSolid& solid) {
+    std::vector<MapPolygon> pending;
+    std::vector<MapPolygon> kept;
+    pending.push_back(poly);
+
+    for (const BrushSolidPlane& plane : solid.planes) {
+        std::vector<MapPolygon> nextPending;
+        for (const MapPolygon& fragment : pending) {
+            PolygonPlaneSplit split = SplitPolygonByPlane(fragment.verts, plane.point, plane.normal);
+            CleanupClippedPolygon(split.front, fragment.normal);
+            CleanupClippedPolygon(split.back, fragment.normal);
+
+            if (split.hasStrictFront && split.front.size() >= 3) {
+                MapPolygon outsideFragment = fragment;
+                outsideFragment.verts = std::move(split.front);
+                kept.push_back(std::move(outsideFragment));
+            }
+            if (split.back.size() >= 3) {
+                MapPolygon insideFragment = fragment;
+                insideFragment.verts = std::move(split.back);
+                nextPending.push_back(std::move(insideFragment));
+            }
+        }
+        pending.swap(nextPending);
+        if (pending.empty()) {
+            break;
+        }
+    }
+
+    return kept;
+}
+
+static std::vector<MapPolygon> BuildExteriorPolygons(const std::vector<MapPolygon>& polys) {
+    if (polys.empty()) {
+        return {};
+    }
+
+    const std::vector<BrushSolid> solids = BuildBrushSolids(polys);
+    std::vector<MapPolygon> exterior;
+    for (const MapPolygon& poly : polys) {
+        std::vector<MapPolygon> fragments;
+        fragments.push_back(poly);
+
+        for (const BrushSolid& solid : solids) {
+            if (solid.sourceBrushId == poly.sourceBrushId) {
+                continue;
+            }
+
+            std::vector<MapPolygon> nextFragments;
+            for (const MapPolygon& fragment : fragments) {
+                std::vector<MapPolygon> kept = SubtractSolidFromPolygon(fragment, solid);
+                nextFragments.insert(nextFragments.end(),
+                                     std::make_move_iterator(kept.begin()),
+                                     std::make_move_iterator(kept.end()));
+            }
+            fragments.swap(nextFragments);
+            if (fragments.empty()) {
+                break;
+            }
+        }
+
+        exterior.insert(exterior.end(),
+                        std::make_move_iterator(fragments.begin()),
+                        std::make_move_iterator(fragments.end()));
+    }
+    return exterior;
 }
 
 // Simple intersection of three planes (in TB coords)
@@ -681,16 +862,24 @@ Vector2 ComputeFaceUV(const Vector3& vert,
     Used by the .bsp compiler and by BuildMapGeometry below.
 ------------------------------------------------------------
 */
-static void AppendBrushEntityPolygons(const Entity& entity, bool devMode, int* nextLightBrushGroup, std::vector<MapPolygon>& out) {
+static void AppendBrushEntityPolygons(const Entity& entity,
+                                      bool devMode,
+                                      bool exteriorOnly,
+                                      int* nextLightBrushGroup,
+                                      int* nextSourceBrushId,
+                                      size_t* sourceFaceCount,
+                                      std::vector<MapPolygon>& out) {
     const bool isTrigger = EntityHasClass(entity, "trigger_once") || EntityHasClass(entity, "trigger_multiple");
     const bool isLightBrush = EntityHasClass(entity, "light_brush");
     const std::string lightBrushTexture = isLightBrush
         ? EncodeLightBrushTextureName(ReadLightBrushColor255(entity))
         : std::string();
+    std::vector<MapPolygon> entityPolys;
 
     for (auto& brush : entity.brushes) {
         if (isTrigger && !devMode) continue;
         const int lightBrushGroup = (isLightBrush && nextLightBrushGroup) ? (*nextLightBrushGroup)++ : -1;
+        const int sourceBrushId = nextSourceBrushId ? (*nextSourceBrushId)++ : -1;
 
         const int nF = (int)brush.faces.size();
         if (nF < 3) continue;
@@ -739,6 +928,8 @@ static void AppendBrushEntityPolygons(const Entity& entity, bool devMode, int* n
             mp.normal   = nRL;
             mp.texture  = isLightBrush ? lightBrushTexture : brush.faces[i].texture;
             mp.occluderGroup = lightBrushGroup;
+            mp.sourceBrushId = sourceBrushId;
+            mp.sourceFaceIndex = i;
             mp.texAxisU = ConvertTBtoRaylib(brush.faces[i].textureAxes1);
             mp.texAxisV = ConvertTBtoRaylib(brush.faces[i].textureAxes2);
             mp.offU     = brush.faces[i].offsetX;
@@ -746,8 +937,22 @@ static void AppendBrushEntityPolygons(const Entity& entity, bool devMode, int* n
             mp.rot      = brush.faces[i].rotation;
             mp.scaleU   = brush.faces[i].scaleX;
             mp.scaleV   = brush.faces[i].scaleY;
-            out.push_back(std::move(mp));
+            entityPolys.push_back(std::move(mp));
+            if (sourceFaceCount) {
+                ++(*sourceFaceCount);
+            }
         }
+    }
+
+    if (exteriorOnly) {
+        std::vector<MapPolygon> exteriorPolys = BuildExteriorPolygons(entityPolys);
+        out.insert(out.end(),
+                   std::make_move_iterator(exteriorPolys.begin()),
+                   std::make_move_iterator(exteriorPolys.end()));
+    } else {
+        out.insert(out.end(),
+                   std::make_move_iterator(entityPolys.begin()),
+                   std::make_move_iterator(entityPolys.end()));
     }
 }
 
@@ -755,10 +960,25 @@ std::vector<MapPolygon> BuildMapPolygons(const Map &map, bool devMode)
 {
     std::vector<MapPolygon> out;
     int nextLightBrushGroup = 0;
+    int nextSourceBrushId = 0;
+    size_t sourceFaceCount = 0;
     for (auto& entity : map.entities) {
-        AppendBrushEntityPolygons(entity, devMode, &nextLightBrushGroup, out);
+        AppendBrushEntityPolygons(entity, devMode, false, &nextLightBrushGroup, &nextSourceBrushId, &sourceFaceCount, out);
     }
-    printf("[MapParser] Built %zu polygons.\n", out.size());
+    printf("[MapParser] Built %zu polygons from %zu brush faces.\n", out.size(), sourceFaceCount);
+    return out;
+}
+
+std::vector<MapPolygon> BuildExteriorMapPolygons(const Map &map, bool devMode)
+{
+    std::vector<MapPolygon> out;
+    int nextLightBrushGroup = 0;
+    int nextSourceBrushId = 0;
+    size_t sourceFaceCount = 0;
+    for (auto& entity : map.entities) {
+        AppendBrushEntityPolygons(entity, devMode, true, &nextLightBrushGroup, &nextSourceBrushId, &sourceFaceCount, out);
+    }
+    printf("[MapParser] Built %zu exterior occluder polygons from %zu brush faces.\n", out.size(), sourceFaceCount);
     return out;
 }
 

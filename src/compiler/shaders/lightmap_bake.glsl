@@ -73,6 +73,8 @@ layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
 
 const int AA_GRID = 4;
 const int SAMPLES = AA_GRID * AA_GRID;
+const float EDGE_SEAM_GUARD_LUXELS = 0.75;
+const float EDGE_SEAM_TMIN_BOOST = 0.75;
 
 bool inside_poly_2d(float px, float py) {
     for (int i = 0; i < poly_count; ++i) {
@@ -86,6 +88,29 @@ bool inside_poly_2d(float px, float py) {
         }
     }
     return true;
+}
+
+float dist_sq_point_segment_2d(vec2 p, vec2 a, vec2 b) {
+    vec2 ab = b - a;
+    float ab_len_sq = dot(ab, ab);
+    if (ab_len_sq <= 1e-8) {
+        vec2 d = p - a;
+        return dot(d, d);
+    }
+    float t = clamp(dot(p - a, ab) / ab_len_sq, 0.0, 1.0);
+    vec2 q = a + ab * t;
+    vec2 d = p - q;
+    return dot(d, d);
+}
+
+float min_dist_to_poly_edge_2d(float px, float py) {
+    vec2 p = vec2(px, py);
+    float min_dist_sq = 3.402823e38;
+    for (int i = 0; i < poly_count; ++i) {
+        int j = (i + 1) % poly_count;
+        min_dist_sq = min(min_dist_sq, dist_sq_point_segment_2d(p, poly_verts[i].xy, poly_verts[j].xy));
+    }
+    return sqrt(min_dist_sq);
 }
 
 bool ray_aabb(vec3 ro, vec3 inv_rd, vec3 bb_min, vec3 bb_max, float tmax) {
@@ -149,7 +174,7 @@ vec3 safe_inverse_dir(vec3 rd) {
     return 1.0 / denom;
 }
 
-bool occluded(vec3 ro, vec3 rd, float dist, int ignore_occluder_group) {
+bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group) {
     vec3 inv_rd = safe_inverse_dir(rd);
     for (int i = 0; i < tri_count; ++i) {
         occluder_tri tri = tris[i];
@@ -159,7 +184,7 @@ bool occluded(vec3 ro, vec3 rd, float dist, int ignore_occluder_group) {
         if (!ray_aabb(ro, inv_rd, tri.bounds_min, tri.bounds_max, dist)) {
             continue;
         }
-        if (ray_tri(ro, rd, tri, ray_eps, dist)) {
+        if (ray_tri(ro, rd, tri, min_hit_t, dist)) {
             return true;
         }
     }
@@ -188,6 +213,9 @@ void main() {
                 continue;
             }
             vec3 wp = origin + axis_u * (ju * luxel_size) + axis_v * (jv * luxel_size);
+            float edge_dist_luxels = min_dist_to_poly_edge_2d(ju, jv);
+            float edge_factor = clamp(1.0 - edge_dist_luxels / EDGE_SEAM_GUARD_LUXELS, 0.0, 1.0);
+            float near_hit_t = shadow_bias + EDGE_SEAM_TMIN_BOOST * edge_factor;
 
             vec3 sample_rgb = vec3(ambient);
             for (int li = 0; li < light_count; ++li) {
@@ -210,7 +238,7 @@ void main() {
                 if (ndl <= 0.0) {
                     continue;
                 }
-                if (occluded(ro, dir, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group)) {
+                if (occluded(ro, dir, near_hit_t, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group)) {
                     continue;
                 }
                 float attenuation = 1.0 - dist / light.intensity;

@@ -315,6 +315,7 @@ void Renderer_Init(void) {
     sg_sampler_desc smp = {};
     smp.min_filter = SG_FILTER_LINEAR;
     smp.mag_filter = SG_FILTER_LINEAR;
+    smp.max_anisotropy = 16;
     smp.wrap_u     = SG_WRAP_REPEAT;
     smp.wrap_v     = SG_WRAP_REPEAT;
     smp.label      = "map-sampler";
@@ -324,6 +325,7 @@ void Renderer_Init(void) {
     sg_sampler_desc lsmp = {};
     lsmp.min_filter = SG_FILTER_LINEAR;
     lsmp.mag_filter = SG_FILTER_LINEAR;
+    lsmp.max_anisotropy = 16;
     lsmp.wrap_u     = SG_WRAP_CLAMP_TO_EDGE;
     lsmp.wrap_v     = SG_WRAP_CLAMP_TO_EDGE;
     lsmp.label      = "lightmap-sampler";

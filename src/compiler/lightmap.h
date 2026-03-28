@@ -31,4 +31,5 @@ struct LightmapAtlas {
 // polygon list for world geometry/collision; any patch subdivision returned in
 // LightmapAtlas::patches is only for lightmapped render emission.
 LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
+                           const std::vector<MapPolygon>& occluderPolys,
                            const std::vector<PointLight>& lights);

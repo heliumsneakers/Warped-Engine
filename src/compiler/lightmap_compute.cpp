@@ -39,6 +39,7 @@ namespace {
 
 constexpr int kWorkgroupSize = 8;
 constexpr int kDispatchBatchSize = 32;
+constexpr size_t kUniformUploadAlign = 256;
 constexpr float kAmbient = 0.12f;
 constexpr float kShadowBias = 0.25f;
 constexpr float kRayEps = 1e-4f;
@@ -112,6 +113,10 @@ void CopyVec3(float (&dst)[3], const Vector3& src) {
     dst[0] = src.x;
     dst[1] = src.y;
     dst[2] = src.z;
+}
+
+size_t AlignUp(size_t value, size_t align) {
+    return (value + (align - 1)) & ~(align - 1);
 }
 
 bool LightmapComputePlatform_Init(sg_environment* env, std::string* error);
@@ -422,7 +427,10 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     setupDesc.shader_pool_size = 2;
     setupDesc.pipeline_pool_size = 2;
     setupDesc.view_pool_size = 8;
-    setupDesc.uniform_buffer_size = 4096;
+    // One face-params upload is issued per rect dispatch. On Metal these uploads
+    // are placed into a ring buffer with 256-byte alignment, so a 32-rect batch
+    // needs far more than the old fixed 4 KB allocation.
+    setupDesc.uniform_buffer_size = (int)(kDispatchBatchSize * AlignUp(sizeof(GpuFaceParams), kUniformUploadAlign));
     setupDesc.logger.func = slog_func;
     setupDesc.environment = environment;
     sg_setup(&setupDesc);
