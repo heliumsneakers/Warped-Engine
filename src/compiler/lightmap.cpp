@@ -27,6 +27,12 @@ static constexpr float RAY_EPS            = 1e-4f;
 static constexpr float OCCLUSION_NEAR_TMIN = SHADOW_BIAS;
 static constexpr float EDGE_SEAM_GUARD_LUXELS = 0.75f;
 static constexpr float EDGE_SEAM_TMIN_BOOST   = SHADOW_BIAS * 3.0f;
+static constexpr float INDIRECT_BOUNCE_REFLECTANCE = 0.35f;
+static constexpr float INDIRECT_BOUNCE_THRESHOLD   = 0.03f;
+static constexpr float INDIRECT_BOUNCE_RADIUS_BIAS = 96.0f;
+static constexpr float INDIRECT_BOUNCE_RADIUS_SCALE = 4.0f;
+static constexpr float INDIRECT_BOUNCE_RADIUS_MIN = 96.0f;
+static constexpr float INDIRECT_BOUNCE_RADIUS_MAX = 384.0f;
 static constexpr int   AA_GRID            = 4;      // AA_GRID² samples per luxel
 static constexpr int   DILATE_PASSES      = 4;
 
@@ -124,6 +130,17 @@ static float PolygonArea(const std::vector<Vector3>& verts) {
         area += 0.5f * Vector3Length(Vector3CrossProduct(e0, e1));
     }
     return area;
+}
+
+static Vector3 PolygonCentroid(const std::vector<Vector3>& verts) {
+    Vector3 centroid = Vector3Zero();
+    if (verts.empty()) {
+        return centroid;
+    }
+    for (const Vector3& v : verts) {
+        centroid = Vector3Add(centroid, v);
+    }
+    return Vector3Scale(centroid, 1.0f / (float)verts.size());
 }
 
 template <typename InsideFn, typename IntersectFn>
@@ -1078,20 +1095,42 @@ static bool HasInvalidDarkValidLuxels(const DarkLuxelStats& stats)
     return stats.darkValidCount == stats.validCount;
 }
 
+static std::vector<std::vector<uint32_t>> BuildRectLightIndices(const std::vector<FaceRect>& rects,
+                                                                const std::vector<PointLight>& lights)
+{
+    std::vector<std::vector<uint32_t>> lightIndices(rects.size());
+    for (size_t rectIndex = 0; rectIndex < rects.size(); ++rectIndex) {
+        const FaceRect& r = rects[rectIndex];
+        std::vector<uint32_t>& indices = lightIndices[rectIndex];
+        indices.reserve(lights.size());
+        for (uint32_t lightIndex = 0; lightIndex < lights.size(); ++lightIndex) {
+            const PointLight& light = lights[lightIndex];
+            const float radiusSq = light.intensity * light.intensity;
+            if (DistSqPointAABB(light.position, r.bounds) <= radiusSq) {
+                indices.push_back(lightIndex);
+            }
+        }
+    }
+    return lightIndices;
+}
+
 static std::vector<PointLight> GatherPageLights(const std::vector<FaceRect>& rects,
                                                 uint32_t pageIndex,
-                                                const std::vector<PointLight>& lights)
+                                                const std::vector<PointLight>& lights,
+                                                const std::vector<std::vector<uint32_t>>* lightIndicesByRect = nullptr)
 {
     if (lights.empty()) {
         return {};
     }
 
     std::vector<uint8_t> used(lights.size(), 0);
-    for (const FaceRect& r : rects) {
+    for (size_t rectIndex = 0; rectIndex < rects.size(); ++rectIndex) {
+        const FaceRect& r = rects[rectIndex];
         if (r.page != pageIndex) {
             continue;
         }
-        for (uint32_t lightIndex : r.lightIndices) {
+        const std::vector<uint32_t>& rectLightIndices = lightIndicesByRect ? (*lightIndicesByRect)[rectIndex] : r.lightIndices;
+        for (uint32_t lightIndex : rectLightIndices) {
             used[lightIndex] = 1;
         }
     }
@@ -1105,11 +1144,125 @@ static std::vector<PointLight> GatherPageLights(const std::vector<FaceRect>& rec
     return pageLights;
 }
 
+static bool IsLightBrushTextureName(const std::string& name) {
+    return name.rfind("__light_brush_", 0) == 0;
+}
+
+static Vector3 AverageRectLighting(const LightmapPage& page,
+                                   const FaceRect& rect,
+                                   const std::vector<uint8_t>& coverage)
+{
+    const size_t pixelCount = (size_t)page.width * (size_t)page.height;
+    if (coverage.size() < pixelCount || page.pixels.size() < pixelCount * 4) {
+        return Vector3Zero();
+    }
+
+    const uint8_t kFullCoverage = (uint8_t)(AA_GRID * AA_GRID);
+    Vector3 fullAccum = Vector3Zero();
+    size_t fullCount = 0;
+    Vector3 validAccum = Vector3Zero();
+    size_t validCount = 0;
+    for (int ly = 0; ly < rect.gpu.h; ++ly) {
+        for (int lx = 0; lx < rect.gpu.w; ++lx) {
+            const size_t pixelIndex = (size_t)(rect.gpu.y + ly) * (size_t)page.width + (size_t)(rect.gpu.x + lx);
+            if (pixelIndex >= pixelCount || coverage[pixelIndex] == 0) {
+                continue;
+            }
+            const size_t off = pixelIndex * 4;
+            const Vector3 sample = {
+                page.pixels[off + 0] / 255.0f,
+                page.pixels[off + 1] / 255.0f,
+                page.pixels[off + 2] / 255.0f
+            };
+            validAccum = Vector3Add(validAccum, sample);
+            ++validCount;
+            if (coverage[pixelIndex] == kFullCoverage) {
+                fullAccum = Vector3Add(fullAccum, sample);
+                ++fullCount;
+            }
+        }
+    }
+
+    Vector3 avg = Vector3Zero();
+    if (fullCount > 0) {
+        avg = Vector3Scale(fullAccum, 1.0f / (float)fullCount);
+    } else if (validCount > 0) {
+        avg = Vector3Scale(validAccum, 1.0f / (float)validCount);
+    }
+    avg.x = std::max(0.0f, avg.x - AMBIENT);
+    avg.y = std::max(0.0f, avg.y - AMBIENT);
+    avg.z = std::max(0.0f, avg.z - AMBIENT);
+    return avg;
+}
+
+static std::vector<PointLight> BuildIndirectBounceLights(const std::vector<BakePatch>& patches,
+                                                         const std::vector<FaceRect>& rects,
+                                                         const std::vector<LightmapPage>& pages,
+                                                         const std::vector<std::vector<uint8_t>>& coverageMasks)
+{
+    std::vector<PointLight> bounceLights;
+    bounceLights.reserve(patches.size());
+    for (size_t i = 0; i < patches.size(); ++i) {
+        const BakePatch& patch = patches[i];
+        const FaceRect& rect = rects[i];
+        if (rect.page >= pages.size() || rect.page >= coverageMasks.size()) {
+            continue;
+        }
+        if (IsLightBrushTextureName(patch.poly.texture)) {
+            continue;
+        }
+
+        const Vector3 avgDirect = AverageRectLighting(pages[rect.page], rect, coverageMasks[rect.page]);
+        const float maxChannel = std::max(avgDirect.x, std::max(avgDirect.y, avgDirect.z));
+        if (maxChannel < INDIRECT_BOUNCE_THRESHOLD) {
+            continue;
+        }
+
+        const float area = std::max(1.0f, PolygonArea(patch.poly.verts));
+        const float radius = std::clamp(
+            INDIRECT_BOUNCE_RADIUS_BIAS + sqrtf(area) * INDIRECT_BOUNCE_RADIUS_SCALE,
+            INDIRECT_BOUNCE_RADIUS_MIN,
+            INDIRECT_BOUNCE_RADIUS_MAX);
+
+        PointLight bounce{};
+        bounce.position = Vector3Add(PolygonCentroid(patch.poly.verts), Vector3Scale(patch.poly.normal, 1.0f));
+        bounce.color = Vector3Scale(avgDirect, INDIRECT_BOUNCE_REFLECTANCE);
+        bounce.intensity = radius;
+        bounce.emissionNormal = patch.poly.normal;
+        bounce.directional = 1;
+        bounce.ignoreOccluderGroup = -1;
+        bounceLights.push_back(bounce);
+    }
+    return bounceLights;
+}
+
+static LightmapPage MakeBlankPageLike(const LightmapPage& src) {
+    LightmapPage page;
+    page.width = src.width;
+    page.height = src.height;
+    page.pixels.assign((size_t)page.width * (size_t)page.height * 4, 0);
+    return page;
+}
+
+static void AddPagePixels(LightmapPage& dst, const LightmapPage& src) {
+    if (dst.pixels.size() != src.pixels.size()) {
+        return;
+    }
+    for (size_t i = 0; i + 3 < dst.pixels.size(); i += 4) {
+        dst.pixels[i + 0] = (uint8_t)std::min(255, (int)dst.pixels[i + 0] + (int)src.pixels[i + 0]);
+        dst.pixels[i + 1] = (uint8_t)std::min(255, (int)dst.pixels[i + 1] + (int)src.pixels[i + 1]);
+        dst.pixels[i + 2] = (uint8_t)std::min(255, (int)dst.pixels[i + 2] + (int)src.pixels[i + 2]);
+        dst.pixels[i + 3] = 255;
+    }
+}
+
 static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 const std::vector<PointLight>& lights,
                                 const std::vector<FaceRect>& rects,
+                                const std::vector<std::vector<uint32_t>>* lightIndicesByRect,
                                 uint32_t pageIndex,
                                 const OccluderSet& occ,
+                                float ambient,
                                 LightmapPage& page)
 {
     const int W = page.width;
@@ -1146,8 +1299,9 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             1.0f);
                         const float nearHitT = OCCLUSION_NEAR_TMIN + EDGE_SEAM_TMIN_BOOST * edgeFactor;
 
-                        float cr = AMBIENT, cg = AMBIENT, cb = AMBIENT;
-                        for (uint32_t lightIndex : r.lightIndices) {
+                        float cr = ambient, cg = ambient, cb = ambient;
+                        const std::vector<uint32_t>& rectLightIndices = lightIndicesByRect ? (*lightIndicesByRect)[i] : r.lightIndices;
+                        for (uint32_t lightIndex : rectLightIndices) {
                             const PointLight& L = lights[lightIndex];
                             const Vector3 toL = Vector3Subtract(L.position, wp);
                             const float dist = Vector3Length(toL);
@@ -1230,13 +1384,17 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
            totalLuxels, AA_GRID * AA_GRID, totalLuxels * (size_t)(AA_GRID * AA_GRID));
     fflush(stdout);
 
+    std::vector<std::vector<uint8_t>> coverageMasks(atlas.pages.size());
+    std::vector<std::vector<uint8_t>> baseValidMasks(atlas.pages.size());
     for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
         LightmapPage& page = atlas.pages[pageIndex];
         printf("[Lightmap] page %u/%zu begin (%dx%d)\n",
                pageIndex + 1, atlas.pages.size(), page.width, page.height);
         fflush(stdout);
-        std::vector<uint8_t> coverage = BuildCoverageMask(rects, pageIndex, page.width, page.height);
-        std::vector<uint8_t> valid = CoverageToValidMask(coverage);
+        std::vector<uint8_t>& coverage = coverageMasks[pageIndex];
+        coverage = BuildCoverageMask(rects, pageIndex, page.width, page.height);
+        std::vector<uint8_t>& valid = baseValidMasks[pageIndex];
+        valid = CoverageToValidMask(coverage);
         std::vector<PointLight> pageLights = GatherPageLights(rects, pageIndex, lights);
         size_t pageLuxels = 0;
 
@@ -1261,11 +1419,11 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         if (pageRequiresCPU) {
             computeError = "page contains polygon(s) exceeding compute vertex limit";
         }
-        if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageLights, page.width, page.height, page.pixels, &computeError)) {
+        if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageLights, AMBIENT, page.width, page.height, page.pixels, &computeError)) {
             printf("[Lightmap] page %u compute bake unavailable, falling back to CPU: %s\n",
                    pageIndex, computeError.c_str());
             fflush(stdout);
-            BakeLightmapCPUPage(patches, lights, rects, pageIndex, occ, page);
+            BakeLightmapCPUPage(patches, lights, rects, nullptr, pageIndex, occ, AMBIENT, page);
             usedCPUFallback = true;
             printf("[Lightmap] page %u CPU bake complete\n", pageIndex);
             fflush(stdout);
@@ -1289,7 +1447,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                        darkStats.darkValidCount, darkStats.validCount,
                        darkStats.darkFullCoverageCount, darkStats.fullCoverageCount);
                 fflush(stdout);
-                BakeLightmapCPUPage(patches, lights, rects, pageIndex, occ, page);
+                BakeLightmapCPUPage(patches, lights, rects, nullptr, pageIndex, occ, AMBIENT, page);
                 edgeTexelsStabilized = false;
                 printf("[Lightmap] page %u CPU re-bake complete\n", pageIndex);
                 fflush(stdout);
@@ -1301,6 +1459,59 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
             fflush(stdout);
             StabilizeEdgeTexels(page, coverage);
         }
+        printf("[Lightmap] page %u direct complete\n", pageIndex);
+        fflush(stdout);
+    }
+
+    const std::vector<PointLight> indirectLights = BuildIndirectBounceLights(patches, rects, atlas.pages, coverageMasks);
+    if (!indirectLights.empty()) {
+        printf("[Lightmap] indirect bounce emitters: %zu\n", indirectLights.size());
+        fflush(stdout);
+        const std::vector<std::vector<uint32_t>> indirectLightIndices = BuildRectLightIndices(rects, indirectLights);
+
+        for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
+            LightmapPage& page = atlas.pages[pageIndex];
+            const std::vector<PointLight> pageIndirectLights = GatherPageLights(rects, pageIndex, indirectLights, &indirectLightIndices);
+            if (pageIndirectLights.empty()) {
+                continue;
+            }
+
+            std::vector<LightmapComputeFaceRect> pageRects;
+            pageRects.reserve(rects.size());
+            bool pageRequiresCPU = false;
+            for (const FaceRect& r : rects) {
+                if (r.page == pageIndex) {
+                    pageRects.push_back(r.gpu);
+                    if (r.gpu.polyCount < 0) {
+                        pageRequiresCPU = true;
+                    }
+                }
+            }
+
+            printf("[Lightmap] page %u indirect begin (%zu bounce lights)\n", pageIndex, pageIndirectLights.size());
+            fflush(stdout);
+            LightmapPage indirectPage = MakeBlankPageLike(page);
+            std::string computeError;
+            if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageIndirectLights, 0.0f, page.width, page.height, indirectPage.pixels, &computeError)) {
+                printf("[Lightmap] page %u indirect compute unavailable, falling back to CPU: %s\n",
+                       pageIndex, computeError.c_str());
+                fflush(stdout);
+                BakeLightmapCPUPage(patches, indirectLights, rects, &indirectLightIndices, pageIndex, occ, 0.0f, indirectPage);
+            }
+
+            StabilizeEdgeTexels(indirectPage, coverageMasks[pageIndex]);
+            AddPagePixels(page, indirectPage);
+            printf("[Lightmap] page %u indirect complete\n", pageIndex);
+            fflush(stdout);
+        }
+    } else {
+        printf("[Lightmap] indirect bounce emitters: 0\n");
+        fflush(stdout);
+    }
+
+    for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
+        LightmapPage& page = atlas.pages[pageIndex];
+        std::vector<uint8_t> valid = baseValidMasks[pageIndex];
         printf("[Lightmap] page %u dilating borders\n", pageIndex);
         fflush(stdout);
         DilatePage(page, valid);

@@ -40,7 +40,6 @@ namespace {
 constexpr int kWorkgroupSize = 8;
 constexpr int kDispatchBatchSize = 32;
 constexpr size_t kUniformUploadAlign = 256;
-constexpr float kAmbient = 0.12f;
 constexpr float kShadowBias = 0.25f;
 constexpr float kRayEps = 1e-4f;
 
@@ -365,6 +364,7 @@ bool LightmapComputePlatform_ReadbackBuffer(sg_buffer buffer, size_t numBytes, v
 bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          const std::vector<LightmapComputeOccluderTri>& occluders,
                          const std::vector<PointLight>& lights,
+                         float ambient,
                          int atlasWidth,
                          int atlasHeight,
                          std::vector<uint8_t>& outPixels,
@@ -550,7 +550,7 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             params.min_u = rect.minU;
             params.min_v = rect.minV;
             params.luxel_size = rect.luxelSize;
-            params.ambient = kAmbient;
+            params.ambient = ambient;
             params.shadow_bias = kShadowBias;
             params.ray_eps = kRayEps;
             params._pad_scalar0 = 0.0f;

@@ -36,6 +36,7 @@ struct LightmapComputeOccluderTri {
 bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          const std::vector<LightmapComputeOccluderTri>& occluders,
                          const std::vector<PointLight>& lights,
+                         float ambient,
                          int atlasWidth,
                          int atlasHeight,
                          std::vector<uint8_t>& outPixels,
