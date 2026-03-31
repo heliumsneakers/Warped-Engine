@@ -50,6 +50,8 @@ static constexpr float STEP_HEIGHT = 18.0f;
 static constexpr float GROUND_NORMAL_MIN = 0.7f;
 static constexpr float OVERCLIP = 1.001f;
 static constexpr float STOP_EPSILON = 0.1f;
+static constexpr float CLIP_PLANE_EPSILON = 0.1f;
+static constexpr float DUPLICATE_PLANE_DOT = 0.99f;
 static constexpr float GROUND_PROBE_DISTANCE = 2.0f;
 static constexpr float GROUND_CONTACT_DISTANCE = 0.25f;
 static constexpr float POSITION_EPSILON = 0.02f;
@@ -296,6 +298,44 @@ static inline void PM_ClipVelocity(const Vector3 &in, const Vector3 &normal, Vec
     if (out.z > -STOP_EPSILON && out.z < STOP_EPSILON) out.z = 0.0f;
 }
 
+static bool RecoverTangentVelocity(const Vector3 *planes, int numPlanes, const Vector3 &sourceVelocity, Vector3 &outVelocity)
+{
+    float bestSpeedSq = 0.0f;
+    Vector3 bestVelocity = Vector3Zero();
+
+    for (int i = 0; i < numPlanes; ++i)
+    {
+        Vector3 candidate;
+        PM_ClipVelocity(sourceVelocity, planes[i], candidate, 1.0f);
+
+        int j = 0;
+        for (; j < numPlanes; ++j)
+        {
+            if (j != i && Vector3DotProduct(candidate, planes[j]) < -CLIP_PLANE_EPSILON)
+                break;
+        }
+
+        if (j != numPlanes)
+            continue;
+
+        if (Vector3DotProduct(candidate, sourceVelocity) <= STOP_EPSILON)
+            continue;
+
+        float speedSq = Vector3LengthSq(candidate);
+        if (speedSq <= bestSpeedSq)
+            continue;
+
+        bestSpeedSq = speedSq;
+        bestVelocity = candidate;
+    }
+
+    if (bestSpeedSq <= 1e-8f)
+        return false;
+
+    outVelocity = bestVelocity;
+    return true;
+}
+
 static void PM_Friction(float dt)
 {
     if (!OnWalkableGround())
@@ -447,6 +487,20 @@ static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVe
             continue;
         }
 
+        bool duplicatePlane = false;
+        for (int i = 0; i < numPlanes; ++i)
+        {
+            if (Vector3DotProduct(trace.normal, planes[i]) > DUPLICATE_PLANE_DOT)
+            {
+                moveVelocity = Vector3Add(moveVelocity, trace.normal);
+                duplicatePlane = true;
+                break;
+            }
+        }
+
+        if (duplicatePlane)
+            continue;
+
         if (numPlanes < MAX_CLIP_PLANES)
             planes[numPlanes++] = trace.normal;
 
@@ -464,7 +518,7 @@ static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVe
             int j = 0;
             for (; j < numPlanes; ++j)
             {
-                if (j != i && Vector3DotProduct(candidate, planes[j]) < 0.0f)
+                if (j != i && Vector3DotProduct(candidate, planes[j]) < -CLIP_PLANE_EPSILON)
                     break;
             }
 
@@ -493,8 +547,14 @@ static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVe
         moveVelocity = clipped;
         if (Vector3DotProduct(moveVelocity, oldVelocity) <= 0.0f)
         {
-            moveVelocity = Vector3Zero();
-            break;
+            Vector3 recoveredVelocity;
+            if (!RecoverTangentVelocity(planes, numPlanes, oldVelocity, recoveredVelocity))
+            {
+                moveVelocity = Vector3Zero();
+                break;
+            }
+
+            moveVelocity = recoveredVelocity;
         }
 
         primalVelocity = moveVelocity;
