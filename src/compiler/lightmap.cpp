@@ -17,22 +17,25 @@
 // --------------------------------------------------------------------------
 //  Tunables
 // --------------------------------------------------------------------------
-static constexpr float DEFAULT_LUXEL_SIZE = 16.0f;   // world units per luxel
+static constexpr float DEFAULT_LUXEL_SIZE = 1.0f;   // world units per luxel
 static constexpr int   LM_PAD             = 2;      // border luxels (filled by dilate)
 static constexpr int   LIGHTMAP_PAGE_SIZE = 2048;
-static constexpr int   FACE_MAX_LUXELS    = LIGHTMAP_PAGE_SIZE - LM_PAD * 2 - 4;
+static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face luxel cap (interior only)
 static constexpr float AMBIENT            = 0.12f;
 static constexpr float SHADOW_BIAS        = 0.25f;
 static constexpr float RAY_EPS            = 1e-4f;
 static constexpr float OCCLUSION_NEAR_TMIN = SHADOW_BIAS;
 static constexpr float EDGE_SEAM_GUARD_LUXELS = 0.75f;
 static constexpr float EDGE_SEAM_TMIN_BOOST   = SHADOW_BIAS * 3.0f;
-static constexpr float INDIRECT_BOUNCE_REFLECTANCE = 0.35f;
-static constexpr float INDIRECT_BOUNCE_THRESHOLD   = 0.03f;
-static constexpr float INDIRECT_BOUNCE_RADIUS_BIAS = 96.0f;
-static constexpr float INDIRECT_BOUNCE_RADIUS_SCALE = 4.0f;
-static constexpr float INDIRECT_BOUNCE_RADIUS_MIN = 96.0f;
-static constexpr float INDIRECT_BOUNCE_RADIUS_MAX = 384.0f;
+// The current indirect pass approximates bounced light with per-patch emitters.
+// Keep it conservative so it lifts occluded regions without flattening direct
+// shadow contrast into an overcast look.
+static constexpr float INDIRECT_BOUNCE_REFLECTANCE = 0.18f;
+static constexpr float INDIRECT_BOUNCE_THRESHOLD   = 0.08f;
+static constexpr float INDIRECT_BOUNCE_RADIUS_BIAS = 32.0f;
+static constexpr float INDIRECT_BOUNCE_RADIUS_SCALE = 2.0f;
+static constexpr float INDIRECT_BOUNCE_RADIUS_MIN = 32.0f;
+static constexpr float INDIRECT_BOUNCE_RADIUS_MAX = 160.0f;
 static constexpr int   AA_GRID            = 4;      // AA_GRID² samples per luxel
 static constexpr int   DILATE_PASSES      = 4;
 
@@ -55,6 +58,11 @@ struct BakePatch {
     MapPolygon poly{};
     uint32_t sourcePolyIndex = 0;
 };
+
+static int ComputeInteriorLuxelSpan(float extentWorld) {
+    const float extentLuxels = std::max(0.0f, extentWorld) / DEFAULT_LUXEL_SIZE;
+    return std::max(2, (int)ceilf(std::max(0.0f, extentLuxels - 1e-4f)));
+}
 
 static Vector3 LerpVec3(const Vector3& a, const Vector3& b, float t) {
     return {
@@ -701,6 +709,9 @@ struct FaceRect {
     AABB bounds{};
     std::vector<uint32_t> lightIndices;
     uint32_t page = 0;
+    uint32_t sourcePolyIndex = 0;
+    float maxU = 0.0f;
+    float maxV = 0.0f;
 };
 
 struct LightmapPageLayout {
@@ -744,14 +755,19 @@ static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patche
             AABBExtend(&r.bounds, vv);
         }
 
-        r.gpu.w = std::max(2, (int)ceilf((maxU - minU) / DEFAULT_LUXEL_SIZE)) + LM_PAD * 2;
-        r.gpu.h = std::max(2, (int)ceilf((maxV - minV) / DEFAULT_LUXEL_SIZE)) + LM_PAD * 2;
+        const int interiorW = ComputeInteriorLuxelSpan(maxU - minU);
+        const int interiorH = ComputeInteriorLuxelSpan(maxV - minV);
+        r.gpu.w = interiorW + LM_PAD * 2;
+        r.gpu.h = interiorH + LM_PAD * 2;
         r.gpu.luxelSize = DEFAULT_LUXEL_SIZE;
         r.gpu.minU = minU;
         r.gpu.minV = minV;
         r.gpu.axisU = U;
         r.gpu.axisV = V;
         r.gpu.normal = p.normal;
+        r.sourcePolyIndex = patches[i].sourcePolyIndex;
+        r.maxU = maxU;
+        r.maxV = maxV;
         const float d = Vector3DotProduct(p.verts[0], p.normal);
         r.gpu.origin = Vector3Add(
             Vector3Scale(p.normal, d),
@@ -784,8 +800,208 @@ static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patche
                 r.lightIndices.push_back(lightIndex);
             }
         }
+
+        if (interiorW > FACE_MAX_LUXELS || interiorH > FACE_MAX_LUXELS) {
+            printf("[Lightmap] warning: patch %zu exceeded face luxel cap after subdivision (%dx%d > %d).\n",
+                   i, interiorW, interiorH, FACE_MAX_LUXELS);
+        }
     }
     return rects;
+}
+
+static bool CoverageContains(const std::vector<uint8_t>& coverage,
+                             const LightmapPage& page,
+                             int x, int y)
+{
+    if (x < 0 || y < 0 || x >= page.width || y >= page.height) {
+        return false;
+    }
+    const size_t idx = (size_t)y * (size_t)page.width + (size_t)x;
+    return idx < coverage.size() && coverage[idx] > 0;
+}
+
+static int InteriorSpanX(const FaceRect& rect) {
+    return std::max(0, rect.gpu.w - LM_PAD * 2);
+}
+
+static int InteriorSpanY(const FaceRect& rect) {
+    return std::max(0, rect.gpu.h - LM_PAD * 2);
+}
+
+static bool LocalInteriorIndexFromGlobalCenter(float rectMinCoord,
+                                               float luxelSize,
+                                               int interiorSpan,
+                                               float globalCenter,
+                                               int* outInteriorIndex)
+{
+    if (!outInteriorIndex || interiorSpan <= 0 || luxelSize <= 0.0f) {
+        return false;
+    }
+
+    const float local = (globalCenter - rectMinCoord) / luxelSize;
+    const int candidate = (int)floorf(local);
+    if (candidate < 0 || candidate >= interiorSpan) {
+        return false;
+    }
+    const float expectedCenter = (float)candidate + 0.5f;
+    if (fabsf(local - expectedCenter) > 1e-3f) {
+        return false;
+    }
+
+    *outInteriorIndex = candidate;
+    return true;
+}
+
+static void AverageLuxelPair(LightmapPage& aPage, int ax, int ay,
+                             LightmapPage& bPage, int bx, int by)
+{
+    const size_t aOff = ((size_t)ay * (size_t)aPage.width + (size_t)ax) * 4;
+    const size_t bOff = ((size_t)by * (size_t)bPage.width + (size_t)bx) * 4;
+    if (aOff + 3 >= aPage.pixels.size() || bOff + 3 >= bPage.pixels.size()) {
+        return;
+    }
+
+    for (int c = 0; c < 3; ++c) {
+        const int avg = ((int)aPage.pixels[aOff + c] + (int)bPage.pixels[bOff + c] + 1) / 2;
+        aPage.pixels[aOff + c] = (uint8_t)avg;
+        bPage.pixels[bOff + c] = (uint8_t)avg;
+    }
+    aPage.pixels[aOff + 3] = 255;
+    bPage.pixels[bOff + 3] = 255;
+}
+
+static size_t WeldVerticalSiblingSeam(const FaceRect& left,
+                                      const FaceRect& right,
+                                      std::vector<LightmapPage>& pages,
+                                      const std::vector<std::vector<uint8_t>>& coverageMasks)
+{
+    if (left.page >= pages.size() || right.page >= pages.size() ||
+        left.page >= coverageMasks.size() || right.page >= coverageMasks.size()) {
+        return 0;
+    }
+
+    const int leftInteriorW = InteriorSpanX(left);
+    const int leftInteriorH = InteriorSpanY(left);
+    const int rightInteriorH = InteriorSpanY(right);
+    if (leftInteriorW <= 0 || leftInteriorH <= 0 || rightInteriorH <= 0) {
+        return 0;
+    }
+
+    LightmapPage& leftPage = pages[left.page];
+    LightmapPage& rightPage = pages[right.page];
+    const std::vector<uint8_t>& leftCoverage = coverageMasks[left.page];
+    const std::vector<uint8_t>& rightCoverage = coverageMasks[right.page];
+    const int leftX = left.gpu.x + LM_PAD + leftInteriorW - 1;
+    const int rightX = right.gpu.x + LM_PAD;
+
+    size_t welded = 0;
+    for (int leftRow = 0; leftRow < leftInteriorH; ++leftRow) {
+        const float globalVCenter = left.gpu.minV + ((float)leftRow + 0.5f) * left.gpu.luxelSize;
+        int rightRow = 0;
+        if (!LocalInteriorIndexFromGlobalCenter(right.gpu.minV, right.gpu.luxelSize, rightInteriorH, globalVCenter, &rightRow)) {
+            continue;
+        }
+
+        const int leftY = left.gpu.y + LM_PAD + leftRow;
+        const int rightY = right.gpu.y + LM_PAD + rightRow;
+        if (!CoverageContains(leftCoverage, leftPage, leftX, leftY) ||
+            !CoverageContains(rightCoverage, rightPage, rightX, rightY)) {
+            continue;
+        }
+
+        AverageLuxelPair(leftPage, leftX, leftY, rightPage, rightX, rightY);
+        ++welded;
+    }
+
+    return welded;
+}
+
+static size_t WeldHorizontalSiblingSeam(const FaceRect& bottom,
+                                        const FaceRect& top,
+                                        std::vector<LightmapPage>& pages,
+                                        const std::vector<std::vector<uint8_t>>& coverageMasks)
+{
+    if (bottom.page >= pages.size() || top.page >= pages.size() ||
+        bottom.page >= coverageMasks.size() || top.page >= coverageMasks.size()) {
+        return 0;
+    }
+
+    const int bottomInteriorW = InteriorSpanX(bottom);
+    const int bottomInteriorH = InteriorSpanY(bottom);
+    const int topInteriorW = InteriorSpanX(top);
+    if (bottomInteriorW <= 0 || bottomInteriorH <= 0 || topInteriorW <= 0) {
+        return 0;
+    }
+
+    LightmapPage& bottomPage = pages[bottom.page];
+    LightmapPage& topPage = pages[top.page];
+    const std::vector<uint8_t>& bottomCoverage = coverageMasks[bottom.page];
+    const std::vector<uint8_t>& topCoverage = coverageMasks[top.page];
+    const int bottomY = bottom.gpu.y + LM_PAD + bottomInteriorH - 1;
+    const int topY = top.gpu.y + LM_PAD;
+
+    size_t welded = 0;
+    for (int bottomCol = 0; bottomCol < bottomInteriorW; ++bottomCol) {
+        const float globalUCenter = bottom.gpu.minU + ((float)bottomCol + 0.5f) * bottom.gpu.luxelSize;
+        int topCol = 0;
+        if (!LocalInteriorIndexFromGlobalCenter(top.gpu.minU, top.gpu.luxelSize, topInteriorW, globalUCenter, &topCol)) {
+            continue;
+        }
+
+        const int bottomX = bottom.gpu.x + LM_PAD + bottomCol;
+        const int topX = top.gpu.x + LM_PAD + topCol;
+        if (!CoverageContains(bottomCoverage, bottomPage, bottomX, bottomY) ||
+            !CoverageContains(topCoverage, topPage, topX, topY)) {
+            continue;
+        }
+
+        AverageLuxelPair(bottomPage, bottomX, bottomY, topPage, topX, topY);
+        ++welded;
+    }
+
+    return welded;
+}
+
+static size_t WeldSiblingPatchSeams(const std::vector<FaceRect>& rects,
+                                    std::vector<LightmapPage>& pages,
+                                    const std::vector<std::vector<uint8_t>>& coverageMasks)
+{
+    static constexpr float kSeamCoordEpsilon = DEFAULT_LUXEL_SIZE * 0.05f;
+
+    std::unordered_map<uint32_t, std::vector<size_t>> rectsBySourcePoly;
+    rectsBySourcePoly.reserve(rects.size());
+    for (size_t i = 0; i < rects.size(); ++i) {
+        rectsBySourcePoly[rects[i].sourcePolyIndex].push_back(i);
+    }
+
+    size_t weldedSamples = 0;
+    for (const auto& [sourcePolyIndex, group] : rectsBySourcePoly) {
+        (void)sourcePolyIndex;
+        if (group.size() < 2) {
+            continue;
+        }
+
+        for (size_t i = 0; i < group.size(); ++i) {
+            const FaceRect& a = rects[group[i]];
+            for (size_t j = i + 1; j < group.size(); ++j) {
+                const FaceRect& b = rects[group[j]];
+
+                if (fabsf(a.maxU - b.gpu.minU) <= kSeamCoordEpsilon) {
+                    weldedSamples += WeldVerticalSiblingSeam(a, b, pages, coverageMasks);
+                } else if (fabsf(b.maxU - a.gpu.minU) <= kSeamCoordEpsilon) {
+                    weldedSamples += WeldVerticalSiblingSeam(b, a, pages, coverageMasks);
+                }
+
+                if (fabsf(a.maxV - b.gpu.minV) <= kSeamCoordEpsilon) {
+                    weldedSamples += WeldHorizontalSiblingSeam(a, b, pages, coverageMasks);
+                } else if (fabsf(b.maxV - a.gpu.minV) <= kSeamCoordEpsilon) {
+                    weldedSamples += WeldHorizontalSiblingSeam(b, a, pages, coverageMasks);
+                }
+            }
+        }
+    }
+
+    return weldedSamples;
 }
 
 static bool PlaceRectOnPage(FaceRect& rect, LightmapPageLayout& page) {
@@ -1463,6 +1679,12 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         fflush(stdout);
     }
 
+    const size_t directSeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks);
+    if (directSeamWelded > 0) {
+        printf("[Lightmap] welded %zu direct seam-adjacent luxel pairs across split patches.\n", directSeamWelded);
+        fflush(stdout);
+    }
+
     const std::vector<PointLight> indirectLights = BuildIndirectBounceLights(patches, rects, atlas.pages, coverageMasks);
     if (!indirectLights.empty()) {
         printf("[Lightmap] indirect bounce emitters: %zu\n", indirectLights.size());
@@ -1502,6 +1724,12 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
             StabilizeEdgeTexels(indirectPage, coverageMasks[pageIndex]);
             AddPagePixels(page, indirectPage);
             printf("[Lightmap] page %u indirect complete\n", pageIndex);
+            fflush(stdout);
+        }
+
+        const size_t indirectSeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks);
+        if (indirectSeamWelded > 0) {
+            printf("[Lightmap] welded %zu indirect seam-adjacent luxel pairs across split patches.\n", indirectSeamWelded);
             fflush(stdout);
         }
     } else {

@@ -431,7 +431,7 @@ Map ParseMapFile(const std::string &filename) {
                     }
                 }
 
-                Face face;
+                Face face{};
                 std::istringstream iss(faceLine);
                 std::string token;
 
@@ -515,12 +515,21 @@ Map ParseMapFile(const std::string &filename) {
                     }
                 }
 
-                iss >> token;
-                face.rotation = (!token.empty()) ? std::stof(token) : 0.f;
-                iss >> token;
-                face.scaleX   = (!token.empty()) ? std::stof(token) : 1.f;
-                iss >> token;
-                face.scaleY   = (!token.empty()) ? std::stof(token) : 1.f;
+                if (iss >> token) {
+                    face.rotation = !token.empty() ? std::stof(token) : 0.f;
+                } else {
+                    face.rotation = 0.f;
+                }
+                if (iss >> token) {
+                    face.scaleX = !token.empty() ? std::stof(token) : 1.f;
+                } else {
+                    face.scaleX = 1.f;
+                }
+                if (iss >> token) {
+                    face.scaleY = !token.empty() ? std::stof(token) : 1.f;
+                } else {
+                    face.scaleY = 1.f;
+                }
 
                 face.normal = CalculateNormal(face.vertices[0],
                                               face.vertices[1],
@@ -916,9 +925,14 @@ static void AppendBrushEntityPolygons(const Entity& entity,
             Vector3 nTB = brush.faces[i].normal;
             SortPolygonVertices(polys[i], nTB);
             for (auto& p : polys[i]) p = ConvertTBtoRaylib(p);
+            const Vector3 expectedNormalRL = ConvertTBtoRaylib(nTB);
+            SortPolygonVertices(polys[i], expectedNormalRL);
+            RemoveDuplicatePoints(polys[i], 0.1f);
+            CleanupClippedPolygon(polys[i], expectedNormalRL);
+            if (polys[i].size() < 3) continue;
 
             Vector3 nRL = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
-            if (Vector3DotProduct(nRL, ConvertTBtoRaylib(nTB)) < 0.f) {
+            if (Vector3DotProduct(nRL, expectedNormalRL) < 0.f) {
                 std::reverse(polys[i].begin(), polys[i].end());
                 nRL = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
             }
