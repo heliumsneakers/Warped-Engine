@@ -580,6 +580,18 @@ static bool EntityHasClass(const Entity& e, const char* classname) {
     return (it != e.properties.end()) && (it->second == classname);
 }
 
+static bool ShouldRenderBrushEntity(const Entity& entity, bool devMode) {
+    if ((EntityHasClass(entity, "trigger_once") || EntityHasClass(entity, "trigger_multiple")) && !devMode) {
+        return false;
+    }
+
+    if (EntityHasClass(entity, "func_clip")) {
+        return false;
+    }
+
+    return true;
+}
+
 static int ClampColor255Component(float value) {
     return std::max(0, std::min(255, (int)std::lround(value)));
 }
@@ -878,15 +890,18 @@ static void AppendBrushEntityPolygons(const Entity& entity,
                                       int* nextSourceBrushId,
                                       size_t* sourceFaceCount,
                                       std::vector<MapPolygon>& out) {
-    const bool isTrigger = EntityHasClass(entity, "trigger_once") || EntityHasClass(entity, "trigger_multiple");
     const bool isLightBrush = EntityHasClass(entity, "light_brush");
     const std::string lightBrushTexture = isLightBrush
         ? EncodeLightBrushTextureName(ReadLightBrushColor255(entity))
         : std::string();
+
+    if (!ShouldRenderBrushEntity(entity, devMode)) {
+        return;
+    }
+
     std::vector<MapPolygon> entityPolys;
 
     for (auto& brush : entity.brushes) {
-        if (isTrigger && !devMode) continue;
         const int lightBrushGroup = (isLightBrush && nextLightBrushGroup) ? (*nextLightBrushGroup)++ : -1;
         const int sourceBrushId = nextSourceBrushId ? (*nextSourceBrushId)++ : -1;
 

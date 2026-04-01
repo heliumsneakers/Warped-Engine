@@ -1,6 +1,6 @@
 // src/player/player.cpp
 //
-// GoldSrc-style movement using manual Jolt capsule sweeps.
+// GoldSrc-style movement using manual Jolt box sweeps.
 
 #include <cmath>
 
@@ -26,7 +26,7 @@
 #include "Jolt/Physics/Collision/RayCast.h"
 #include "Jolt/Physics/Collision/CastResult.h"
 #include "Jolt/Physics/Collision/Shape/Shape.h"
-#include "Jolt/Physics/Collision/Shape/CapsuleShape.h"
+#include "Jolt/Physics/Collision/Shape/BoxShape.h"
 #include "Jolt/Physics/Collision/ShapeCast.h"
 #include "Jolt/Physics/Collision/CollideShape.h"
 #include "Jolt/Physics/Collision/CollisionCollectorImpl.h"
@@ -57,11 +57,10 @@ static constexpr float GROUND_CONTACT_DISTANCE = 0.25f;
 static constexpr float POSITION_EPSILON = 0.02f;
 static constexpr int MAX_CLIP_PLANES = 5;
 static constexpr int MAX_BUMPS = 4;
-static constexpr int MAX_PENETRATION_ITERS = 4;
+static constexpr int MAX_PENETRATION_ITERS = 8;
 static constexpr float PLAYER_RADIUS = 16.0f;
 static constexpr float PLAYER_HEIGHT = 56.0f;
-static constexpr float PLAYER_CYLINDER_HALF_HEIGHT = (PLAYER_HEIGHT - 2.0f * PLAYER_RADIUS) * 0.5f;
-static constexpr float PLAYER_HALF_HEIGHT = PLAYER_CYLINDER_HALF_HEIGHT + PLAYER_RADIUS;
+static constexpr float PLAYER_HALF_HEIGHT = PLAYER_HEIGHT * 0.5f;
 static constexpr float JUMP_FORCE = 268.3281573f; // sqrt(2 * 800 * 45)
 
 Vector3 velocity = Vector3Zero();
@@ -73,7 +72,7 @@ Vector3 wishDir = Vector3Zero();
 Vector3 wishVel = Vector3Zero();
 float wishSpeed = 0.0f;
 
-static JPH::RefConst<JPH::CapsuleShape> gPlayerShape;
+static JPH::RefConst<JPH::Shape> gPlayerShape;
 static JPH::Vec3 gGroundNormal = JPH::Vec3::sAxisY();
 
 // Debug colors
@@ -159,8 +158,9 @@ static MoveTrace CastPlayerShape(JPH::PhysicsSystem *ps, Vector3 start, Vector3 
     JPH::ShapeCastSettings settings;
     settings.mBackFaceModeTriangles = JPH::EBackFaceMode::CollideWithBackFaces;
     settings.mBackFaceModeConvex = JPH::EBackFaceMode::CollideWithBackFaces;
-    settings.mUseShrunkenShapeAndConvexRadius = true;
+    settings.mUseShrunkenShapeAndConvexRadius = false;
     settings.mReturnDeepestPoint = true;
+    settings.mActiveEdgeMovementDirection = ToJoltVec3(delta);
 
     JPH::ClosestHitCollisionCollector<JPH::CastShapeCollector> collector;
     ps->GetNarrowPhaseQuery().CastShape(
@@ -469,7 +469,11 @@ static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVe
         }
 
         if (trace.fraction > 0.0f)
+        {
             position = trace.endPos;
+            primalVelocity = moveVelocity;
+            numPlanes = 0;
+        }
 
         if (!trace.hit || trace.fraction >= 1.0f)
             break;
@@ -607,7 +611,7 @@ void InitJoltCharacter(Player *player, JPH::PhysicsSystem *physicsSystem)
     (void)physicsSystem;
 
     if (!gPlayerShape)
-        gPlayerShape = new JPH::CapsuleShape(PLAYER_CYLINDER_HALF_HEIGHT, PLAYER_RADIUS);
+        gPlayerShape = new JPH::BoxShape(JPH::Vec3(PLAYER_RADIUS, PLAYER_HALF_HEIGHT, PLAYER_RADIUS), 0.0f);
 
     ResolvePlayerPenetration(s_physics_system, player->center);
     CategorizeGround(s_physics_system, player->center, true);

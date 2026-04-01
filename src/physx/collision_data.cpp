@@ -26,6 +26,10 @@ static CollisionType GetEntityCollisionType(const Entity &ent) {
             ct = CollisionType::DYNAMIC;
             printf("\n FUNC_PHYSICS ENTITY \n");
         }
+        else if (classname.find("func_clip") != std::string::npos) {
+            ct = CollisionType::STATIC;
+            printf("\n FUNC_CLIP ENTITY \n");
+        }
         else if (classname.find("func_detail") != std::string::npos) {
             ct = CollisionType::NO_COLLIDE;
             printf("\n FUNC_DETAIL ENTITY \n");
