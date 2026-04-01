@@ -47,7 +47,8 @@ static constexpr float AIR_WISH_SPEED_CAP = 30.0f;
 static constexpr float GRAVITY = 800.0f;
 static constexpr float JUMP_HEIGHT = 45.0f;
 static constexpr float STEP_HEIGHT = 18.0f;
-static constexpr float GROUND_NORMAL_MIN = 0.7f;
+static constexpr float GROUND_NORMAL_MIN = 0.70710677f; // cos(45 deg)
+static constexpr float SLOPE_STOP_SPEED_EPSILON = 1.0f;
 static constexpr float OVERCLIP = 1.001f;
 static constexpr float STOP_EPSILON = 0.1f;
 static constexpr float CLIP_PLANE_EPSILON = 0.1f;
@@ -110,6 +111,8 @@ struct GroundSupport {
     Vector3 normal = { 0.0f, 1.0f, 0.0f };
 };
 
+static GroundSupport FindGroundSupport(JPH::PhysicsSystem *ps, Vector3 position, float maxDistance);
+
 class PlayerQueryLayerFilter : public JPH::ObjectLayerFilter
 {
 public:
@@ -131,6 +134,30 @@ static inline JPH::Vec3 ToJoltVec3(Vector3 v) { return JPH::Vec3(v.x, v.y, v.z);
 static inline JPH::RVec3 ToJoltRVec3(Vector3 v) { return JPH::RVec3(v.x, v.y, v.z); }
 static inline Vector3 FromJoltVec3(JPH::Vec3Arg v) { return { v.GetX(), v.GetY(), v.GetZ() }; }
 static inline Vector3 FromJoltRVec3(JPH::RVec3Arg v) { return { (float)v.GetX(), (float)v.GetY(), (float)v.GetZ() }; }
+static inline Vector3 GroundNormalVector() { return FromJoltVec3(gGroundNormal); }
+
+static inline Vector3 ProjectVectorOntoPlane(Vector3 v, Vector3 normal)
+{
+    return Vector3Subtract(v, Vector3Scale(normal, Vector3DotProduct(v, normal)));
+}
+
+static Vector3 ReprojectVelocityPreserveSpeed(Vector3 velocity, Vector3 normal, float targetSpeed)
+{
+    Vector3 projected = ProjectVectorOntoPlane(velocity, normal);
+    float lenSq = Vector3LengthSq(projected);
+    if (lenSq <= 1e-8f || targetSpeed <= 0.0f)
+        return Vector3Zero();
+    return Vector3Scale(projected, targetSpeed / sqrtf(lenSq));
+}
+
+static Vector3 ProjectDirectionOntoPlane(Vector3 dir, Vector3 normal)
+{
+    Vector3 projected = ProjectVectorOntoPlane(dir, normal);
+    float lenSq = Vector3LengthSq(projected);
+    if (lenSq <= 1e-8f)
+        return Vector3Zero();
+    return Vector3Scale(projected, 1.0f / sqrtf(lenSq));
+}
 
 static void DebugUpdateVelMetrics()
 {
@@ -217,7 +244,23 @@ static bool ResolvePlayerPenetration(JPH::PhysicsSystem *ps, Vector3 &position)
             return moved;
 
         Vector3 resolve = FromJoltVec3(-axis.Normalized());
-        position = Vector3Add(position, Vector3Scale(resolve, collector.mHit.mPenetrationDepth + POSITION_EPSILON));
+        const float resolveDistance = collector.mHit.mPenetrationDepth + POSITION_EPSILON;
+
+        if (resolve.y >= GROUND_NORMAL_MIN)
+        {
+            GroundSupport support = FindGroundSupport(ps, position, GROUND_PROBE_DISTANCE);
+            if (support.found && IsWalkableNormal(support.normal))
+            {
+                const float verticalDistance = resolveDistance / fmaxf(resolve.y, GROUND_NORMAL_MIN);
+                const float snappedY = support.centerY + POSITION_EPSILON;
+                const float raisedY = position.y + verticalDistance;
+                position.y = fmaxf(raisedY, snappedY);
+                moved = true;
+                continue;
+            }
+        }
+
+        position = Vector3Add(position, Vector3Scale(resolve, resolveDistance));
         moved = true;
     }
 
@@ -341,20 +384,33 @@ static void PM_Friction(float dt)
     if (!OnWalkableGround())
         return;
 
-    float speed = HorizontalLength(velocity);
+    Vector3 groundVelocity = ProjectVectorOntoPlane(velocity, GroundNormalVector());
+    float speed = Vector3Length(groundVelocity);
     if (speed <= 0.0f)
         return;
 
     float control = speed < STOP_SPEED ? STOP_SPEED : speed;
     float drop = control * FRICTION * dt;
-    float newspeed = speed - drop;
-    if (newspeed < 0.0f) newspeed = 0.0f;
+    float newGroundSpeed = speed - drop;
+    if (newGroundSpeed < 0.0f) newGroundSpeed = 0.0f;
 
     if (speed > 0.0f)
-        newspeed /= speed;
+        newGroundSpeed /= speed;
 
-    velocity.x *= newspeed;
-    velocity.z *= newspeed;
+    groundVelocity = Vector3Scale(groundVelocity, newGroundSpeed);
+    velocity = groundVelocity;
+}
+
+static void PM_ApplyWalkableSlopeStop()
+{
+    if (!OnWalkableGround())
+        return;
+
+    Vector3 groundVelocity = ProjectVectorOntoPlane(velocity, GroundNormalVector());
+    const float groundSpeed = Vector3Length(groundVelocity);
+    const bool hasInput = wishSpeed > 0.001f;
+    const bool stopOnSlope = !hasInput && groundSpeed <= SLOPE_STOP_SPEED_EPSILON;
+    velocity = stopOnSlope ? Vector3Zero() : groundVelocity;
 }
 
 static inline void PM_BuildWish()
@@ -418,6 +474,8 @@ static inline void PM_Jump(float dt)
 
 static void CategorizeGround(JPH::PhysicsSystem *ps, Vector3 &position, bool allowSnap)
 {
+    const bool wasGroundedState = isGrounded;
+
     if (!allowSnap && velocity.y > 0.0f)
     {
         isGrounded = false;
@@ -440,16 +498,19 @@ static void CategorizeGround(JPH::PhysicsSystem *ps, Vector3 &position, bool all
     if (allowSnap)
         position.y = support.centerY;
 
-    if (velocity.y < 0.0f)
-        velocity.y = 0.0f;
+    const float targetGroundSpeed = wasGroundedState ? Vector3Length(velocity) : HorizontalLength(velocity);
+    velocity = ReprojectVelocityPreserveSpeed(velocity, support.normal, targetGroundSpeed);
 }
 
-static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVelocity, float dt)
+static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVelocity, float dt, bool preserveFallVelocityOnWalkableImpact = false, bool *landedOnWalkable = nullptr)
 {
     float timeLeft = dt;
     Vector3 planes[MAX_CLIP_PLANES];
     int numPlanes = 0;
     Vector3 primalVelocity = moveVelocity;
+
+    if (landedOnWalkable)
+        *landedOnWalkable = false;
 
     for (int bump = 0; bump < MAX_BUMPS; ++bump)
     {
@@ -489,6 +550,16 @@ static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVe
         if (trace.fraction <= 0.0f && IsWalkableNormal(trace.normal) && moveVelocity.y <= 0.0f)
         {
             continue;
+        }
+
+        if (preserveFallVelocityOnWalkableImpact && IsWalkableNormal(trace.normal) && primalVelocity.y < 0.0f)
+        {
+            Vector3 landingVelocity = primalVelocity;
+            landingVelocity.y = 0.0f;
+            moveVelocity = landingVelocity;
+            if (landedOnWalkable)
+                *landedOnWalkable = true;
+            break;
         }
 
         bool duplicatePlane = false;
@@ -569,7 +640,7 @@ static void StepSlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &mo
 {
     Vector3 downPos = position;
     Vector3 downVel = moveVelocity;
-    SlideMove(ps, downPos, downVel, dt);
+    SlideMove(ps, downPos, downVel, dt, false, nullptr);
 
     MoveTrace upTrace = CastPlayerShape(ps, position, { 0.0f, STEP_HEIGHT, 0.0f });
     if (upTrace.hit && upTrace.fraction < 1.0f)
@@ -581,7 +652,7 @@ static void StepSlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &mo
 
     Vector3 upPos = upTrace.endPos;
     Vector3 upVel = moveVelocity;
-    SlideMove(ps, upPos, upVel, dt);
+    SlideMove(ps, upPos, upVel, dt, false, nullptr);
 
     MoveTrace downTrace = CastPlayerShape(ps, upPos, { 0.0f, -STEP_HEIGHT, 0.0f });
     if (downTrace.hit && IsWalkableNormal(downTrace.normal))
@@ -651,13 +722,15 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
     player->pitch = playerPitch;
 
     bool wasGrounded = isGrounded;
-    CategorizeGround(ps, player->center, wasGrounded && velocity.y <= 0.0f);
+    CategorizeGround(ps, player->center, wasGrounded);
 
     PM_BuildWish();
 
     bool jumped = false;
     if (OnWalkableGround())
     {
+        const Vector3 groundWishDir = ProjectDirectionOntoPlane(wishDir, GroundNormalVector());
+
         if (Input_KeyDown(WKEY_SPACE))
         {
             PM_Jump(dt);
@@ -669,7 +742,7 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
         else
         {
             PM_Friction(dt);
-            PM_Accelerate(wishDir, wishSpeed, ACCELERATION, dt);
+            PM_Accelerate(groundWishDir, wishSpeed, ACCELERATION, dt);
         }
     }
     else
@@ -678,13 +751,21 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
         velocity.y -= GRAVITY * dt;
     }
 
+    bool landedOnWalkable = false;
+
     if (OnWalkableGround())
-        StepSlideMove(ps, player->center, velocity, dt);
+    {
+        Vector3 moveVelocity = velocity;
+        PM_ClipVelocity(moveVelocity, GroundNormalVector(), moveVelocity, OVERCLIP);
+        StepSlideMove(ps, player->center, moveVelocity, dt);
+        velocity = moveVelocity;
+    }
     else
-        SlideMove(ps, player->center, velocity, dt);
+        SlideMove(ps, player->center, velocity, dt, true, &landedOnWalkable);
 
     ResolvePlayerPenetration(ps, player->center);
-    CategorizeGround(ps, player->center, wasGrounded && !jumped && velocity.y <= 0.0f);
+    CategorizeGround(ps, player->center, landedOnWalkable || (wasGrounded && !jumped));
+    PM_ApplyWalkableSlopeStop();
 
     DebugUpdateVelMetrics();
 
