@@ -49,6 +49,10 @@ static constexpr float JUMP_HEIGHT = 45.0f;
 static constexpr float STEP_HEIGHT = 18.0f;
 static constexpr float GROUND_NORMAL_MIN = 0.70710677f; // cos(45 deg)
 static constexpr float SLOPE_STOP_SPEED_EPSILON = 1.0f;
+static constexpr float AIR_EDGE_STEP_MAX_LIFT = 6.0f;
+static constexpr float AIR_EDGE_STEP_LIFT_INCREMENT = 0.5f;
+static constexpr float AIR_EDGE_STEP_FORWARD_BIAS = 1.0f;
+static constexpr float GROUND_PROBE_HALF_THICKNESS = 0.1f;
 static constexpr float OVERCLIP = 1.001f;
 static constexpr float STOP_EPSILON = 0.1f;
 static constexpr float CLIP_PLANE_EPSILON = 0.1f;
@@ -74,6 +78,7 @@ Vector3 wishVel = Vector3Zero();
 float wishSpeed = 0.0f;
 
 static JPH::RefConst<JPH::Shape> gPlayerShape;
+static JPH::RefConst<JPH::Shape> gGroundProbeShape;
 static JPH::Vec3 gGroundNormal = JPH::Vec3::sAxisY();
 
 // Debug colors
@@ -110,6 +115,16 @@ struct GroundSupport {
     float centerY = 0.0f;
     Vector3 normal = { 0.0f, 1.0f, 0.0f };
 };
+
+struct GroundProbeDebug {
+    bool valid = false;
+    bool hadHit = false;
+    Vector3 startCenter = Vector3Zero();
+    Vector3 endCenter = Vector3Zero();
+    Vector3 hitCenter = Vector3Zero();
+    Vector3 hitNormal = { 0.0f, 1.0f, 0.0f };
+};
+static GroundProbeDebug gGroundProbeDebug;
 
 static GroundSupport FindGroundSupport(JPH::PhysicsSystem *ps, Vector3 position, float maxDistance);
 
@@ -269,59 +284,75 @@ static bool ResolvePlayerPenetration(JPH::PhysicsSystem *ps, Vector3 &position)
 
 static GroundSupport FindGroundSupport(JPH::PhysicsSystem *ps, Vector3 position, float maxDistance)
 {
-    static const Vector3 kSupportOffsets[] = {
-        {  0.0f, 0.0f,  0.0f },
-        { 12.0f, 0.0f,  0.0f },
-        {-12.0f, 0.0f,  0.0f },
-        {  0.0f, 0.0f, 12.0f },
-        {  0.0f, 0.0f,-12.0f },
-        { 10.0f, 0.0f, 10.0f },
-        { 10.0f, 0.0f,-10.0f },
-        {-10.0f, 0.0f, 10.0f },
-        {-10.0f, 0.0f,-10.0f },
+    GroundSupport best;
+
+    if (!gGroundProbeShape || maxDistance <= 0.0f)
+    {
+        gGroundProbeDebug.valid = false;
+        return best;
+    }
+
+    Vector3 probeStart = {
+        position.x,
+        position.y - PLAYER_HALF_HEIGHT + GROUND_PROBE_HALF_THICKNESS + POSITION_EPSILON,
+        position.z
     };
 
-    GroundSupport best;
-    const float rayStartLift = 1.0f;
-    const float rayLength = maxDistance + rayStartLift;
+    const float castDistance = maxDistance + POSITION_EPSILON;
+    gGroundProbeDebug.valid = true;
+    gGroundProbeDebug.hadHit = false;
+    gGroundProbeDebug.startCenter = probeStart;
+    gGroundProbeDebug.endCenter = { probeStart.x, probeStart.y - castDistance, probeStart.z };
+    gGroundProbeDebug.hitCenter = gGroundProbeDebug.endCenter;
+    gGroundProbeDebug.hitNormal = { 0.0f, 1.0f, 0.0f };
+    const JPH::RShapeCast cast(
+        gGroundProbeShape.GetPtr(),
+        JPH::Vec3::sReplicate(1.0f),
+        JPH::RMat44::sTranslation(ToJoltRVec3(probeStart)),
+        JPH::Vec3(0.0f, -castDistance, 0.0f)
+    );
 
-    for (const Vector3 &offset : kSupportOffsets)
+    JPH::ShapeCastSettings settings;
+    settings.mBackFaceModeTriangles = JPH::EBackFaceMode::CollideWithBackFaces;
+    settings.mBackFaceModeConvex = JPH::EBackFaceMode::CollideWithBackFaces;
+    settings.mUseShrunkenShapeAndConvexRadius = false;
+    settings.mReturnDeepestPoint = true;
+    settings.mActiveEdgeMovementDirection = JPH::Vec3(0.0f, -1.0f, 0.0f);
+
+    JPH::AllHitCollisionCollector<JPH::CastShapeCollector> collector;
+    ps->GetNarrowPhaseQuery().CastShape(
+        cast,
+        settings,
+        JPH::RVec3::sZero(),
+        collector,
+        ps->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
+        s_player_query_layer_filter
+    );
+
+    if (!collector.HadHit())
+        return best;
+
+    collector.Sort();
+    for (const JPH::ShapeCastResult &hit : collector.mHits)
     {
-        Vector3 origin = {
-            position.x + offset.x,
-            position.y - PLAYER_HALF_HEIGHT + rayStartLift,
-            position.z + offset.z
-        };
-
-        JPH::RayCastResult hit;
-        bool hadHit = ps->GetNarrowPhaseQuery().CastRay(
-            JPH::RRayCast(ToJoltRVec3(origin), JPH::Vec3(0.0f, -rayLength, 0.0f)),
-            hit,
-            ps->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
-            s_player_query_layer_filter
-        );
-
-        if (!hadHit)
+        JPH::Vec3 axis = hit.mPenetrationAxis;
+        if (axis.LengthSq() <= 1e-12f)
             continue;
 
-        JPH::BodyLockRead lock(ps->GetBodyLockInterface(), hit.mBodyID);
-        if (!lock.Succeeded())
-            continue;
-
-        const JPH::Body &body = lock.GetBody();
-        JPH::RVec3 hitPos = JPH::RRayCast(ToJoltRVec3(origin), JPH::Vec3(0.0f, -rayLength, 0.0f)).GetPointOnRay(hit.mFraction);
-        Vector3 normal = FromJoltVec3(body.GetWorldSpaceSurfaceNormal(hit.mSubShapeID2, hitPos));
+        Vector3 normal = FromJoltVec3(-axis.Normalized());
         if (!IsWalkableNormal(normal))
             continue;
 
-        float hitY = (float)hitPos.GetY();
-        float centerY = hitY + PLAYER_HALF_HEIGHT;
-
+        const float probeCenterY = probeStart.y - castDistance * hit.mFraction;
+        const float centerY = probeCenterY + (PLAYER_HALF_HEIGHT - GROUND_PROBE_HALF_THICKNESS);
         if (!best.found || centerY > best.centerY)
         {
             best.found = true;
             best.centerY = centerY;
             best.normal = normal;
+            gGroundProbeDebug.hadHit = true;
+            gGroundProbeDebug.hitCenter = { probeStart.x, probeCenterY, probeStart.z };
+            gGroundProbeDebug.hitNormal = normal;
         }
     }
 
@@ -377,6 +408,67 @@ static bool RecoverTangentVelocity(const Vector3 *planes, int numPlanes, const V
 
     outVelocity = bestVelocity;
     return true;
+}
+
+static bool TryAirEdgeStep(JPH::PhysicsSystem *ps, Vector3 position, const Vector3 &moveVelocity, float remainingTime, Vector3 &outPosition, Vector3 &outSurfaceNormal)
+{
+    if (remainingTime <= 0.0f || moveVelocity.y <= 0.0f)
+        return false;
+
+    Vector3 horizontalDelta = Vector3Scale(moveVelocity, remainingTime);
+    horizontalDelta.y = 0.0f;
+    if (Vector3LengthSq(horizontalDelta) <= 1e-8f)
+        return false;
+
+    for (float lift = AIR_EDGE_STEP_LIFT_INCREMENT; lift <= AIR_EDGE_STEP_MAX_LIFT + 1e-4f; lift += AIR_EDGE_STEP_LIFT_INCREMENT)
+    {
+        MoveTrace upTrace = CastPlayerShape(ps, position, { 0.0f, lift, 0.0f });
+        if (upTrace.hit && upTrace.fraction < 1.0f)
+            continue;
+
+        Vector3 raisedPos = upTrace.endPos;
+        MoveTrace forwardTrace = CastPlayerShape(ps, raisedPos, horizontalDelta);
+        if (forwardTrace.startSolid)
+            continue;
+
+        // Air edge-step should only succeed if we can fully clear the lip.
+        // Partial forward hits leave us hugging the edge and cause slide/stick behavior.
+        if (forwardTrace.hit && forwardTrace.fraction < 1.0f)
+            continue;
+
+        Vector3 forwardPos = forwardTrace.endPos;
+        const float downDistance = lift + GROUND_CONTACT_DISTANCE + POSITION_EPSILON;
+        MoveTrace downTrace = CastPlayerShape(ps, forwardPos, { 0.0f, -downDistance, 0.0f });
+        if (!downTrace.hit || !IsWalkableNormal(downTrace.normal))
+            continue;
+
+        const float raisedAmount = downTrace.endPos.y - position.y;
+        if (raisedAmount < -POSITION_EPSILON || raisedAmount > AIR_EDGE_STEP_MAX_LIFT + POSITION_EPSILON)
+            continue;
+
+        Vector3 landedPos = downTrace.endPos;
+        Vector3 moveDir = horizontalDelta;
+        float moveLenSq = Vector3LengthSq(moveDir);
+        if (moveLenSq > 1e-8f)
+        {
+            moveDir = Vector3Scale(moveDir, 1.0f / sqrtf(moveLenSq));
+            MoveTrace biasTrace = CastPlayerShape(ps, landedPos, Vector3Scale(moveDir, AIR_EDGE_STEP_FORWARD_BIAS));
+            if (biasTrace.startSolid)
+                continue;
+            landedPos = biasTrace.endPos;
+        }
+
+        GroundSupport support = FindGroundSupport(ps, landedPos, GROUND_CONTACT_DISTANCE + POSITION_EPSILON);
+        if (!support.found)
+            continue;
+
+        landedPos.y = support.centerY;
+        outPosition = Vector3Add(landedPos, Vector3Scale(support.normal, POSITION_EPSILON));
+        outSurfaceNormal = support.normal;
+        return true;
+    }
+
+    return false;
 }
 
 static void PM_Friction(float dt)
@@ -539,6 +631,26 @@ static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVe
         if (!trace.hit || trace.fraction >= 1.0f)
             break;
 
+        if (preserveFallVelocityOnWalkableImpact && trace.normal.y < GROUND_NORMAL_MIN)
+        {
+            const float remainingTime = timeLeft * fmaxf(0.0f, 1.0f - trace.fraction);
+            Vector3 edgeStepPos;
+            Vector3 edgeStepNormal;
+            if (TryAirEdgeStep(ps, position, moveVelocity, remainingTime, edgeStepPos, edgeStepNormal))
+            {
+                position = edgeStepPos;
+                moveVelocity = ProjectVectorOntoPlane(moveVelocity, edgeStepNormal);
+                if (moveVelocity.y < 0.0f)
+                    moveVelocity.y = 0.0f;
+                if (landedOnWalkable)
+                    *landedOnWalkable = true;
+                timeLeft = remainingTime;
+                primalVelocity = moveVelocity;
+                numPlanes = 0;
+                continue;
+            }
+        }
+
         position = Vector3Add(position, Vector3Scale(trace.normal, POSITION_EPSILON));
 
         if (trace.fraction <= 0.0f && IsWalkableNormal(trace.normal))
@@ -677,6 +789,11 @@ void InitJoltCharacter(Player *player, JPH::PhysicsSystem *physicsSystem)
 
     if (!gPlayerShape)
         gPlayerShape = new JPH::BoxShape(JPH::Vec3(PLAYER_RADIUS, PLAYER_HALF_HEIGHT, PLAYER_RADIUS), 0.0f);
+    if (!gGroundProbeShape)
+        gGroundProbeShape = new JPH::BoxShape(
+            JPH::Vec3(PLAYER_RADIUS, GROUND_PROBE_HALF_THICKNESS, PLAYER_RADIUS),
+            0.0f
+        );
 
     ResolvePlayerPenetration(s_physics_system, player->center);
     CategorizeGround(s_physics_system, player->center, true);
@@ -832,6 +949,30 @@ void UpdateCameraTarget(Player *player)
 void DebugDrawPlayerAABB(Player *player)
 {
     Debug_WireBox(player->center, player->halfExt, C_RED);
+}
+
+void DebugDrawGroundProbe(void)
+{
+    if (!gGroundProbeDebug.valid)
+        return;
+
+    const Vector3 probeHalfExt = { PLAYER_RADIUS, GROUND_PROBE_HALF_THICKNESS, PLAYER_RADIUS };
+    const Color probeStartCol = WCOLOR(120, 180, 255, 255);
+    const Color probeEndCol = WCOLOR(70, 110, 180, 255);
+
+    Debug_WireBox(gGroundProbeDebug.startCenter, probeHalfExt, probeStartCol);
+    Debug_WireBox(gGroundProbeDebug.endCenter, probeHalfExt, probeEndCol);
+    Debug_Line(gGroundProbeDebug.startCenter, gGroundProbeDebug.endCenter, probeStartCol);
+
+    if (!gGroundProbeDebug.hadHit)
+        return;
+
+    Debug_WireBox(gGroundProbeDebug.hitCenter, probeHalfExt, C_GREEN);
+    Debug_Line(
+        gGroundProbeDebug.hitCenter,
+        Vector3Add(gGroundProbeDebug.hitCenter, Vector3Scale(gGroundProbeDebug.hitNormal, 12.0f)),
+        C_YELLOW
+    );
 }
 
 void DebugDir(Player *player)

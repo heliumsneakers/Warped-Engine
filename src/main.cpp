@@ -493,6 +493,7 @@ static void frame(void) {
                      10.0f, WCOLOR(230, 41, 55, 255));
     }
     DebugDrawPlayerAABB(&G.player);
+    DebugDrawGroundProbe();
     DebugDir(&G.player);
 
     sdtx_canvas(sapp_widthf()*0.5f, sapp_heightf()*0.5f);

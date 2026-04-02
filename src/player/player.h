@@ -37,6 +37,7 @@ void UpdatePlayer(Player *player, JPH::PhysicsSystem *s_physics_system, float de
 void UpdateCameraTarget(Player *player);
 
 void DebugDrawPlayerAABB(Player *player);
+void DebugDrawGroundProbe(void);
 void DebugDir(Player *player);
 void DebugDrawPlayerPos(const Player *player, int col, int row);
 void DebugDrawPlayerVel(int col, int row);
