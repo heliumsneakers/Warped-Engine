@@ -49,9 +49,6 @@ static constexpr float JUMP_HEIGHT = 45.0f;
 static constexpr float STEP_HEIGHT = 18.0f;
 static constexpr float GROUND_NORMAL_MIN = 0.70710677f; // cos(45 deg)
 static constexpr float SLOPE_STOP_SPEED_EPSILON = 1.0f;
-static constexpr float AIR_EDGE_STEP_MAX_LIFT = 6.0f;
-static constexpr float AIR_EDGE_STEP_LIFT_INCREMENT = 0.5f;
-static constexpr float AIR_EDGE_STEP_FORWARD_BIAS = 1.0f;
 static constexpr float GROUND_PROBE_HALF_THICKNESS = 0.1f;
 static constexpr float OVERCLIP = 1.001f;
 static constexpr float STOP_EPSILON = 0.1f;
@@ -410,67 +407,6 @@ static bool RecoverTangentVelocity(const Vector3 *planes, int numPlanes, const V
     return true;
 }
 
-static bool TryAirEdgeStep(JPH::PhysicsSystem *ps, Vector3 position, const Vector3 &moveVelocity, float remainingTime, Vector3 &outPosition, Vector3 &outSurfaceNormal)
-{
-    if (remainingTime <= 0.0f || moveVelocity.y <= 0.0f)
-        return false;
-
-    Vector3 horizontalDelta = Vector3Scale(moveVelocity, remainingTime);
-    horizontalDelta.y = 0.0f;
-    if (Vector3LengthSq(horizontalDelta) <= 1e-8f)
-        return false;
-
-    for (float lift = AIR_EDGE_STEP_LIFT_INCREMENT; lift <= AIR_EDGE_STEP_MAX_LIFT + 1e-4f; lift += AIR_EDGE_STEP_LIFT_INCREMENT)
-    {
-        MoveTrace upTrace = CastPlayerShape(ps, position, { 0.0f, lift, 0.0f });
-        if (upTrace.hit && upTrace.fraction < 1.0f)
-            continue;
-
-        Vector3 raisedPos = upTrace.endPos;
-        MoveTrace forwardTrace = CastPlayerShape(ps, raisedPos, horizontalDelta);
-        if (forwardTrace.startSolid)
-            continue;
-
-        // Air edge-step should only succeed if we can fully clear the lip.
-        // Partial forward hits leave us hugging the edge and cause slide/stick behavior.
-        if (forwardTrace.hit && forwardTrace.fraction < 1.0f)
-            continue;
-
-        Vector3 forwardPos = forwardTrace.endPos;
-        const float downDistance = lift + GROUND_CONTACT_DISTANCE + POSITION_EPSILON;
-        MoveTrace downTrace = CastPlayerShape(ps, forwardPos, { 0.0f, -downDistance, 0.0f });
-        if (!downTrace.hit || !IsWalkableNormal(downTrace.normal))
-            continue;
-
-        const float raisedAmount = downTrace.endPos.y - position.y;
-        if (raisedAmount < -POSITION_EPSILON || raisedAmount > AIR_EDGE_STEP_MAX_LIFT + POSITION_EPSILON)
-            continue;
-
-        Vector3 landedPos = downTrace.endPos;
-        Vector3 moveDir = horizontalDelta;
-        float moveLenSq = Vector3LengthSq(moveDir);
-        if (moveLenSq > 1e-8f)
-        {
-            moveDir = Vector3Scale(moveDir, 1.0f / sqrtf(moveLenSq));
-            MoveTrace biasTrace = CastPlayerShape(ps, landedPos, Vector3Scale(moveDir, AIR_EDGE_STEP_FORWARD_BIAS));
-            if (biasTrace.startSolid)
-                continue;
-            landedPos = biasTrace.endPos;
-        }
-
-        GroundSupport support = FindGroundSupport(ps, landedPos, GROUND_CONTACT_DISTANCE + POSITION_EPSILON);
-        if (!support.found)
-            continue;
-
-        landedPos.y = support.centerY;
-        outPosition = Vector3Add(landedPos, Vector3Scale(support.normal, POSITION_EPSILON));
-        outSurfaceNormal = support.normal;
-        return true;
-    }
-
-    return false;
-}
-
 static void PM_Friction(float dt)
 {
     if (!OnWalkableGround())
@@ -630,26 +566,6 @@ static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVe
 
         if (!trace.hit || trace.fraction >= 1.0f)
             break;
-
-        if (preserveFallVelocityOnWalkableImpact && trace.normal.y < GROUND_NORMAL_MIN)
-        {
-            const float remainingTime = timeLeft * fmaxf(0.0f, 1.0f - trace.fraction);
-            Vector3 edgeStepPos;
-            Vector3 edgeStepNormal;
-            if (TryAirEdgeStep(ps, position, moveVelocity, remainingTime, edgeStepPos, edgeStepNormal))
-            {
-                position = edgeStepPos;
-                moveVelocity = ProjectVectorOntoPlane(moveVelocity, edgeStepNormal);
-                if (moveVelocity.y < 0.0f)
-                    moveVelocity.y = 0.0f;
-                if (landedOnWalkable)
-                    *landedOnWalkable = true;
-                timeLeft = remainingTime;
-                primalVelocity = moveVelocity;
-                numPlanes = 0;
-                continue;
-            }
-        }
 
         position = Vector3Add(position, Vector3Scale(trace.normal, POSITION_EPSILON));
 
