@@ -406,11 +406,11 @@ static void PM_ApplyWalkableSlopeStop()
     if (!OnWalkableGround())
         return;
 
-    Vector3 groundVelocity = ProjectVectorOntoPlane(velocity, GroundNormalVector());
-    const float groundSpeed = Vector3Length(groundVelocity);
+    const float groundSpeed = Vector3Length(velocity);
     const bool hasInput = wishSpeed > 0.001f;
     const bool stopOnSlope = !hasInput && groundSpeed <= SLOPE_STOP_SPEED_EPSILON;
-    velocity = stopOnSlope ? Vector3Zero() : groundVelocity;
+    if (stopOnSlope)
+        velocity = Vector3Zero();
 }
 
 static inline void PM_BuildWish()
@@ -539,15 +539,9 @@ static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVe
         if (!trace.hit || trace.fraction >= 1.0f)
             break;
 
-        if (trace.fraction <= 0.0f && IsWalkableNormal(trace.normal) && moveVelocity.y >= 0.0f)
-        {
-            position = Vector3Add(position, Vector3Scale(trace.normal, POSITION_EPSILON));
-            continue;
-        }
-
         position = Vector3Add(position, Vector3Scale(trace.normal, POSITION_EPSILON));
 
-        if (trace.fraction <= 0.0f && IsWalkableNormal(trace.normal) && moveVelocity.y <= 0.0f)
+        if (trace.fraction <= 0.0f && IsWalkableNormal(trace.normal))
         {
             continue;
         }
