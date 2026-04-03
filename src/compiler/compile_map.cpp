@@ -11,6 +11,7 @@
 #include "../utils/asset_pack.h"
 #include "../physx/collision_data.h"
 #include "lightmap.h"
+#include "structural_bsp.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -100,39 +101,47 @@ int main(int argc, char** argv)
     if (map.entities.empty()) { fprintf(stderr,"No entities parsed.\n"); return 1; }
 
     // ----- geometry + lights ----------------------------------------------
-    std::vector<MapPolygon> polys  = BuildMapPolygons(map, /*devMode=*/false);
-    std::vector<MapPolygon> occluderPolys = BuildExteriorMapPolygons(map, /*devMode=*/false);
+    std::vector<MapPolygon> rawPolys  = BuildMapPolygons(map, /*devMode=*/false);
     std::vector<PointLight> lights = GetPointLights(map);
-
-    printf("[compile_map] baking lightmap...\n");
-    LightmapAtlas lm = BakeLightmap(polys, occluderPolys, lights);
-
-    // ----- triangulate into buckets ---------------------------------------
+    std::vector<SurfaceLightTemplate> surfaceLights = GetSurfaceLightTemplates(map);
+    LightBakeSettings lightSettings = GetLightBakeSettings(map);
     std::unordered_map<std::string,TexInfo> texCache;
     std::unordered_map<std::string,uint32_t> texIdx;
     std::vector<BSPTexture> textures;
     std::vector<PackagedAssetEntry> packagedAssets;
+
+    auto GetTex = [&](const std::string& n)->uint32_t {
+        const std::string& resolvedName = n.empty() ? std::string("default") : n;
+        auto it = texIdx.find(resolvedName);
+        if (it!=texIdx.end()) return it->second;
+        TexInfo ti = ProbeTexture(mapDir, resolvedName, texCache);
+        BSPTexture bt{}; strncpy(bt.name, resolvedName.c_str(), 63); bt.width=ti.w; bt.height=ti.h;
+        uint32_t idx=(uint32_t)textures.size(); textures.push_back(bt);
+        if (IsPackableTextureName(resolvedName)) {
+            packagedAssets.push_back({
+                "textures/" + resolvedName + ".png",
+                mapDir + "/../textures/" + resolvedName + ".png"
+            });
+        }
+        texIdx[resolvedName]=idx; return idx;
+    };
+
+    StructuralBSPData structural = BuildStructuralBSP(rawPolys, GetTex);
+    const std::vector<MapPolygon>& bspPolys =
+        structural.splitPolygons.empty() ? rawPolys : structural.splitPolygons;
+    printf("[compile_map] structural bsp: %zu raw faces -> %zu bsp faces, %zu planes, %zu nodes, %zu leaves\n",
+           rawPolys.size(), bspPolys.size(), structural.planes.size(), structural.nodes.size(), structural.leaves.size());
+
+    printf("[compile_map] baking lightmap...\n");
+    LightmapAtlas lm = BakeLightmap(bspPolys, bspPolys, lights, surfaceLights, lightSettings);
+
+    // ----- triangulate into buckets ---------------------------------------
     std::vector<BSPVertex>  vertices;
     std::vector<uint32_t>   indices;
     std::vector<BSPMesh>    meshes;
 
     struct Bucket { uint32_t firstIdx, firstVtx; uint32_t lightmapPage = 0; std::vector<BSPVertex> v; std::vector<uint32_t> i; };
     std::unordered_map<uint64_t,Bucket> buckets;
-
-    auto GetTex = [&](const std::string& n)->uint32_t {
-        auto it = texIdx.find(n);
-        if (it!=texIdx.end()) return it->second;
-        TexInfo ti = ProbeTexture(mapDir, n, texCache);
-        BSPTexture bt{}; strncpy(bt.name, n.c_str(), 63); bt.width=ti.w; bt.height=ti.h;
-        uint32_t idx=(uint32_t)textures.size(); textures.push_back(bt);
-        if (IsPackableTextureName(n)) {
-            packagedAssets.push_back({
-                "textures/" + n + ".png",
-                mapDir + "/../textures/" + n + ".png"
-            });
-        }
-        texIdx[n]=idx; return idx;
-    };
 
     for (size_t pi=0; pi<lm.patches.size(); ++pi) {
         const LightmapPatch& patch = lm.patches[pi];
@@ -243,6 +252,13 @@ int main(int argc, char** argv)
     lw.Write   (LUMP_HULL_PTS, hullPts);
     lw.WriteRaw(LUMP_ENTITIES, entText.data(), entText.size());
     lw.WriteRaw(LUMP_LIGHTMAP, lmLump.data(),  lmLump.size());
+    lw.WriteRaw(LUMP_BSP_TREE, &structural.tree, sizeof(structural.tree));
+    lw.Write   (LUMP_BSP_PLANES, structural.planes);
+    lw.Write   (LUMP_BSP_FACES, structural.faces);
+    lw.Write   (LUMP_BSP_FACE_VERTS, structural.faceVerts);
+    lw.Write   (LUMP_BSP_NODES, structural.nodes);
+    lw.Write   (LUMP_BSP_LEAVES, structural.leaves);
+    lw.Write   (LUMP_BSP_FACE_REFS, structural.faceRefs);
     lw.End();
     fclose(f);
 
@@ -255,8 +271,10 @@ int main(int argc, char** argv)
     printf("\n[compile_map] wrote %s\n", outName.c_str());
     printf("[compile_map] wrote %s\n", outPackName.c_str());
     printf("  textures : %zu\n  vertices : %zu\n  indices  : %zu\n"
-           "  meshes   : %zu\n  hulls    : %zu\n  lightmap pages : %zu\n",
+           "  meshes   : %zu\n  hulls    : %zu\n  lightmap pages : %zu\n"
+           "  bsp faces: %zu\n  bsp nodes: %zu\n  bsp leaves: %zu\n",
            textures.size(), vertices.size(), indices.size(),
-           meshes.size(), hulls.size(), lm.pages.size());
+           meshes.size(), hulls.size(), lm.pages.size(),
+           structural.faces.size(), structural.nodes.size(), structural.leaves.size());
     return 0;
 }

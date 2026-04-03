@@ -17,11 +17,9 @@
 // --------------------------------------------------------------------------
 //  Tunables
 // --------------------------------------------------------------------------
-static constexpr float DEFAULT_LUXEL_SIZE = 1.0f;   // world units per luxel
 static constexpr int   LM_PAD             = 2;      // border luxels (filled by dilate)
 static constexpr int   LIGHTMAP_PAGE_SIZE = 2048;
 static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face luxel cap (interior only)
-static constexpr float AMBIENT            = 0.12f;
 static constexpr float SHADOW_BIAS        = 0.25f;
 static constexpr float RAY_EPS            = 1e-4f;
 static constexpr float OCCLUSION_NEAR_TMIN = SHADOW_BIAS;
@@ -59,8 +57,9 @@ struct BakePatch {
     uint32_t sourcePolyIndex = 0;
 };
 
-static int ComputeInteriorLuxelSpan(float extentWorld) {
-    const float extentLuxels = std::max(0.0f, extentWorld) / DEFAULT_LUXEL_SIZE;
+static int ComputeInteriorLuxelSpan(float extentWorld, float luxelSize) {
+    const float safeLuxelSize = std::max(0.125f, luxelSize);
+    const float extentLuxels = std::max(0.0f, extentWorld) / safeLuxelSize;
     return std::max(2, (int)ceilf(std::max(0.0f, extentLuxels - 1e-4f)));
 }
 
@@ -70,6 +69,144 @@ static Vector3 LerpVec3(const Vector3& a, const Vector3& b, float t) {
         a.y + (b.y - a.y) * t,
         a.z + (b.z - a.z) * t
     };
+}
+
+static float EvaluateLightAttenuation(const PointLight& light, float dist) {
+    const float safeRadius = std::max(1e-3f, light.intensity);
+    const float linear = std::max(0.0f, 1.0f - dist / safeRadius);
+    const float normalizedDist = dist / std::max(1e-3f, safeRadius * 0.5f);
+
+    switch (light.attenuationMode) {
+        case POINT_LIGHT_ATTEN_LINEAR:
+            return linear;
+        case POINT_LIGHT_ATTEN_INVERSE:
+            return linear / (1.0f + normalizedDist);
+        case POINT_LIGHT_ATTEN_INVERSE_SQUARE:
+            return linear / (1.0f + normalizedDist * normalizedDist);
+        case POINT_LIGHT_ATTEN_NONE:
+            return 1.0f;
+        case POINT_LIGHT_ATTEN_LOCAL_MINLIGHT:
+            return std::max(0.35f, linear);
+        case POINT_LIGHT_ATTEN_INVERSE_SQUARE_B:
+            return linear / (1.0f + normalizedDist * normalizedDist * 0.5f);
+        case POINT_LIGHT_ATTEN_QUADRATIC:
+        default:
+            return linear * linear;
+    }
+}
+
+static float EvaluateIncidenceScale(const PointLight& light, float ndl) {
+    const float clampedLambert = std::max(0.0f, ndl);
+    const float t = std::clamp(light.angleScale, 0.0f, 1.0f);
+    return (1.0f - t) + t * clampedLambert;
+}
+
+static float EvaluateSpotlightFactor(const PointLight& light, const Vector3& dirToLight) {
+    if (light.spotOuterCos <= -1.5f || Vector3LengthSq(light.spotDirection) <= 1e-6f) {
+        return 1.0f;
+    }
+
+    const Vector3 lightToSurface = Vector3Scale(dirToLight, -1.0f);
+    const float spotCos = Vector3DotProduct(Vector3Normalize(light.spotDirection), lightToSurface);
+    if (spotCos <= light.spotOuterCos) {
+        return 0.0f;
+    }
+    if (light.spotInnerCos <= light.spotOuterCos) {
+        return 1.0f;
+    }
+    return std::clamp((spotCos - light.spotOuterCos) / (light.spotInnerCos - light.spotOuterCos), 0.0f, 1.0f);
+}
+
+static bool LightUsesDirt(const PointLight& light, const LightBakeSettings& settings) {
+    const int dirtSetting = (light.dirt == -2) ? settings.dirt : light.dirt;
+    return dirtSetting == 1;
+}
+
+static float EffectiveLightDirtScale(const PointLight& light, const LightBakeSettings& settings) {
+    return (light.dirtScale > 0.0f) ? light.dirtScale : settings.dirtScale;
+}
+
+static float EffectiveLightDirtGain(const PointLight& light, const LightBakeSettings& settings) {
+    return (light.dirtGain > 0.0f) ? light.dirtGain : settings.dirtGain;
+}
+
+static float DistPointSegment3D(const Vector3& p, const Vector3& a, const Vector3& b) {
+    const Vector3 ab = Vector3Subtract(b, a);
+    const float abLenSq = Vector3LengthSq(ab);
+    if (abLenSq <= 1e-8f) {
+        return sqrtf(Vector3LengthSq(Vector3Subtract(p, a)));
+    }
+    const float t = std::clamp(Vector3DotProduct(Vector3Subtract(p, a), ab) / abLenSq, 0.0f, 1.0f);
+    const Vector3 q = Vector3Add(a, Vector3Scale(ab, t));
+    return sqrtf(Vector3LengthSq(Vector3Subtract(p, q)));
+}
+
+struct PhongNeighbor {
+    uint32_t sourcePolyIndex = 0;
+    Vector3 edgeA{};
+    Vector3 edgeB{};
+    Vector3 normal{};
+    float areaWeight = 1.0f;
+};
+
+struct PhongSourcePoly {
+    bool enabled = false;
+    Vector3 normal{};
+    float areaWeight = 1.0f;
+    std::vector<PhongNeighbor> neighbors;
+};
+
+static uint32_t HashLightSeed(const Vector3& position, int extra) {
+    auto h = [](float v) -> uint32_t {
+        return (uint32_t)std::lround(v * 1000.0f);
+    };
+    uint32_t seed = 2166136261u;
+    seed = (seed ^ h(position.x)) * 16777619u;
+    seed = (seed ^ h(position.y)) * 16777619u;
+    seed = (seed ^ h(position.z)) * 16777619u;
+    seed = (seed ^ (uint32_t)extra) * 16777619u;
+    return seed ? seed : 1u;
+}
+
+static float RandomFloat01(uint32_t& state) {
+    state = state * 1664525u + 1013904223u;
+    return (float)(state & 0x00FFFFFFu) / (float)0x01000000u;
+}
+
+static Vector3 RandomPointInUnitSphere(uint32_t& state) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const Vector3 p = {
+            RandomFloat01(state) * 2.0f - 1.0f,
+            RandomFloat01(state) * 2.0f - 1.0f,
+            RandomFloat01(state) * 2.0f - 1.0f
+        };
+        if (Vector3LengthSq(p) <= 1.0f) {
+            return p;
+        }
+    }
+    return {0.0f, 0.0f, 0.0f};
+}
+
+static void AppendDeviatedLights(const PointLight& baseLight,
+                                 float deviance,
+                                 int samples,
+                                 int seedSalt,
+                                 std::vector<PointLight>& out)
+{
+    if (deviance <= 0.0f || samples <= 1) {
+        out.push_back(baseLight);
+        return;
+    }
+
+    const int safeSamples = std::max(1, samples);
+    const Vector3 sampleColor = Vector3Scale(baseLight.color, 1.0f / (float)safeSamples);
+    uint32_t seed = HashLightSeed(baseLight.position, seedSalt);
+    for (int i = 0; i < safeSamples; ++i) {
+        PointLight split = baseLight;
+        split.position = Vector3Add(baseLight.position, Vector3Scale(RandomPointInUnitSphere(seed), deviance));
+        split.color = sampleColor;
+        out.push_back(split);
+    }
 }
 
 static void RemoveConsecutiveDuplicates(std::vector<LocalPolyVert>& poly) {
@@ -151,6 +288,150 @@ static Vector3 PolygonCentroid(const std::vector<Vector3>& verts) {
     return Vector3Scale(centroid, 1.0f / (float)verts.size());
 }
 
+static bool PointsEqualEps(const Vector3& a, const Vector3& b, float eps) {
+    return fabsf(a.x - b.x) <= eps &&
+           fabsf(a.y - b.y) <= eps &&
+           fabsf(a.z - b.z) <= eps;
+}
+
+static std::string MakeQuantizedPointKey(const Vector3& p, float eps) {
+    const float inv = 1.0f / std::max(1e-6f, eps);
+    const int x = (int)std::lround(p.x * inv);
+    const int y = (int)std::lround(p.y * inv);
+    const int z = (int)std::lround(p.z * inv);
+    char buffer[96];
+    snprintf(buffer, sizeof(buffer), "%d,%d,%d", x, y, z);
+    return std::string(buffer);
+}
+
+static std::string MakeQuantizedEdgeKey(const Vector3& a, const Vector3& b, float eps) {
+    std::string ka = MakeQuantizedPointKey(a, eps);
+    std::string kb = MakeQuantizedPointKey(b, eps);
+    if (kb < ka) {
+        std::swap(ka, kb);
+    }
+    return ka + "|" + kb;
+}
+
+struct EdgeRef {
+    uint32_t sourcePolyIndex = 0;
+    Vector3 start{};
+    Vector3 end{};
+};
+
+static bool PhongGroupsCompatible(const MapPolygon& a, const MapPolygon& b) {
+    if (a.sourceEntityId != b.sourceEntityId) {
+        return false;
+    }
+    if (a.phongGroup == 0 && b.phongGroup == 0) {
+        return true;
+    }
+    return a.phongGroup != 0 && a.phongGroup == b.phongGroup;
+}
+
+static bool IsConcaveJoint(const MapPolygon& a, const MapPolygon& b) {
+    const Vector3 ca = PolygonCentroid(a.verts);
+    const Vector3 cb = PolygonCentroid(b.verts);
+    return Vector3DotProduct(a.normal, Vector3Subtract(cb, ca)) > 1e-3f ||
+           Vector3DotProduct(b.normal, Vector3Subtract(ca, cb)) > 1e-3f;
+}
+
+static std::vector<PhongSourcePoly> BuildPhongSourcePolys(const std::vector<MapPolygon>& polys) {
+    std::vector<PhongSourcePoly> sourcePolys(polys.size());
+    constexpr float kEdgeKeyEpsilon = 0.05f;
+    std::unordered_map<std::string, std::vector<EdgeRef>> edgesByKey;
+    edgesByKey.reserve(polys.size() * 4);
+
+    for (size_t i = 0; i < polys.size(); ++i) {
+        const MapPolygon& poly = polys[i];
+        sourcePolys[i].enabled = poly.phong != 0;
+        sourcePolys[i].normal = poly.normal;
+        sourcePolys[i].areaWeight = std::max(1.0f, sqrtf(std::max(1.0f, PolygonArea(poly.verts))));
+        if (!sourcePolys[i].enabled || poly.verts.size() < 3) {
+            continue;
+        }
+        for (size_t vi = 0; vi < poly.verts.size(); ++vi) {
+            const Vector3& a = poly.verts[vi];
+            const Vector3& b = poly.verts[(vi + 1) % poly.verts.size()];
+            edgesByKey[MakeQuantizedEdgeKey(a, b, kEdgeKeyEpsilon)].push_back({ (uint32_t)i, a, b });
+        }
+    }
+
+    for (const auto& [key, refs] : edgesByKey) {
+        (void)key;
+        if (refs.size() < 2) {
+            continue;
+        }
+        for (size_t i = 0; i < refs.size(); ++i) {
+            const MapPolygon& a = polys[refs[i].sourcePolyIndex];
+            if (!a.phong) {
+                continue;
+            }
+            for (size_t j = i + 1; j < refs.size(); ++j) {
+                const MapPolygon& b = polys[refs[j].sourcePolyIndex];
+                if (!b.phong || !PhongGroupsCompatible(a, b)) {
+                    continue;
+                }
+
+                const float dotNormals = std::clamp(Vector3DotProduct(a.normal, b.normal), -1.0f, 1.0f);
+                const float angleDeg = acosf(dotNormals) * RAD2DEG;
+                const bool concave = IsConcaveJoint(a, b);
+                const float aLimit = (concave && a.phongAngleConcave > 0.0f) ? a.phongAngleConcave : a.phongAngle;
+                const float bLimit = (concave && b.phongAngleConcave > 0.0f) ? b.phongAngleConcave : b.phongAngle;
+                if (angleDeg > std::min(aLimit, bLimit)) {
+                    continue;
+                }
+
+                const Vector3 edgeA = refs[i].start;
+                const Vector3 edgeB = refs[i].end;
+                sourcePolys[refs[i].sourcePolyIndex].neighbors.push_back({
+                    refs[j].sourcePolyIndex,
+                    edgeA,
+                    edgeB,
+                    b.normal,
+                    sourcePolys[refs[j].sourcePolyIndex].areaWeight
+                });
+                sourcePolys[refs[j].sourcePolyIndex].neighbors.push_back({
+                    refs[i].sourcePolyIndex,
+                    refs[j].start,
+                    refs[j].end,
+                    a.normal,
+                    sourcePolys[refs[i].sourcePolyIndex].areaWeight
+                });
+            }
+        }
+    }
+
+    return sourcePolys;
+}
+
+static Vector3 EvaluatePhongNormal(const std::vector<PhongSourcePoly>& sourcePolys,
+                                   uint32_t sourcePolyIndex,
+                                   const Vector3& samplePoint,
+                                   float luxelSize)
+{
+    if (sourcePolyIndex >= sourcePolys.size()) {
+        return Vector3Zero();
+    }
+    const PhongSourcePoly& source = sourcePolys[sourcePolyIndex];
+    if (!source.enabled || source.neighbors.empty()) {
+        return source.normal;
+    }
+
+    Vector3 accum = Vector3Scale(source.normal, source.areaWeight * 2.0f);
+    const float distanceBias = std::max(0.25f, luxelSize);
+    for (const PhongNeighbor& neighbor : source.neighbors) {
+        const float dist = DistPointSegment3D(samplePoint, neighbor.edgeA, neighbor.edgeB);
+        const float weight = neighbor.areaWeight / std::max(distanceBias, dist);
+        accum = Vector3Add(accum, Vector3Scale(neighbor.normal, weight));
+    }
+
+    if (Vector3LengthSq(accum) <= 1e-8f) {
+        return source.normal;
+    }
+    return Vector3Normalize(accum);
+}
+
 template <typename InsideFn, typename IntersectFn>
 static std::vector<LocalPolyVert> ClipLocalPolygon(const std::vector<LocalPolyVert>& input,
                                                    InsideFn inside,
@@ -221,7 +502,8 @@ static std::vector<LocalPolyVert> ClipToRect(const std::vector<LocalPolyVert>& p
 }
 
 static std::vector<BakePatch> SubdivideLightmappedPolygon(const MapPolygon& poly,
-                                                          uint32_t sourcePolyIndex) {
+                                                          uint32_t sourcePolyIndex,
+                                                          float luxelSize) {
     if (poly.verts.size() < 3) {
         return {};
     }
@@ -242,7 +524,8 @@ static std::vector<BakePatch> SubdivideLightmappedPolygon(const MapPolygon& poly
         minV = std::min(minV, v); maxV = std::max(maxV, v);
     }
 
-    const float tileExtent = FACE_MAX_LUXELS * DEFAULT_LUXEL_SIZE;
+    const float safeLuxelSize = std::max(0.125f, luxelSize);
+    const float tileExtent = FACE_MAX_LUXELS * safeLuxelSize;
     const float startU = floorf(minU / tileExtent) * tileExtent;
     const float startV = floorf(minV / tileExtent) * tileExtent;
     const int tilesU = std::max(1, (int)ceilf((maxU - startU) / tileExtent));
@@ -295,13 +578,14 @@ static std::vector<BakePatch> SubdivideLightmappedPolygon(const MapPolygon& poly
     return out;
 }
 
-static std::vector<BakePatch> SubdivideLightmappedPolygons(const std::vector<MapPolygon>& polys) {
+static std::vector<BakePatch> SubdivideLightmappedPolygons(const std::vector<MapPolygon>& polys,
+                                                           float luxelSize) {
     std::vector<BakePatch> out;
     out.reserve(polys.size());
 
     for (size_t i = 0; i < polys.size(); ++i) {
         const MapPolygon& poly = polys[i];
-        std::vector<BakePatch> parts = SubdivideLightmappedPolygon(poly, (uint32_t)i);
+        std::vector<BakePatch> parts = SubdivideLightmappedPolygon(poly, (uint32_t)i, luxelSize);
         out.insert(out.end(),
                    std::make_move_iterator(parts.begin()),
                    std::make_move_iterator(parts.end()));
@@ -346,6 +630,13 @@ struct OccluderSet {
     std::vector<LightmapComputeOccluderTri> tris;
 };
 
+struct SurfaceVisibilityInfo {
+    std::vector<uint8_t> hidden;
+    std::vector<uint8_t> emitterOnly;
+    int hiddenCount = 0;
+    int emitterOnlyCount = 0;
+};
+
 struct BrushSolidPlane {
     Vector3 point{};
     Vector3 normal{};
@@ -386,8 +677,10 @@ static bool PointInsideBrushSolid(const BrushSolid& solid, const Vector3& point,
     return !solid.planes.empty();
 }
 
-static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
-    OccluderSet o;
+static SurfaceVisibilityInfo AnalyzeSurfaceVisibility(const std::vector<MapPolygon>& polys) {
+    SurfaceVisibilityInfo info;
+    info.hidden.assign(polys.size(), 0);
+    info.emitterOnly.assign(polys.size(), 0);
     const std::vector<BrushSolid> solids = BuildBrushSolids(polys);
     auto polygonCentroid = [](const MapPolygon& poly) {
         Vector3 centroid = Vector3Zero();
@@ -429,16 +722,14 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
         return Vector3Scale(Vector3Add(a, b), 0.5f);
     };
 
-    std::vector<uint8_t> hidden(polys.size(), 0);
-    std::vector<uint8_t> emitterOnly(polys.size(), 0);
     for (size_t i = 0; i < polys.size(); ++i) {
         if (polys[i].occluderGroup >= 0) {
-            emitterOnly[i] = 1;
+            info.emitterOnly[i] = 1;
         }
     }
     for (size_t i = 0; i < polys.size(); ++i) {
         const MapPolygon& poly = polys[i];
-        if (emitterOnly[i]) {
+        if (info.emitterOnly[i]) {
             continue;
         }
         const Vector3 centroid = polygonCentroid(poly);
@@ -503,7 +794,7 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
         }
 
         if (allInsideOtherSolid) {
-            hidden[i] = 1;
+            info.hidden[i] = 1;
             continue;
         }
 
@@ -543,7 +834,7 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
         }
 
         if (allCovered) {
-            hidden[i] = 1;
+            info.hidden[i] = 1;
             continue;
         }
 
@@ -568,21 +859,45 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
 
             const Vector3 projected = Vector3Subtract(frontSample, Vector3Scale(other.normal, frontPlaneDist));
             if (pointInsidePolygonProjected(other, projected)) {
-                hidden[i] = 1;
+                info.hidden[i] = 1;
                 break;
             }
         }
     }
 
-    int hiddenCount = 0;
-    int emitterOnlyCount = 0;
     for (size_t i = 0; i < polys.size(); ++i) {
-        if (emitterOnly[i]) {
-            ++emitterOnlyCount;
+        if (info.emitterOnly[i]) {
+            ++info.emitterOnlyCount;
+        }
+        if (info.hidden[i]) {
+            ++info.hiddenCount;
+        }
+    }
+    return info;
+}
+
+static std::vector<MapPolygon> FilterVisibleBakePolygons(const std::vector<MapPolygon>& polys,
+                                                         const SurfaceVisibilityInfo& visibility)
+{
+    std::vector<MapPolygon> visible;
+    visible.reserve(polys.size());
+    for (size_t i = 0; i < polys.size(); ++i) {
+        if (i < visibility.hidden.size() && visibility.hidden[i]) {
             continue;
         }
-        if (hidden[i]) {
-            ++hiddenCount;
+        visible.push_back(polys[i]);
+    }
+    return visible;
+}
+
+static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
+    OccluderSet o;
+    const SurfaceVisibilityInfo visibility = AnalyzeSurfaceVisibility(polys);
+    for (size_t i = 0; i < polys.size(); ++i) {
+        if (visibility.emitterOnly[i]) {
+            continue;
+        }
+        if (visibility.hidden[i]) {
             continue;
         }
         const MapPolygon& p = polys[i];
@@ -599,11 +914,11 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
             o.tris.push_back(tr);
         }
     }
-    if (hiddenCount > 0) {
-        printf("[Lightmap] skipped %d hidden/internal brush faces from occluders.\n", hiddenCount);
+    if (visibility.hiddenCount > 0) {
+        printf("[Lightmap] skipped %d hidden/internal brush faces from occluders.\n", visibility.hiddenCount);
     }
-    if (emitterOnlyCount > 0) {
-        printf("[Lightmap] skipped %d light brush faces from occluders.\n", emitterOnlyCount);
+    if (visibility.emitterOnlyCount > 0) {
+        printf("[Lightmap] skipped %d light brush faces from occluders.\n", visibility.emitterOnlyCount);
     }
     return o;
 }
@@ -712,6 +1027,8 @@ struct FaceRect {
     uint32_t sourcePolyIndex = 0;
     float maxU = 0.0f;
     float maxV = 0.0f;
+    bool computeCompatible = true;
+    std::string computeFallbackReason;
 };
 
 struct LightmapPageLayout {
@@ -738,8 +1055,11 @@ static float DistSqPointAABB(const Vector3& p, const AABB& bounds) {
 }
 
 static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patches,
-                                            const std::vector<PointLight>& lights) {
+                                            const std::vector<PointLight>& lights,
+                                            const std::vector<PhongSourcePoly>& sourcePhongs,
+                                            float luxelSize) {
     std::vector<FaceRect> rects(patches.size());
+    const float safeLuxelSize = std::max(0.125f, luxelSize);
     for (size_t i = 0; i < patches.size(); ++i) {
         const MapPolygon& p = patches[i].poly;
         Vector3 U, V;
@@ -755,11 +1075,11 @@ static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patche
             AABBExtend(&r.bounds, vv);
         }
 
-        const int interiorW = ComputeInteriorLuxelSpan(maxU - minU);
-        const int interiorH = ComputeInteriorLuxelSpan(maxV - minV);
+        const int interiorW = ComputeInteriorLuxelSpan(maxU - minU, safeLuxelSize);
+        const int interiorH = ComputeInteriorLuxelSpan(maxV - minV, safeLuxelSize);
         r.gpu.w = interiorW + LM_PAD * 2;
         r.gpu.h = interiorH + LM_PAD * 2;
-        r.gpu.luxelSize = DEFAULT_LUXEL_SIZE;
+        r.gpu.luxelSize = safeLuxelSize;
         r.gpu.minU = minU;
         r.gpu.minV = minV;
         r.gpu.axisU = U;
@@ -768,6 +1088,32 @@ static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patche
         r.sourcePolyIndex = patches[i].sourcePolyIndex;
         r.maxU = maxU;
         r.maxV = maxV;
+        if (r.sourcePolyIndex < sourcePhongs.size()) {
+            const PhongSourcePoly& source = sourcePhongs[r.sourcePolyIndex];
+            r.gpu.phongBaseNormal = source.normal;
+            r.gpu.phongBaseAreaWeight = source.areaWeight;
+            if (source.neighbors.size() > LIGHTMAP_COMPUTE_MAX_PHONG_NEIGHBORS) {
+                r.computeCompatible = false;
+                r.computeFallbackReason = "page uses phong smoothing with too many neighboring faces for the compute baker";
+            } else {
+                r.gpu.phongNeighborCount = (int)source.neighbors.size();
+                for (int neighborIndex = 0; neighborIndex < r.gpu.phongNeighborCount; ++neighborIndex) {
+                    const PhongNeighbor& neighbor = source.neighbors[(size_t)neighborIndex];
+                    r.gpu.phongNeighborEdgeA[neighborIndex][0] = neighbor.edgeA.x;
+                    r.gpu.phongNeighborEdgeA[neighborIndex][1] = neighbor.edgeA.y;
+                    r.gpu.phongNeighborEdgeA[neighborIndex][2] = neighbor.edgeA.z;
+                    r.gpu.phongNeighborEdgeA[neighborIndex][3] = 0.0f;
+                    r.gpu.phongNeighborEdgeB[neighborIndex][0] = neighbor.edgeB.x;
+                    r.gpu.phongNeighborEdgeB[neighborIndex][1] = neighbor.edgeB.y;
+                    r.gpu.phongNeighborEdgeB[neighborIndex][2] = neighbor.edgeB.z;
+                    r.gpu.phongNeighborEdgeB[neighborIndex][3] = 0.0f;
+                    r.gpu.phongNeighborNormalWeight[neighborIndex][0] = neighbor.normal.x;
+                    r.gpu.phongNeighborNormalWeight[neighborIndex][1] = neighbor.normal.y;
+                    r.gpu.phongNeighborNormalWeight[neighborIndex][2] = neighbor.normal.z;
+                    r.gpu.phongNeighborNormalWeight[neighborIndex][3] = neighbor.areaWeight;
+                }
+            }
+        }
         const float d = Vector3DotProduct(p.verts[0], p.normal);
         r.gpu.origin = Vector3Add(
             Vector3Scale(p.normal, d),
@@ -775,12 +1121,13 @@ static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patche
         r.poly2d.reserve(p.verts.size());
         for (const Vector3& vv : p.verts) {
             r.poly2d.push_back({
-                (Vector3DotProduct(vv, U) - minU) / DEFAULT_LUXEL_SIZE,
-                (Vector3DotProduct(vv, V) - minV) / DEFAULT_LUXEL_SIZE
+                (Vector3DotProduct(vv, U) - minU) / safeLuxelSize,
+                (Vector3DotProduct(vv, V) - minV) / safeLuxelSize
             });
         }
         if (r.poly2d.size() > LIGHTMAP_COMPUTE_MAX_POLY_VERTS) {
-            r.gpu.polyCount = -1;
+            r.computeCompatible = false;
+            r.computeFallbackReason = "page contains polygon(s) exceeding compute vertex limit";
             printf("[Lightmap] compute polygon vertex limit exceeded (%zu > %d), page will use CPU fallback.\n",
                    r.poly2d.size(), LIGHTMAP_COMPUTE_MAX_POLY_VERTS);
         } else {
@@ -964,9 +1311,10 @@ static size_t WeldHorizontalSiblingSeam(const FaceRect& bottom,
 
 static size_t WeldSiblingPatchSeams(const std::vector<FaceRect>& rects,
                                     std::vector<LightmapPage>& pages,
-                                    const std::vector<std::vector<uint8_t>>& coverageMasks)
+                                    const std::vector<std::vector<uint8_t>>& coverageMasks,
+                                    float luxelSize)
 {
-    static constexpr float kSeamCoordEpsilon = DEFAULT_LUXEL_SIZE * 0.05f;
+    const float kSeamCoordEpsilon = std::max(0.125f, luxelSize) * 0.05f;
 
     std::unordered_map<uint32_t, std::vector<size_t>> rectsBySourcePoly;
     rectsBySourcePoly.reserve(rects.size());
@@ -1360,13 +1708,201 @@ static std::vector<PointLight> GatherPageLights(const std::vector<FaceRect>& rec
     return pageLights;
 }
 
+static AABB ComputeMapBounds(const std::vector<MapPolygon>& polys) {
+    AABB bounds = AABBInvalid();
+    for (const MapPolygon& poly : polys) {
+        for (const Vector3& vert : poly.verts) {
+            AABBExtend(&bounds, vert);
+        }
+    }
+    if (bounds.min.x > bounds.max.x || bounds.min.y > bounds.max.y || bounds.min.z > bounds.max.z) {
+        bounds.min = Vector3Zero();
+        bounds.max = Vector3Zero();
+    }
+    return bounds;
+}
+
+static Vector3 SampleConeDirection(const Vector3& axis, float coneAngleDeg, int sampleIndex, int sampleCount) {
+    const Vector3 dirAxis = Vector3Normalize(axis);
+    if (sampleCount <= 1 || coneAngleDeg <= 1e-3f) {
+        return dirAxis;
+    }
+
+    Vector3 tangent{};
+    Vector3 bitangent{};
+    FaceBasis(dirAxis, tangent, bitangent);
+    const float u1 = ((float)sampleIndex + 0.5f) / (float)sampleCount;
+    const float u2 = fmodf(((float)sampleIndex + 0.5f) * 0.61803398875f, 1.0f);
+    const float cosMax = cosf(std::clamp(coneAngleDeg * 0.5f, 0.0f, 89.0f) * DEG2RAD);
+    const float cosTheta = 1.0f - u1 * (1.0f - cosMax);
+    const float sinTheta = sqrtf(std::max(0.0f, 1.0f - cosTheta * cosTheta));
+    const float phi = u2 * PI * 2.0f;
+    const Vector3 radial = Vector3Add(Vector3Scale(tangent, cosf(phi)), Vector3Scale(bitangent, sinf(phi)));
+    return Vector3Normalize(Vector3Add(Vector3Scale(dirAxis, cosTheta), Vector3Scale(radial, sinTheta)));
+}
+
+static Vector3 SampleHemisphereDirection(const Vector3& axis, int sampleIndex, int sampleCount) {
+    const Vector3 dirAxis = Vector3Normalize(axis);
+    Vector3 tangent{};
+    Vector3 bitangent{};
+    FaceBasis(dirAxis, tangent, bitangent);
+    const float u1 = ((float)sampleIndex + 0.5f) / (float)std::max(1, sampleCount);
+    const float u2 = fmodf(((float)sampleIndex + 0.5f) * 0.61803398875f, 1.0f);
+    const float cosTheta = sqrtf(std::max(0.0f, 1.0f - u1));
+    const float sinTheta = sqrtf(std::max(0.0f, 1.0f - cosTheta * cosTheta));
+    const float phi = u2 * PI * 2.0f;
+    const Vector3 radial = Vector3Add(Vector3Scale(tangent, cosf(phi)), Vector3Scale(bitangent, sinf(phi)));
+    return Vector3Normalize(Vector3Add(Vector3Scale(dirAxis, cosTheta), Vector3Scale(radial, sinTheta)));
+}
+
+static PointLight BuildDirectionalSunLight(const Vector3& toLightDirection,
+                                           const Vector3& color,
+                                           float angleScale,
+                                           int dirtOverride,
+                                           const Vector3& mapCenter,
+                                           float sunDistance)
+{
+    PointLight light{};
+    light.position = Vector3Add(mapCenter, Vector3Scale(Vector3Normalize(toLightDirection), sunDistance));
+    light.color = color;
+    light.intensity = std::max(1.0f, sunDistance * 2.0f);
+    light.attenuationMode = POINT_LIGHT_ATTEN_NONE;
+    light.angleScale = angleScale;
+    light.dirt = (int8_t)dirtOverride;
+    return light;
+}
+
+static std::vector<Vector3> GenerateSurfaceEmitterSamples(const MapPolygon& poly,
+                                                          float sampleSpacing,
+                                                          float offsetAlongNormal)
+{
+    Vector3 axisU{};
+    Vector3 axisV{};
+    FaceBasis(poly.normal, axisU, axisV);
+
+    float minU = 1e30f, maxU = -1e30f, minV = 1e30f, maxV = -1e30f;
+    std::vector<Vector2> poly2d;
+    poly2d.reserve(poly.verts.size());
+    const Vector3 anchor = poly.verts[0];
+    const float anchorU = Vector3DotProduct(anchor, axisU);
+    const float anchorV = Vector3DotProduct(anchor, axisV);
+    for (const Vector3& vert : poly.verts) {
+        const float u = Vector3DotProduct(vert, axisU);
+        const float v = Vector3DotProduct(vert, axisV);
+        minU = std::min(minU, u);
+        maxU = std::max(maxU, u);
+        minV = std::min(minV, v);
+        maxV = std::max(maxV, v);
+        poly2d.push_back({u, v});
+    }
+
+    const float safeSpacing = std::max(16.0f, sampleSpacing);
+    const float extentU = std::max(0.0f, maxU - minU);
+    const float extentV = std::max(0.0f, maxV - minV);
+    const int samplesU = std::max(1, std::min(32, (int)ceilf(extentU / safeSpacing)));
+    const int samplesV = std::max(1, std::min(32, (int)ceilf(extentV / safeSpacing)));
+    const float stepU = (samplesU > 0) ? (extentU / (float)samplesU) : 0.0f;
+    const float stepV = (samplesV > 0) ? (extentV / (float)samplesV) : 0.0f;
+
+    std::vector<Vector3> samples;
+    samples.reserve((size_t)samplesU * (size_t)samplesV);
+    for (int y = 0; y < samplesV; ++y) {
+        for (int x = 0; x < samplesU; ++x) {
+            const float u = minU + ((float)x + 0.5f) * stepU;
+            const float v = minV + ((float)y + 0.5f) * stepV;
+            if (!InsidePoly2D(poly2d, u, v)) {
+                continue;
+            }
+            Vector3 p = anchor;
+            p = Vector3Add(p, Vector3Scale(axisU, u - anchorU));
+            p = Vector3Add(p, Vector3Scale(axisV, v - anchorV));
+            p = Vector3Add(p, Vector3Scale(poly.normal, offsetAlongNormal));
+            samples.push_back(p);
+        }
+    }
+
+    if (samples.empty()) {
+        samples.push_back(Vector3Add(PolygonCentroid(poly.verts), Vector3Scale(poly.normal, offsetAlongNormal)));
+    }
+    return samples;
+}
+
+static std::vector<PointLight> BuildExpandedLights(const std::vector<MapPolygon>& polys,
+                                                   const std::vector<PointLight>& explicitLights,
+                                                   const std::vector<SurfaceLightTemplate>& surfaceLights,
+                                                   const LightBakeSettings& settings)
+{
+    std::vector<PointLight> lights = explicitLights;
+    const AABB bounds = ComputeMapBounds(polys);
+    const Vector3 mapCenter = Vector3Scale(Vector3Add(bounds.min, bounds.max), 0.5f);
+    const float sunDistance = std::max(2048.0f, sqrtf(Vector3LengthSq(Vector3Subtract(bounds.max, bounds.min))) * 2.0f + 1024.0f);
+
+    if (settings.sunlightIntensity > 0.0f) {
+        const int sunSamples = (settings.sunlightPenumbra > 0.1f) ? 16 : 1;
+        const Vector3 sampleColor = Vector3Scale(settings.sunlightColor, settings.sunlightIntensity / (300.0f * (float)sunSamples));
+        const int dirtOverride = (settings.sunlightDirt == -2) ? settings.dirt : settings.sunlightDirt;
+        for (int i = 0; i < sunSamples; ++i) {
+            const Vector3 toLight = SampleConeDirection(settings.sunlightDirection, settings.sunlightPenumbra, i, sunSamples);
+            lights.push_back(BuildDirectionalSunLight(toLight, sampleColor, settings.sunlightAngleScale, dirtOverride, mapCenter, sunDistance));
+        }
+    }
+
+    auto appendHemisphere = [&](float intensity, const Vector3& color, const Vector3& axis, int dirtOverride) {
+        if (intensity <= 0.0f) {
+            return;
+        }
+        const int domeSamples = 24;
+        const Vector3 sampleColor = Vector3Scale(color, intensity / (300.0f * (float)domeSamples));
+        for (int i = 0; i < domeSamples; ++i) {
+            const Vector3 toLight = SampleHemisphereDirection(axis, i, domeSamples);
+            lights.push_back(BuildDirectionalSunLight(toLight, sampleColor, settings.sunlightAngleScale, dirtOverride, mapCenter, sunDistance));
+        }
+    };
+    const int skyDirtOverride = (settings.sunlight2Dirt == -2) ? settings.dirt : settings.sunlight2Dirt;
+    appendHemisphere(settings.sunlight2Intensity, settings.sunlight2Color, {0.0f, 1.0f, 0.0f}, skyDirtOverride);
+    appendHemisphere(settings.sunlight3Intensity, settings.sunlight3Color, {0.0f, -1.0f, 0.0f}, skyDirtOverride);
+
+    int surfaceTemplateMatches = 0;
+    for (const SurfaceLightTemplate& templ : surfaceLights) {
+        for (const MapPolygon& poly : polys) {
+            if (poly.texture != templ.texture) {
+                continue;
+            }
+            if (templ.surfaceLightGroup != 0 && poly.surfaceLightGroup != templ.surfaceLightGroup) {
+                continue;
+            }
+
+            const std::vector<Vector3> samples = GenerateSurfaceEmitterSamples(poly, 128.0f, std::max(0.0f, templ.surfaceOffset));
+            for (const Vector3& samplePos : samples) {
+                PointLight emitted = templ.light;
+                emitted.position = samplePos;
+                if (templ.surfaceSpotlight) {
+                    emitted.spotDirection = poly.normal;
+                    if (emitted.spotOuterCos <= -1.5f) {
+                        emitted.spotOuterCos = cosf(20.0f * DEG2RAD);
+                        emitted.spotInnerCos = emitted.spotOuterCos;
+                    }
+                }
+                AppendDeviatedLights(emitted, templ.deviance, templ.devianceSamples, ++surfaceTemplateMatches, lights);
+            }
+        }
+    }
+
+    if (!surfaceLights.empty()) {
+        printf("[Lightmap] expanded %zu surface-light templates into %zu total lights.\n", surfaceLights.size(), lights.size());
+        fflush(stdout);
+    }
+    return lights;
+}
+
 static bool IsLightBrushTextureName(const std::string& name) {
     return name.rfind("__light_brush_", 0) == 0;
 }
 
 static Vector3 AverageRectLighting(const LightmapPage& page,
                                    const FaceRect& rect,
-                                   const std::vector<uint8_t>& coverage)
+                                   const std::vector<uint8_t>& coverage,
+                                   const Vector3& ambientColor)
 {
     const size_t pixelCount = (size_t)page.width * (size_t)page.height;
     if (coverage.size() < pixelCount || page.pixels.size() < pixelCount * 4) {
@@ -1405,18 +1941,23 @@ static Vector3 AverageRectLighting(const LightmapPage& page,
     } else if (validCount > 0) {
         avg = Vector3Scale(validAccum, 1.0f / (float)validCount);
     }
-    avg.x = std::max(0.0f, avg.x - AMBIENT);
-    avg.y = std::max(0.0f, avg.y - AMBIENT);
-    avg.z = std::max(0.0f, avg.z - AMBIENT);
+    avg.x = std::max(0.0f, avg.x - ambientColor.x);
+    avg.y = std::max(0.0f, avg.y - ambientColor.y);
+    avg.z = std::max(0.0f, avg.z - ambientColor.z);
     return avg;
 }
 
 static std::vector<PointLight> BuildIndirectBounceLights(const std::vector<BakePatch>& patches,
                                                          const std::vector<FaceRect>& rects,
                                                          const std::vector<LightmapPage>& pages,
-                                                         const std::vector<std::vector<uint8_t>>& coverageMasks)
+                                                         const std::vector<std::vector<uint8_t>>& coverageMasks,
+                                                         const Vector3& ambientColor,
+                                                         float bounceScale)
 {
     std::vector<PointLight> bounceLights;
+    if (bounceScale <= 0.0f) {
+        return bounceLights;
+    }
     bounceLights.reserve(patches.size());
     for (size_t i = 0; i < patches.size(); ++i) {
         const BakePatch& patch = patches[i];
@@ -1428,7 +1969,7 @@ static std::vector<PointLight> BuildIndirectBounceLights(const std::vector<BakeP
             continue;
         }
 
-        const Vector3 avgDirect = AverageRectLighting(pages[rect.page], rect, coverageMasks[rect.page]);
+        const Vector3 avgDirect = AverageRectLighting(pages[rect.page], rect, coverageMasks[rect.page], ambientColor);
         const float maxChannel = std::max(avgDirect.x, std::max(avgDirect.y, avgDirect.z));
         if (maxChannel < INDIRECT_BOUNCE_THRESHOLD) {
             continue;
@@ -1442,11 +1983,13 @@ static std::vector<PointLight> BuildIndirectBounceLights(const std::vector<BakeP
 
         PointLight bounce{};
         bounce.position = Vector3Add(PolygonCentroid(patch.poly.verts), Vector3Scale(patch.poly.normal, 1.0f));
-        bounce.color = Vector3Scale(avgDirect, INDIRECT_BOUNCE_REFLECTANCE);
+        bounce.color = Vector3Scale(avgDirect, INDIRECT_BOUNCE_REFLECTANCE * bounceScale);
         bounce.intensity = radius;
         bounce.emissionNormal = patch.poly.normal;
         bounce.directional = 1;
         bounce.ignoreOccluderGroup = -1;
+        bounce.attenuationMode = POINT_LIGHT_ATTEN_QUADRATIC;
+        bounce.dirt = -1;
         bounceLights.push_back(bounce);
     }
     return bounceLights;
@@ -1472,13 +2015,64 @@ static void AddPagePixels(LightmapPage& dst, const LightmapPage& src) {
     }
 }
 
+static float ComputeDirtAttenuation(float occlusionRatio, float dirtScale, float dirtGain) {
+    const float scaled = std::clamp(occlusionRatio * std::max(0.0f, dirtScale), 0.0f, 1.0f);
+    const float gained = powf(scaled, std::max(0.01f, dirtGain));
+    return std::clamp(1.0f - gained, 0.0f, 1.0f);
+}
+
+static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
+                                       const Vector3& samplePoint,
+                                       const Vector3& sampleNormal,
+                                       const LightBakeSettings& settings)
+{
+    const int rayCount = 16;
+    const bool randomized = settings.dirtMode != 0;
+    const float coneAngle = std::clamp(settings.dirtAngle, 1.0f, 90.0f);
+    uint32_t seed = randomized ? HashLightSeed(samplePoint, 7919) : 1u;
+    int occludedCount = 0;
+    for (int i = 0; i < rayCount; ++i) {
+        Vector3 dir = SampleConeDirection(sampleNormal, coneAngle, i, rayCount);
+        if (randomized) {
+            dir = Vector3Normalize(Vector3Add(dir, Vector3Scale(RandomPointInUnitSphere(seed), 0.15f)));
+            if (Vector3DotProduct(dir, sampleNormal) < 0.0f) {
+                dir = Vector3Scale(dir, -1.0f);
+            }
+        }
+        const Vector3 ro = Vector3Add(samplePoint, Vector3Scale(sampleNormal, SHADOW_BIAS));
+        if (Occluded(occ, ro, dir, OCCLUSION_NEAR_TMIN, std::max(1.0f, settings.dirtDepth), -1)) {
+            ++occludedCount;
+        }
+    }
+    return (float)occludedCount / (float)rayCount;
+}
+
+static bool PageUsesCPUOnlyLightingFeatures(uint32_t pageIndex,
+                                            const std::vector<FaceRect>& rects,
+                                            const std::vector<PhongSourcePoly>& sourcePhongs,
+                                            const std::vector<PointLight>& pageLights,
+                                            const LightBakeSettings& settings,
+                                            std::string* reason)
+{
+    (void)pageIndex;
+    (void)rects;
+    (void)sourcePhongs;
+    (void)pageLights;
+    (void)settings;
+    if (reason) {
+        reason->clear();
+    }
+    return false;
+}
+
 static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
+                                const std::vector<PhongSourcePoly>& sourcePhongs,
                                 const std::vector<PointLight>& lights,
                                 const std::vector<FaceRect>& rects,
                                 const std::vector<std::vector<uint32_t>>* lightIndicesByRect,
                                 uint32_t pageIndex,
                                 const OccluderSet& occ,
-                                float ambient,
+                                const LightBakeSettings& settings,
                                 LightmapPage& page)
 {
     const int W = page.width;
@@ -1508,6 +2102,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             r.gpu.origin,
                             Vector3Add(Vector3Scale(r.gpu.axisU, ju * r.gpu.luxelSize),
                                        Vector3Scale(r.gpu.axisV, jv * r.gpu.luxelSize)));
+                        const Vector3 sampleNormal = EvaluatePhongNormal(sourcePhongs, r.sourcePolyIndex, wp, r.gpu.luxelSize);
                         const float edgeDistLuxels = MinDistToPolyEdge2D(r.poly2d, ju, jv);
                         const float edgeFactor = std::clamp(
                             1.0f - edgeDistLuxels / EDGE_SEAM_GUARD_LUXELS,
@@ -1515,8 +2110,18 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             1.0f);
                         const float nearHitT = OCCLUSION_NEAR_TMIN + EDGE_SEAM_TMIN_BOOST * edgeFactor;
 
-                        float cr = ambient, cg = ambient, cb = ambient;
+                        float cr = settings.ambientColor.x;
+                        float cg = settings.ambientColor.y;
+                        float cb = settings.ambientColor.z;
                         const std::vector<uint32_t>& rectLightIndices = lightIndicesByRect ? (*lightIndicesByRect)[i] : r.lightIndices;
+                        bool usesDirt = false;
+                        for (uint32_t lightIndex : rectLightIndices) {
+                            if (LightUsesDirt(lights[lightIndex], settings)) {
+                                usesDirt = true;
+                                break;
+                            }
+                        }
+                        const float dirtOcclusion = usesDirt ? ComputeDirtOcclusionRatio(occ, wp, sampleNormal, settings) : 0.0f;
                         for (uint32_t lightIndex : rectLightIndices) {
                             const PointLight& L = lights[lightIndex];
                             const Vector3 toL = Vector3Subtract(L.position, wp);
@@ -1524,7 +2129,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             if (dist > L.intensity || dist < 1e-3f) continue;
                             const Vector3 dir = Vector3Scale(toL, 1.f / dist);
                             const Vector3 ro = Vector3Add(
-                                Vector3Add(wp, Vector3Scale(p.normal, SHADOW_BIAS)),
+                                Vector3Add(wp, Vector3Scale(sampleNormal, SHADOW_BIAS)),
                                 Vector3Scale(dir, SHADOW_BIAS));
                             float emit = 1.0f;
                             if (L.directional) {
@@ -1532,12 +2137,18 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 emit = Vector3DotProduct(L.emissionNormal, lightToSurface);
                                 if (emit <= 0.0f) continue;
                             }
-                            const float ndl = Vector3DotProduct(p.normal, dir);
-                            if (ndl <= 0) continue;
+                            const float spot = EvaluateSpotlightFactor(L, dir);
+                            if (spot <= 0.0f) continue;
+                            const float ndl = Vector3DotProduct(sampleNormal, dir);
+                            const float incidence = EvaluateIncidenceScale(L, ndl);
+                            if (incidence <= 0.0f) continue;
                             if (Occluded(occ, ro, dir, nearHitT, std::max(0.0f, dist - (SHADOW_BIAS * 2.0f)), L.ignoreOccluderGroup)) continue;
-                            float att = 1.f - dist / L.intensity;
-                            att *= att;
-                            const float contrib = emit * ndl * att;
+                            const float att = EvaluateLightAttenuation(L, dist);
+                            if (att <= 0.0f) continue;
+                            const float dirt = LightUsesDirt(L, settings)
+                                ? ComputeDirtAttenuation(dirtOcclusion, EffectiveLightDirtScale(L, settings), EffectiveLightDirtGain(L, settings))
+                                : 1.0f;
+                            const float contrib = emit * spot * incidence * att * dirt;
                             cr += L.color.x * contrib;
                             cg += L.color.y * contrib;
                             cb += L.color.z * contrib;
@@ -1567,11 +2178,23 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
 // --------------------------------------------------------------------------
 LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                            const std::vector<MapPolygon>& occluderPolys,
-                           const std::vector<PointLight>& lights)
+                           const std::vector<PointLight>& lights,
+                           const std::vector<SurfaceLightTemplate>& surfaceLights,
+                           const LightBakeSettings& settings)
 {
     LightmapAtlas atlas;
-    std::vector<BakePatch> patches = SubdivideLightmappedPolygons(polys);
-    std::vector<FaceRect> rects = BuildFaceRects(patches, lights);
+    const float luxelSize = std::max(0.125f, settings.luxelSize);
+    const SurfaceVisibilityInfo sourceVisibility = AnalyzeSurfaceVisibility(polys);
+    const std::vector<MapPolygon> visiblePolys = FilterVisibleBakePolygons(polys, sourceVisibility);
+    if (sourceVisibility.hiddenCount > 0) {
+        printf("[Lightmap] skipped %d hidden/internal brush faces from bake surfaces.\n",
+               sourceVisibility.hiddenCount);
+        fflush(stdout);
+    }
+    const std::vector<PhongSourcePoly> sourcePhongs = BuildPhongSourcePolys(visiblePolys);
+    const std::vector<PointLight> allLights = BuildExpandedLights(visiblePolys, lights, surfaceLights, settings);
+    std::vector<BakePatch> patches = SubdivideLightmappedPolygons(visiblePolys, luxelSize);
+    std::vector<FaceRect> rects = BuildFaceRects(patches, allLights, sourcePhongs, luxelSize);
 
     std::vector<LightmapPageLayout> layouts = PackLightmapPages(rects);
     if (layouts.empty() && !rects.empty()) {
@@ -1593,11 +2216,14 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         totalLuxels += (size_t)r.gpu.w * (size_t)r.gpu.h;
     }
 
-    OccluderSet occ = BuildOccluders(occluderPolys.empty() ? polys : occluderPolys);
-    printf("[Lightmap] %zu source faces -> %zu bake patches across %zu pages of up to %dx%d, %zu lights, %zu tris, %zu luxels x %d samples = %zu rays/light\n",
-           polys.size(), patches.size(), atlas.pages.size(), LIGHTMAP_PAGE_SIZE, LIGHTMAP_PAGE_SIZE,
-           lights.size(), occ.tris.size(),
-           totalLuxels, AA_GRID * AA_GRID, totalLuxels * (size_t)(AA_GRID * AA_GRID));
+    OccluderSet occ = BuildOccluders(occluderPolys.empty() ? visiblePolys : occluderPolys);
+    printf("[Lightmap] %zu source faces -> %zu bake patches across %zu pages of up to %dx%d, %zu lights, %zu tris, %zu luxels x %d samples = %zu rays/light (luxel=%.3f, ambient=%.2f/%.2f/%.2f, bounces=%d, bounceScale=%.2f)\n",
+           visiblePolys.size(), patches.size(), atlas.pages.size(), LIGHTMAP_PAGE_SIZE, LIGHTMAP_PAGE_SIZE,
+           allLights.size(), occ.tris.size(),
+           totalLuxels, AA_GRID * AA_GRID, totalLuxels * (size_t)(AA_GRID * AA_GRID),
+           luxelSize,
+           settings.ambientColor.x, settings.ambientColor.y, settings.ambientColor.z,
+           settings.bounceCount, settings.bounceScale);
     fflush(stdout);
 
     std::vector<std::vector<uint8_t>> coverageMasks(atlas.pages.size());
@@ -1611,18 +2237,22 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         coverage = BuildCoverageMask(rects, pageIndex, page.width, page.height);
         std::vector<uint8_t>& valid = baseValidMasks[pageIndex];
         valid = CoverageToValidMask(coverage);
-        std::vector<PointLight> pageLights = GatherPageLights(rects, pageIndex, lights);
+        std::vector<PointLight> pageLights = GatherPageLights(rects, pageIndex, allLights);
         size_t pageLuxels = 0;
 
         std::vector<LightmapComputeFaceRect> pageRects;
         pageRects.reserve(rects.size());
         bool pageRequiresCPU = false;
+        std::string computeError;
         for (const FaceRect& r : rects) {
             if (r.page == pageIndex) {
                 pageRects.push_back(r.gpu);
                 pageLuxels += (size_t)r.gpu.w * (size_t)r.gpu.h;
-                if (r.gpu.polyCount < 0) {
+                if (!r.computeCompatible) {
                     pageRequiresCPU = true;
+                    if (computeError.empty()) {
+                        computeError = r.computeFallbackReason;
+                    }
                 }
             }
         }
@@ -1630,16 +2260,15 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                pageIndex, pageRects.size(), pageLights.size(), pageLuxels);
         fflush(stdout);
 
-        std::string computeError;
         bool usedCPUFallback = false;
-        if (pageRequiresCPU) {
-            computeError = "page contains polygon(s) exceeding compute vertex limit";
+        if (!pageRequiresCPU && PageUsesCPUOnlyLightingFeatures(pageIndex, rects, sourcePhongs, pageLights, settings, &computeError)) {
+            pageRequiresCPU = true;
         }
-        if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageLights, AMBIENT, page.width, page.height, page.pixels, &computeError)) {
+        if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageLights, settings, page.width, page.height, page.pixels, &computeError)) {
             printf("[Lightmap] page %u compute bake unavailable, falling back to CPU: %s\n",
                    pageIndex, computeError.c_str());
             fflush(stdout);
-            BakeLightmapCPUPage(patches, lights, rects, nullptr, pageIndex, occ, AMBIENT, page);
+            BakeLightmapCPUPage(patches, sourcePhongs, allLights, rects, nullptr, pageIndex, occ, settings, page);
             usedCPUFallback = true;
             printf("[Lightmap] page %u CPU bake complete\n", pageIndex);
             fflush(stdout);
@@ -1663,7 +2292,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                        darkStats.darkValidCount, darkStats.validCount,
                        darkStats.darkFullCoverageCount, darkStats.fullCoverageCount);
                 fflush(stdout);
-                BakeLightmapCPUPage(patches, lights, rects, nullptr, pageIndex, occ, AMBIENT, page);
+                BakeLightmapCPUPage(patches, sourcePhongs, allLights, rects, nullptr, pageIndex, occ, settings, page);
                 edgeTexelsStabilized = false;
                 printf("[Lightmap] page %u CPU re-bake complete\n", pageIndex);
                 fflush(stdout);
@@ -1679,20 +2308,37 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         fflush(stdout);
     }
 
-    const size_t directSeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks);
+    const size_t directSeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks, luxelSize);
     if (directSeamWelded > 0) {
         printf("[Lightmap] welded %zu direct seam-adjacent luxel pairs across split patches.\n", directSeamWelded);
         fflush(stdout);
     }
 
-    const std::vector<PointLight> indirectLights = BuildIndirectBounceLights(patches, rects, atlas.pages, coverageMasks);
-    if (!indirectLights.empty()) {
-        printf("[Lightmap] indirect bounce emitters: %zu\n", indirectLights.size());
+    std::vector<LightmapPage> bounceSourcePages = atlas.pages;
+    Vector3 bounceAmbient = settings.ambientColor;
+    for (int bouncePass = 0; bouncePass < settings.bounceCount; ++bouncePass) {
+        const std::vector<PointLight> indirectLights = BuildIndirectBounceLights(
+            patches, rects, bounceSourcePages, coverageMasks, bounceAmbient, settings.bounceScale);
+        if (indirectLights.empty()) {
+            if (bouncePass == 0) {
+                printf("[Lightmap] indirect bounce emitters: 0\n");
+                fflush(stdout);
+            }
+            break;
+        }
+
+        printf("[Lightmap] bounce pass %d/%d emitters: %zu\n",
+               bouncePass + 1, settings.bounceCount, indirectLights.size());
         fflush(stdout);
         const std::vector<std::vector<uint32_t>> indirectLightIndices = BuildRectLightIndices(rects, indirectLights);
+        std::vector<LightmapPage> bouncedPages = atlas.pages;
+        for (LightmapPage& bouncedPage : bouncedPages) {
+            bouncedPage = MakeBlankPageLike(bouncedPage);
+        }
 
         for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
             LightmapPage& page = atlas.pages[pageIndex];
+            LightmapPage& bouncedPage = bouncedPages[pageIndex];
             const std::vector<PointLight> pageIndirectLights = GatherPageLights(rects, pageIndex, indirectLights, &indirectLightIndices);
             if (pageIndirectLights.empty()) {
                 continue;
@@ -1701,40 +2347,49 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
             std::vector<LightmapComputeFaceRect> pageRects;
             pageRects.reserve(rects.size());
             bool pageRequiresCPU = false;
+            std::string computeError;
             for (const FaceRect& r : rects) {
                 if (r.page == pageIndex) {
                     pageRects.push_back(r.gpu);
-                    if (r.gpu.polyCount < 0) {
+                    if (!r.computeCompatible) {
                         pageRequiresCPU = true;
+                        if (computeError.empty()) {
+                            computeError = r.computeFallbackReason;
+                        }
                     }
                 }
             }
 
-            printf("[Lightmap] page %u indirect begin (%zu bounce lights)\n", pageIndex, pageIndirectLights.size());
+            printf("[Lightmap] page %u bounce %d begin (%zu bounce lights)\n",
+                   pageIndex, bouncePass + 1, pageIndirectLights.size());
             fflush(stdout);
-            LightmapPage indirectPage = MakeBlankPageLike(page);
-            std::string computeError;
-            if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageIndirectLights, 0.0f, page.width, page.height, indirectPage.pixels, &computeError)) {
-                printf("[Lightmap] page %u indirect compute unavailable, falling back to CPU: %s\n",
-                       pageIndex, computeError.c_str());
+            if (!pageRequiresCPU && PageUsesCPUOnlyLightingFeatures(pageIndex, rects, sourcePhongs, pageIndirectLights, settings, &computeError)) {
+                pageRequiresCPU = true;
+            }
+            LightBakeSettings bounceSettings = settings;
+            bounceSettings.ambientColor = Vector3Zero();
+            if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageIndirectLights, bounceSettings, page.width, page.height, bouncedPage.pixels, &computeError)) {
+                printf("[Lightmap] page %u bounce %d compute unavailable, falling back to CPU: %s\n",
+                       pageIndex, bouncePass + 1, computeError.c_str());
                 fflush(stdout);
-                BakeLightmapCPUPage(patches, indirectLights, rects, &indirectLightIndices, pageIndex, occ, 0.0f, indirectPage);
+                BakeLightmapCPUPage(patches, sourcePhongs, indirectLights, rects, &indirectLightIndices, pageIndex, occ, bounceSettings, bouncedPage);
             }
 
-            StabilizeEdgeTexels(indirectPage, coverageMasks[pageIndex]);
-            AddPagePixels(page, indirectPage);
-            printf("[Lightmap] page %u indirect complete\n", pageIndex);
+            StabilizeEdgeTexels(bouncedPage, coverageMasks[pageIndex]);
+            AddPagePixels(page, bouncedPage);
+            printf("[Lightmap] page %u bounce %d complete\n", pageIndex, bouncePass + 1);
             fflush(stdout);
         }
 
-        const size_t indirectSeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks);
+        const size_t indirectSeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks, luxelSize);
         if (indirectSeamWelded > 0) {
-            printf("[Lightmap] welded %zu indirect seam-adjacent luxel pairs across split patches.\n", indirectSeamWelded);
+            printf("[Lightmap] welded %zu bounce %d seam-adjacent luxel pairs across split patches.\n",
+                   indirectSeamWelded, bouncePass + 1);
             fflush(stdout);
         }
-    } else {
-        printf("[Lightmap] indirect bounce emitters: 0\n");
-        fflush(stdout);
+
+        bounceSourcePages = std::move(bouncedPages);
+        bounceAmbient = Vector3Zero();
     }
 
     for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {

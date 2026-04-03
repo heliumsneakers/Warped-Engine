@@ -1,5 +1,6 @@
 // bsp_loader.h  —  runtime .bsp reader.
 #pragma once
+#include "bsp_format.h"
 #include "map_parser.h"              // MapMeshBucket, Entity, PlayerStart
 #include "../physx/collision_data.h" // MeshCollisionData
 #include <vector>
@@ -16,6 +17,13 @@ struct BSPData {
     std::vector<MeshCollisionData> hulls;
     std::vector<Entity>            entities;   // point entities only
     std::vector<BSPDataLightmapPage> lightmapPages;
+    BSPTreeHeader                  tree{};
+    std::vector<BSPPlane>          planes;
+    std::vector<BSPFace>           bspFaces;
+    std::vector<BSPVec3>           bspFaceVerts;
+    std::vector<BSPNode>           bspNodes;
+    std::vector<BSPLeaf>           bspLeaves;
+    std::vector<uint32_t>          bspFaceRefs;
     std::string                    assetPackPath;
 };
 

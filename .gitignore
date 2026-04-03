@@ -14,6 +14,7 @@
 /build/
 /tools/
 /goldgdt/
+/ericw-tools/
 /build_mc/
 /.cache/
 
@@ -26,4 +27,3 @@
 .env
 secrets.txt
 *.md 
-

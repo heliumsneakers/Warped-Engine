@@ -32,4 +32,6 @@ struct LightmapAtlas {
 // LightmapAtlas::patches is only for lightmapped render emission.
 LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                            const std::vector<MapPolygon>& occluderPolys,
-                           const std::vector<PointLight>& lights);
+                           const std::vector<PointLight>& lights,
+                           const std::vector<SurfaceLightTemplate>& surfaceLights,
+                           const LightBakeSettings& settings);

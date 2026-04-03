@@ -8,6 +8,7 @@
 #include <vector>
 
 static constexpr int LIGHTMAP_COMPUTE_MAX_POLY_VERTS = 32;
+static constexpr int LIGHTMAP_COMPUTE_MAX_PHONG_NEIGHBORS = 32;
 
 struct LightmapComputeFaceRect {
     int w = 0;
@@ -23,6 +24,13 @@ struct LightmapComputeFaceRect {
     Vector3 normal{};
     int polyCount = 0;
     float polyVerts[LIGHTMAP_COMPUTE_MAX_POLY_VERTS][4] = {};
+    Vector3 phongBaseNormal{};
+    float phongBaseAreaWeight = 1.0f;
+    int phongNeighborCount = 0;
+    float _pad0[3] = {};
+    float phongNeighborEdgeA[LIGHTMAP_COMPUTE_MAX_PHONG_NEIGHBORS][4] = {};
+    float phongNeighborEdgeB[LIGHTMAP_COMPUTE_MAX_PHONG_NEIGHBORS][4] = {};
+    float phongNeighborNormalWeight[LIGHTMAP_COMPUTE_MAX_PHONG_NEIGHBORS][4] = {};
 };
 
 struct LightmapComputeOccluderTri {
@@ -36,7 +44,7 @@ struct LightmapComputeOccluderTri {
 bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          const std::vector<LightmapComputeOccluderTri>& occluders,
                          const std::vector<PointLight>& lights,
-                         float ambient,
+                         const LightBakeSettings& settings,
                          int atlasWidth,
                          int atlasHeight,
                          std::vector<uint8_t>& outPixels,

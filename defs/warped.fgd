@@ -33,15 +33,73 @@
     ]
 ]
 
+@BaseClass = LightBakeBrush : "Brush-level baked-lighting controls." [
+    _phong(choices) : "Phong Shading" : 0 =
+    [
+        0 : "Disabled"
+        1 : "Enabled"
+    ]
+    _phong_angle(float) : "Phong Angle" : 89 : "Smooth adjacent faces whose normals differ by this many degrees or less."
+    _phong_angle_concave(float) : "Phong Angle Concave" : 0 : "Optional concave-joint smoothing threshold. 0 uses _phong_angle."
+    _phong_group(integer) : "Phong Group" : 0 : "Non-zero smoothing group id. Only matching groups smooth together."
+    _surflight_group(integer) : "Surface Light Group" : 0 : "Restricts _surface light templates to matching brushes when non-zero."
+]
+
 // Entity Definitions
 
 // Worldspawn Entity
-@SolidClass base(Origin) = worldspawn : "World Entity" [
+@SolidClass base(Origin, LightBakeBrush) = worldspawn : "World Entity" [
     // Map properties
     skyname(string) : "Sky Texture" : "" : "Name of the sky texture to use."
     sounds(integer) : "CD Track" : 0 : "CD track to play as background music."
     message(string) : "Message" : "" : "Text message to display when the level starts."
     _ambient(color255) : "Ambient Light" : "0 0 0" : "Ambient light color."
+    _bounce(integer) : "Bounce Passes" : 1 : "Approximate indirect-light bounce passes for the baked lightmap."
+    _bouncescale(float) : "Bounce Scale" : 1.0 : "Scales the strength of indirect bounce light."
+    _world_units_per_luxel(float) : "World Units Per Luxel" : 1.0 : "Global baked lightmap density."
+    _lmscale(float) : "Lightmap Scale" : 1.0 : "Alias for world units per luxel."
+    _sunlight(float) : "Sunlight" : 0 : "Directional sunlight brightness."
+    _sunlight_color(color255) : "Sunlight Color" : "255 255 255" : "Color of the directional sunlight."
+    _sunlight_mangle(angle) : "Sunlight Direction" : "0 -90 0" : "Yaw Pitch Roll describing the sunlight direction."
+    _sun_mangle(angle) : "Sunlight Direction Alias" : "0 -90 0" : "Alias for _sunlight_mangle."
+    _sunlight_penumbra(float) : "Sun Penumbra" : 0 : "Softens directional sunlight by spreading it across a cone."
+    _sunlight2(float) : "Sky Dome Light" : 0 : "Upper-hemisphere dome light brightness."
+    _sunlight_color2(color255) : "Sky Dome Color" : "255 255 255" : "Color of the upper-hemisphere dome light."
+    _sunlight2_color(color255) : "Sky Dome Color Alias" : "255 255 255" : "Alias for _sunlight_color2."
+    _sunlight3(float) : "Lower Dome Light" : 0 : "Lower-hemisphere dome light brightness."
+    _sunlight_color3(color255) : "Lower Dome Color" : "255 255 255" : "Color of the lower-hemisphere dome light."
+    _sunlight3_color(color255) : "Lower Dome Color Alias" : "255 255 255" : "Alias for _sunlight_color3."
+    _anglescale(float) : "Sun Angle Scale" : 0.5 : "Controls how strongly sunlight and skylight respond to surface angle."
+    _anglesense(float) : "Sun Angle Scale Alias" : 0.5 : "Alias for _anglescale."
+    _dirt(choices) : "Dirtmapping" : -1 =
+    [
+        -1 : "Disabled"
+        1 : "Enabled"
+    ]
+    _dirty(choices) : "Dirtmapping Alias" : -1 =
+    [
+        -1 : "Disabled"
+        1 : "Enabled"
+    ]
+    _sunlight_dirt(choices) : "Sun Dirtmapping" : -1 =
+    [
+        -1 : "Use Global / Disabled"
+        1 : "Enabled"
+    ]
+    _sunlight2_dirt(choices) : "Sky Dirtmapping" : -1 =
+    [
+        -1 : "Use Global / Disabled"
+        1 : "Enabled"
+    ]
+    _dirtmode(choices) : "Dirt Mode" : 0 =
+    [
+        0 : "Ordered"
+        1 : "Randomized"
+    ]
+    _dirtdepth(float) : "Dirt Depth" : 128 : "Maximum AO ray length."
+    _dirtscale(float) : "Dirt Scale" : 1.0 : "Strength multiplier for dirtmapping."
+    _dirtgain(float) : "Dirt Gain" : 1.0 : "Exponent shaping the dirtmapping curve."
+    _dirtangle(float) : "Dirt Angle" : 88 : "Cone angle in degrees for AO sampling."
     _color(color255) : "Sky Color" : "0 0 0" : "Color of the sky."
     _fog(color255) : "Fog Color" : "0 0 0" : "Fog color."
     _fogdensity(float) : "Fog Density" : 0 : "Density of the fog."
@@ -70,14 +128,47 @@
         4 : "Local minlight"
         5 : "Inverse distance squared B"
     ]
-    wait(integer) : "Fade distance multiplier" : 1 : "Multiplier for fade distance."
+    wait(float) : "Fade distance multiplier" : 1 : "Multiplier for fade distance."
     angles(angle) : "Spotlight Direction" : "0 0 0" : "Direction of the light."
+    mangle(angle) : "Spotlight Direction" : "0 0 0" : "Direction of the light."
+    angle(float) : "Spotlight Cone" : 40 : "Outer spotlight cone angle in degrees."
+    _softangle(float) : "Spotlight Soft Cone" : 0 : "Inner cone angle for a softer spotlight edge."
+    _anglescale(float) : "Angle Scale" : 0.5 : "Controls how strongly the light responds to surface angle."
+    _anglesense(float) : "Angle Scale Alias" : 0.5 : "Alias for _anglescale."
+    _dirt(choices) : "Dirtmapping" : -1 =
+    [
+        -1 : "Use Global / Disabled"
+        1 : "Enabled"
+    ]
+    _dirtscale(float) : "Dirt Scale Override" : 1.0 : "Overrides the global dirt scale for this light."
+    _dirtgain(float) : "Dirt Gain Override" : 1.0 : "Overrides the global dirt gain for this light."
+    _deviance(float) : "Deviance" : 0 : "Splits the light into several nearby lights for softer shadows."
+    _samples(integer) : "Deviance Samples" : 16 : "Number of split lights used with _deviance."
+    _surface(string) : "Surface Texture" : "" : "Makes all matching textures emit this light as a template."
+    _surface_offset(float) : "Surface Offset" : 2 : "Offset above the emitting surface."
+    _surface_spotlight(choices) : "Surface Spotlight" : 0 =
+    [
+        0 : "Disabled"
+        1 : "Enabled"
+    ]
+    _surflight_group(integer) : "Surface Light Group" : 0 : "Restrict this template to matching brush _surflight_group values."
 ]
 
 // Point Light — baked into lightmap at compile time
 @PointClass base(Targetname, Origin) size(-8 -8 -8, 8 8 8) color(255 255 0) = light_point : "Baked Point Light" [
     _color(color255) : "Light Color (R G B)" : "255 255 255" : "Color of the emitted light."
     intensity(float) : "Intensity (emission radius, TB units)" : "300" : "Radius within which the light contributes."
+    _anglescale(float) : "Angle Scale" : 1.0 : "Controls how strongly the light responds to surface angle."
+    _anglesense(float) : "Angle Scale Alias" : 1.0 : "Alias for _anglescale."
+    _dirt(choices) : "Dirtmapping" : -1 =
+    [
+        -1 : "Use Global / Disabled"
+        1 : "Enabled"
+    ]
+    _dirtscale(float) : "Dirt Scale Override" : 1.0 : "Overrides the global dirt scale for this light."
+    _dirtgain(float) : "Dirt Gain Override" : 1.0 : "Overrides the global dirt gain for this light."
+    _deviance(float) : "Deviance" : 0 : "Splits the light into several nearby lights for softer shadows."
+    _samples(integer) : "Deviance Samples" : 16 : "Number of split lights used with _deviance."
 ]
 
 // Brush Light — editable solid geometry which emits baked light outward from each face
@@ -105,8 +196,10 @@
 ]
 
 // Func Detail
-@SolidClass base(Targetname) size(-8 -8 -8, 8 8 8) color(128 128 128) = func_detail : "Detail Brush" [
-    // No additional properties
+@SolidClass base(Targetname, LightBakeBrush) size(-8 -8 -8, 8 8 8) color(128 128 128) = func_detail : "Detail Brush" [
+]
+
+@SolidClass base(Targetname, LightBakeBrush) size(-8 -8 -8, 8 8 8) color(128 128 128) = func_group : "Grouped Brush" [
 ]
 
 // Clip Brush

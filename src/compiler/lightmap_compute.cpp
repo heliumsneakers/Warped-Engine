@@ -364,7 +364,7 @@ bool LightmapComputePlatform_ReadbackBuffer(sg_buffer buffer, size_t numBytes, v
 bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          const std::vector<LightmapComputeOccluderTri>& occluders,
                          const std::vector<PointLight>& lights,
-                         float ambient,
+                         const LightBakeSettings& settings,
                          int atlasWidth,
                          int atlasHeight,
                          std::vector<uint8_t>& outPixels,
@@ -379,9 +379,18 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         CopyVec3(gpuLights[i].position, lights[i].position);
         gpuLights[i].intensity = lights[i].intensity;
         CopyVec3(gpuLights[i].color, lights[i].color);
-        gpuLights[i].directional = lights[i].directional;
+        gpuLights[i].angle_scale = lights[i].angleScale;
         CopyVec3(gpuLights[i].emission_normal, lights[i].emissionNormal);
+        gpuLights[i].directional = lights[i].directional;
+        CopyVec3(gpuLights[i].spot_direction, lights[i].spotDirection);
+        gpuLights[i].spot_outer_cos = lights[i].spotOuterCos;
         gpuLights[i].ignore_occluder_group = lights[i].ignoreOccluderGroup;
+        gpuLights[i].attenuation_mode = (int32_t) lights[i].attenuationMode;
+        gpuLights[i].spot_inner_cos = lights[i].spotInnerCos;
+        gpuLights[i].dirt = (int32_t) lights[i].dirt;
+        gpuLights[i].dirt_scale = lights[i].dirtScale;
+        gpuLights[i].dirt_gain = lights[i].dirtGain;
+        gpuLights[i]._pad0 = 0;
     }
 
     std::vector<GpuOccluderTri> gpuOccluders(std::max<size_t>(1, occluders.size()));
@@ -550,11 +559,17 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             params.min_u = rect.minU;
             params.min_v = rect.minV;
             params.luxel_size = rect.luxelSize;
-            params.ambient = ambient;
             params.shadow_bias = kShadowBias;
+            CopyVec3(params.ambient_color, settings.ambientColor);
             params.ray_eps = kRayEps;
-            params._pad_scalar0 = 0.0f;
-            params._pad_scalar1 = 0.0f;
+            params.global_dirt = settings.dirt;
+            params.dirt_mode = settings.dirtMode;
+            params.phong_neighbor_count = rect.phongNeighborCount;
+            params._pad_scalar0 = 0;
+            params.dirt_depth = settings.dirtDepth;
+            params.dirt_scale = settings.dirtScale;
+            params.dirt_gain = settings.dirtGain;
+            params.dirt_angle = settings.dirtAngle;
             CopyVec3(params.origin, rect.origin);
             params._pad0 = 0.0f;
             CopyVec3(params.axis_u, rect.axisU);
@@ -567,11 +582,29 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             params._pad_poly_count[0] = 0.0f;
             params._pad_poly_count[1] = 0.0f;
             params._pad_poly_count[2] = 0.0f;
+            params.phong_base_normal_weight[0] = rect.phongBaseNormal.x;
+            params.phong_base_normal_weight[1] = rect.phongBaseNormal.y;
+            params.phong_base_normal_weight[2] = rect.phongBaseNormal.z;
+            params.phong_base_normal_weight[3] = rect.phongBaseAreaWeight;
             for (int i = 0; i < LIGHTMAP_COMPUTE_MAX_POLY_VERTS; ++i) {
                 params.poly_verts[i][0] = rect.polyVerts[i][0];
                 params.poly_verts[i][1] = rect.polyVerts[i][1];
                 params.poly_verts[i][2] = rect.polyVerts[i][2];
                 params.poly_verts[i][3] = rect.polyVerts[i][3];
+            }
+            for (int i = 0; i < LIGHTMAP_COMPUTE_MAX_PHONG_NEIGHBORS; ++i) {
+                params.phong_neighbor_edge_a[i][0] = rect.phongNeighborEdgeA[i][0];
+                params.phong_neighbor_edge_a[i][1] = rect.phongNeighborEdgeA[i][1];
+                params.phong_neighbor_edge_a[i][2] = rect.phongNeighborEdgeA[i][2];
+                params.phong_neighbor_edge_a[i][3] = rect.phongNeighborEdgeA[i][3];
+                params.phong_neighbor_edge_b[i][0] = rect.phongNeighborEdgeB[i][0];
+                params.phong_neighbor_edge_b[i][1] = rect.phongNeighborEdgeB[i][1];
+                params.phong_neighbor_edge_b[i][2] = rect.phongNeighborEdgeB[i][2];
+                params.phong_neighbor_edge_b[i][3] = rect.phongNeighborEdgeB[i][3];
+                params.phong_neighbor_normal_weight[i][0] = rect.phongNeighborNormalWeight[i][0];
+                params.phong_neighbor_normal_weight[i][1] = rect.phongNeighborNormalWeight[i][1];
+                params.phong_neighbor_normal_weight[i][2] = rect.phongNeighborNormalWeight[i][2];
+                params.phong_neighbor_normal_weight[i][3] = rect.phongNeighborNormalWeight[i][3];
             }
 
             const sg_range paramsRange = ByteRange(&params, sizeof(params));

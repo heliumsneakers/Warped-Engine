@@ -55,6 +55,16 @@ typedef struct PlayerStart {
     Vector3 position;
 } PlayerStart;
 
+enum PointLightAttenuationMode : uint8_t {
+    POINT_LIGHT_ATTEN_QUADRATIC = 0,
+    POINT_LIGHT_ATTEN_LINEAR,
+    POINT_LIGHT_ATTEN_INVERSE,
+    POINT_LIGHT_ATTEN_INVERSE_SQUARE,
+    POINT_LIGHT_ATTEN_NONE,
+    POINT_LIGHT_ATTEN_LOCAL_MINLIGHT,
+    POINT_LIGHT_ATTEN_INVERSE_SQUARE_B,
+};
+
 struct PointLight {
     Vector3 position;     // world-space (GL coords)
     Vector3 color;        // 0..1
@@ -62,6 +72,48 @@ struct PointLight {
     Vector3 emissionNormal{0.0f, 0.0f, 0.0f};
     int     directional = 0;
     int     ignoreOccluderGroup = -1;
+    uint8_t attenuationMode = POINT_LIGHT_ATTEN_QUADRATIC;
+    float   angleScale = 1.0f;
+    int8_t  dirt = -2;    // -2 defer, -1 disable, 1 enable
+    float   dirtScale = -1.0f;
+    float   dirtGain = -1.0f;
+    Vector3 spotDirection{0.0f, 0.0f, 0.0f};
+    float   spotOuterCos = -2.0f;
+    float   spotInnerCos = -2.0f;
+};
+
+struct SurfaceLightTemplate {
+    std::string texture;
+    int         surfaceLightGroup = 0;
+    float       surfaceOffset = 2.0f;
+    int         surfaceSpotlight = 0;
+    float       deviance = 0.0f;
+    int         devianceSamples = 16;
+    PointLight  light;
+};
+
+struct LightBakeSettings {
+    Vector3 ambientColor{0.12f, 0.12f, 0.12f};
+    float   luxelSize = 1.0f;
+    int     bounceCount = 1;
+    float   bounceScale = 1.0f;
+    float   sunlightIntensity = 0.0f;
+    Vector3 sunlightColor{1.0f, 1.0f, 1.0f};
+    Vector3 sunlightDirection{0.0f, 1.0f, 0.0f}; // surface -> light
+    float   sunlightPenumbra = 0.0f;
+    float   sunlightAngleScale = 0.5f;
+    float   sunlight2Intensity = 0.0f;
+    Vector3 sunlight2Color{1.0f, 1.0f, 1.0f};
+    float   sunlight3Intensity = 0.0f;
+    Vector3 sunlight3Color{1.0f, 1.0f, 1.0f};
+    int     dirt = -1;
+    int     sunlightDirt = -2;
+    int     sunlight2Dirt = -2;
+    int     dirtMode = 0;
+    float   dirtDepth = 128.0f;
+    float   dirtScale = 1.0f;
+    float   dirtGain = 1.0f;
+    float   dirtAngle = 88.0f;
 };
 
 // --------------------------------------------------------------------------
@@ -91,7 +143,13 @@ struct MapPolygon {
     std::string          texture;
     int                  occluderGroup = -1;
     int                  sourceBrushId = -1;
+    int                  sourceEntityId = -1;
     int                  sourceFaceIndex = -1;
+    int                  surfaceLightGroup = 0;
+    uint8_t              phong = 0;
+    float                phongAngle = 89.0f;
+    float                phongAngleConcave = 0.0f;
+    int                  phongGroup = 0;
     // Texture projection params (already converted to GL axes):
     Vector3 texAxisU, texAxisV;
     float   offU, offV;
@@ -104,6 +162,8 @@ struct MapPolygon {
 Map                        ParseMapFile(const std::string& filePath);
 std::vector<PlayerStart>   GetPlayerStarts(const Map& map);
 std::vector<PointLight>    GetPointLights(const Map& map);
+std::vector<SurfaceLightTemplate> GetSurfaceLightTemplates(const Map& map);
+LightBakeSettings          GetLightBakeSettings(const Map& map);
 std::vector<MapPolygon>    BuildMapPolygons(const Map& map, bool devMode);
 std::vector<MapPolygon>    BuildExteriorMapPolygons(const Map& map, bool devMode);
 

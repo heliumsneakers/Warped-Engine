@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -19,6 +20,8 @@
 
 // meters per TB unit conversion
 static constexpr float TB_TO_WORLD = 1.0f / 32.0f;
+
+static Vector3 ConvertTBtoRaylibEntities(const Vector3& in);
 
 /*
 ------------------------------------------------------------
@@ -575,9 +578,28 @@ static bool ParseFloatProp(const Entity& e, const char* key, float& out) {
     return true;
 }
 
+static bool ParseIntProp(const Entity& e, const char* key, int& out) {
+    float parsed = 0.0f;
+    if (!ParseFloatProp(e, key, parsed)) {
+        return false;
+    }
+    out = (int)std::lround(parsed);
+    return true;
+}
+
 static bool EntityHasClass(const Entity& e, const char* classname) {
     auto it = e.properties.find("classname");
     return (it != e.properties.end()) && (it->second == classname);
+}
+
+static bool EntityClassStartsWith(const Entity& e, const char* prefix) {
+    auto it = e.properties.find("classname");
+    if (it == e.properties.end()) {
+        return false;
+    }
+    const std::string& name = it->second;
+    const size_t len = strlen(prefix);
+    return name.size() >= len && name.compare(0, len, prefix) == 0;
 }
 
 static bool ShouldRenderBrushEntity(const Entity& entity, bool devMode) {
@@ -596,13 +618,163 @@ static int ClampColor255Component(float value) {
     return std::max(0, std::min(255, (int)std::lround(value)));
 }
 
+static Vector3 ClampColor255(const Vector3& color255) {
+    return {
+        (float)ClampColor255Component(color255.x),
+        (float)ClampColor255Component(color255.y),
+        (float)ClampColor255Component(color255.z)
+    };
+}
+
+static Vector3 Color255ToUnit(const Vector3& color255) {
+    const Vector3 clamped = ClampColor255(color255);
+    return {
+        clamped.x / 255.0f,
+        clamped.y / 255.0f,
+        clamped.z / 255.0f
+    };
+}
+
+static bool ParseColor255Prop(const Entity& e, const char* key, Vector3& out) {
+    Vector3 parsed{};
+    if (!ParseVec3Prop(e, key, parsed)) {
+        return false;
+    }
+    out = ClampColor255(parsed);
+    return true;
+}
+
+static bool ParseUnitOr255ColorProp(const Entity& e, const char* key, Vector3& outUnit) {
+    Vector3 parsed{};
+    if (!ParseVec3Prop(e, key, parsed)) {
+        return false;
+    }
+    const float maxComponent = std::max(parsed.x, std::max(parsed.y, parsed.z));
+    if (maxComponent <= 1.0f) {
+        outUnit = {
+            std::clamp(parsed.x, 0.0f, 1.0f),
+            std::clamp(parsed.y, 0.0f, 1.0f),
+            std::clamp(parsed.z, 0.0f, 1.0f)
+        };
+        return true;
+    }
+    outUnit = Color255ToUnit(parsed);
+    return true;
+}
+
+static bool ParseLightColor255AndBrightness(const Entity& e,
+                                            Vector3& outColor255,
+                                            float* outBrightness)
+{
+    auto it = e.properties.find("_light");
+    if (it == e.properties.end()) {
+        return false;
+    }
+
+    const std::vector<std::string> toks = SplitBySpace(it->second);
+    if (toks.size() != 3 && toks.size() != 4) {
+        return false;
+    }
+
+    try {
+        outColor255 = ClampColor255({
+            std::stof(toks[0]),
+            std::stof(toks[1]),
+            std::stof(toks[2])
+        });
+        if (outBrightness && toks.size() == 4) {
+            *outBrightness = std::stof(toks[3]);
+        }
+    } catch (...) {
+        return false;
+    }
+
+    return true;
+}
+
+static PointLightAttenuationMode DelayToAttenuationMode(int delay) {
+    switch (delay) {
+        case 0: return POINT_LIGHT_ATTEN_LINEAR;
+        case 1: return POINT_LIGHT_ATTEN_INVERSE;
+        case 2: return POINT_LIGHT_ATTEN_INVERSE_SQUARE;
+        case 3: return POINT_LIGHT_ATTEN_NONE;
+        case 4: return POINT_LIGHT_ATTEN_LOCAL_MINLIGHT;
+        case 5: return POINT_LIGHT_ATTEN_INVERSE_SQUARE_B;
+        default: return POINT_LIGHT_ATTEN_LINEAR;
+    }
+}
+
+static Vector3 MangleToTBDirection(const Vector3& mangle) {
+    const float yaw = mangle.x * DEG2RAD;
+    const float pitch = mangle.y * DEG2RAD;
+    return Vector3Normalize({
+        cosf(pitch) * cosf(yaw),
+        cosf(pitch) * sinf(yaw),
+        sinf(pitch)
+    });
+}
+
+static Vector3 MangleToWorldLightDirection(const Vector3& mangle) {
+    return Vector3Normalize(ConvertTBtoRaylibEntities(MangleToTBDirection(mangle)));
+}
+
+static bool FindEntityOriginByTargetname(const Map& map, const std::string& targetname, Vector3& outWorldOrigin) {
+    if (targetname.empty()) {
+        return false;
+    }
+    for (const Entity& entity : map.entities) {
+        auto it = entity.properties.find("targetname");
+        if (it == entity.properties.end() || it->second != targetname) {
+            continue;
+        }
+        Vector3 originTB{};
+        if (!ParseVec3Prop(entity, "origin", originTB)) {
+            continue;
+        }
+        outWorldOrigin = ConvertTBtoRaylibEntities(originTB);
+        return true;
+    }
+    return false;
+}
+
+static bool ParseLightDirection(const Map& map, const Entity& e, const Vector3& lightOrigin, Vector3& outDirection) {
+    auto targetIt = e.properties.find("target");
+    if (targetIt != e.properties.end()) {
+        Vector3 targetOrigin{};
+        if (FindEntityOriginByTargetname(map, targetIt->second, targetOrigin)) {
+            const Vector3 toTarget = Vector3Subtract(targetOrigin, lightOrigin);
+            if (Vector3LengthSq(toTarget) > 1e-6f) {
+                outDirection = Vector3Normalize(toTarget);
+                return true;
+            }
+        }
+    }
+
+    Vector3 mangle{};
+    if (ParseVec3Prop(e, "mangle", mangle) || ParseVec3Prop(e, "angles", mangle)) {
+        outDirection = MangleToWorldLightDirection(mangle);
+        return true;
+    }
+
+    return false;
+}
+
+static float ParseAngleScaleProp(const Entity& e, float defaultValue) {
+    float value = defaultValue;
+    ParseFloatProp(e, "_anglescale", value) || ParseFloatProp(e, "_anglesense", value);
+    return std::clamp(value, 0.0f, 1.0f);
+}
+
+static int ParseDirtOverrideProp(const Entity& e, const char* key, int defaultValue) {
+    int value = defaultValue;
+    ParseIntProp(e, key, value);
+    return value;
+}
+
 static Vector3 ReadLightBrushColor255(const Entity& e) {
     Vector3 color255{255, 255, 255};
-    ParseVec3Prop(e, "_color", color255);
-    color255.x = (float)ClampColor255Component(color255.x);
-    color255.y = (float)ClampColor255Component(color255.y);
-    color255.z = (float)ClampColor255Component(color255.z);
-    return color255;
+    ParseColor255Prop(e, "_color", color255);
+    return ClampColor255(color255);
 }
 
 static float ReadLightBrushIntensity(const Entity& e) {
@@ -652,10 +824,10 @@ static bool InsidePoly2D(const std::vector<Vector2>& poly, float px, float py) {
     return true;
 }
 
-static std::vector<Vector3> GenerateFaceEmitterSamples(const MapPolygon& poly) {
-    static constexpr float kSampleSpacing = 32.0f;
-    static constexpr int kMaxSamplesPerAxis = 8;
-
+static std::vector<Vector3> GenerateFaceEmitterSamples(const MapPolygon& poly,
+                                                       float sampleSpacing,
+                                                       float offsetAlongNormal,
+                                                       int maxSamplesPerAxis) {
     Vector3 axisU{};
     Vector3 axisV{};
     FaceBasis(poly.normal, axisU, axisV);
@@ -678,8 +850,10 @@ static std::vector<Vector3> GenerateFaceEmitterSamples(const MapPolygon& poly) {
 
     const float extentU = std::max(0.0f, maxU - minU);
     const float extentV = std::max(0.0f, maxV - minV);
-    const int samplesU = std::max(1, std::min(kMaxSamplesPerAxis, (int)std::ceil(extentU / kSampleSpacing)));
-    const int samplesV = std::max(1, std::min(kMaxSamplesPerAxis, (int)std::ceil(extentV / kSampleSpacing)));
+    const float safeSpacing = std::max(1.0f, sampleSpacing);
+    const int safeMaxPerAxis = std::max(1, maxSamplesPerAxis);
+    const int samplesU = std::max(1, std::min(safeMaxPerAxis, (int)std::ceil(extentU / safeSpacing)));
+    const int samplesV = std::max(1, std::min(safeMaxPerAxis, (int)std::ceil(extentV / safeSpacing)));
     const float stepU = (samplesU > 0) ? (extentU / (float)samplesU) : 0.0f;
     const float stepV = (samplesV > 0) ? (extentV / (float)samplesV) : 0.0f;
 
@@ -695,43 +869,249 @@ static std::vector<Vector3> GenerateFaceEmitterSamples(const MapPolygon& poly) {
             Vector3 p = planeAnchor;
             p = Vector3Add(p, Vector3Scale(axisU, u - anchorU));
             p = Vector3Add(p, Vector3Scale(axisV, v - anchorV));
-            p = Vector3Add(p, Vector3Scale(poly.normal, 1.0f));
+            p = Vector3Add(p, Vector3Scale(poly.normal, offsetAlongNormal));
             samples.push_back(p);
         }
     }
 
     if (samples.empty()) {
-        samples.push_back(Vector3Add(PolygonCentroid(poly.verts), Vector3Scale(poly.normal, 1.0f)));
+        samples.push_back(Vector3Add(PolygonCentroid(poly.verts), Vector3Scale(poly.normal, offsetAlongNormal)));
     }
     return samples;
 }
 
+static std::vector<Vector3> GenerateFaceEmitterSamples(const MapPolygon& poly) {
+    return GenerateFaceEmitterSamples(poly, 32.0f, 1.0f, 8);
+}
+
+static uint32_t HashLightSeed(const Vector3& position, int extra) {
+    auto h = [](float v) -> uint32_t {
+        return (uint32_t)std::lround(v * 1000.0f);
+    };
+    uint32_t seed = 2166136261u;
+    seed = (seed ^ h(position.x)) * 16777619u;
+    seed = (seed ^ h(position.y)) * 16777619u;
+    seed = (seed ^ h(position.z)) * 16777619u;
+    seed = (seed ^ (uint32_t)extra) * 16777619u;
+    return seed ? seed : 1u;
+}
+
+static float RandomFloat01(uint32_t& state) {
+    state = state * 1664525u + 1013904223u;
+    return (float)(state & 0x00FFFFFFu) / (float)0x01000000u;
+}
+
+static Vector3 RandomPointInUnitSphere(uint32_t& state) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const Vector3 p = {
+            RandomFloat01(state) * 2.0f - 1.0f,
+            RandomFloat01(state) * 2.0f - 1.0f,
+            RandomFloat01(state) * 2.0f - 1.0f
+        };
+        if (Vector3LengthSq(p) <= 1.0f) {
+            return p;
+        }
+    }
+    return {0.0f, 0.0f, 0.0f};
+}
+
+static void AppendDeviatedLights(const PointLight& baseLight,
+                                 float deviance,
+                                 int samples,
+                                 int seedSalt,
+                                 std::vector<PointLight>& out)
+{
+    if (deviance <= 0.0f || samples <= 1) {
+        out.push_back(baseLight);
+        return;
+    }
+
+    const int safeSamples = std::max(1, samples);
+    const Vector3 sampleColor = Vector3Scale(baseLight.color, 1.0f / (float)safeSamples);
+    uint32_t seed = HashLightSeed(baseLight.position, seedSalt);
+    for (int i = 0; i < safeSamples; ++i) {
+        PointLight split = baseLight;
+        split.position = Vector3Add(baseLight.position, Vector3Scale(RandomPointInUnitSphere(seed), deviance));
+        split.color = sampleColor;
+        out.push_back(split);
+    }
+}
+
+LightBakeSettings GetLightBakeSettings(const Map &map) {
+    LightBakeSettings settings;
+
+    for (const Entity& entity : map.entities) {
+        if (!EntityHasClass(entity, "worldspawn")) {
+            continue;
+        }
+
+        Vector3 ambient255{};
+        if (ParseColor255Prop(entity, "_ambient", ambient255)) {
+            settings.ambientColor = Color255ToUnit(ambient255);
+        }
+
+        float luxelSize = settings.luxelSize;
+        if (ParseFloatProp(entity, "_world_units_per_luxel", luxelSize) ||
+            ParseFloatProp(entity, "_lmscale", luxelSize)) {
+            settings.luxelSize = std::max(0.125f, luxelSize);
+        }
+
+        int bounceCount = settings.bounceCount;
+        if (ParseIntProp(entity, "_bounce", bounceCount)) {
+            settings.bounceCount = std::max(0, bounceCount);
+        }
+
+        float bounceScale = settings.bounceScale;
+        if (ParseFloatProp(entity, "_bouncescale", bounceScale)) {
+            settings.bounceScale = std::max(0.0f, bounceScale);
+        }
+
+        ParseFloatProp(entity, "_sunlight", settings.sunlightIntensity);
+        ParseFloatProp(entity, "_sunlight2", settings.sunlight2Intensity);
+        ParseFloatProp(entity, "_sunlight3", settings.sunlight3Intensity);
+        ParseFloatProp(entity, "_sunlight_penumbra", settings.sunlightPenumbra);
+        settings.sunlightAngleScale = ParseAngleScaleProp(entity, settings.sunlightAngleScale);
+        settings.dirt = ParseDirtOverrideProp(entity, "_dirt", settings.dirt);
+        if (settings.dirt == -1) {
+            settings.dirt = ParseDirtOverrideProp(entity, "_dirty", settings.dirt);
+        }
+        settings.sunlightDirt = ParseDirtOverrideProp(entity, "_sunlight_dirt", settings.sunlightDirt);
+        settings.sunlight2Dirt = ParseDirtOverrideProp(entity, "_sunlight2_dirt", settings.sunlight2Dirt);
+        ParseIntProp(entity, "_dirtmode", settings.dirtMode);
+        ParseFloatProp(entity, "_dirtdepth", settings.dirtDepth);
+        ParseFloatProp(entity, "_dirtscale", settings.dirtScale);
+        ParseFloatProp(entity, "_dirtgain", settings.dirtGain);
+        ParseFloatProp(entity, "_dirtangle", settings.dirtAngle);
+
+        Vector3 parsedColor{};
+        if (ParseUnitOr255ColorProp(entity, "_sunlight_color", parsedColor) ||
+            ParseUnitOr255ColorProp(entity, "_sun_color", parsedColor)) {
+            settings.sunlightColor = parsedColor;
+        }
+        if (ParseUnitOr255ColorProp(entity, "_sunlight_color2", parsedColor) ||
+            ParseUnitOr255ColorProp(entity, "_sunlight2_color", parsedColor)) {
+            settings.sunlight2Color = parsedColor;
+        }
+        if (ParseUnitOr255ColorProp(entity, "_sunlight_color3", parsedColor) ||
+            ParseUnitOr255ColorProp(entity, "_sunlight3_color", parsedColor)) {
+            settings.sunlight3Color = parsedColor;
+        }
+
+        Vector3 sunMangle{};
+        if (ParseVec3Prop(entity, "_sunlight_mangle", sunMangle) ||
+            ParseVec3Prop(entity, "_sun_mangle", sunMangle) ||
+            ParseVec3Prop(entity, "_sun_angle", sunMangle)) {
+            settings.sunlightDirection = Vector3Scale(MangleToWorldLightDirection(sunMangle), -1.0f);
+        }
+
+        break;
+    }
+
+    printf("[LightSettings] ambient=(%.2f,%.2f,%.2f) luxel=%.3f bounces=%d bounceScale=%.2f sun=%.1f sun2=%.1f sun3=%.1f dirt=%d\n",
+           settings.ambientColor.x, settings.ambientColor.y, settings.ambientColor.z,
+           settings.luxelSize, settings.bounceCount, settings.bounceScale,
+           settings.sunlightIntensity, settings.sunlight2Intensity, settings.sunlight3Intensity,
+           settings.dirt);
+    return settings;
+}
+
 std::vector<PointLight> GetPointLights(const Map &map) {
     std::vector<PointLight> lights;
-    for (auto &e : map.entities) {
-        if (!EntityHasClass(e, "light_point")) continue;
+    int nextLightSeedSalt = 1;
+    for (const Entity& e : map.entities) {
+        if (EntityHasClass(e, "light_point")) {
+            Vector3 originTB{0, 0, 0};
+            Vector3 color255{255, 255, 255};
+            ParseVec3Prop(e, "origin", originTB);
+            ParseColor255Prop(e, "_color", color255);
 
-        Vector3 originTB{0,0,0}, color255{255,255,255};
+            float intensity = 300.0f;
+            ParseFloatProp(e, "intensity", intensity);
+
+            PointLight pl{};
+            pl.position = ConvertTBtoRaylibEntities(originTB);
+            pl.color = Color255ToUnit(color255);
+            pl.intensity = std::max(1.0f, intensity);
+            pl.emissionNormal = { 0.0f, 0.0f, 0.0f };
+            pl.directional = 0;
+            pl.ignoreOccluderGroup = -1;
+            pl.attenuationMode = POINT_LIGHT_ATTEN_QUADRATIC;
+            pl.angleScale = ParseAngleScaleProp(e, 1.0f);
+            pl.dirt = ParseDirtOverrideProp(e, "_dirt", pl.dirt);
+            ParseFloatProp(e, "_dirtscale", pl.dirtScale);
+            ParseFloatProp(e, "_dirtgain", pl.dirtGain);
+            float deviance = 0.0f;
+            ParseFloatProp(e, "_deviance", deviance);
+            int samples = 16;
+            ParseIntProp(e, "_samples", samples);
+            AppendDeviatedLights(pl, deviance, samples, nextLightSeedSalt++, lights);
+            printf("LightPoint at (%.1f,%.1f,%.1f) radius=%.1f\n",
+                   pl.position.x, pl.position.y, pl.position.z, pl.intensity);
+            continue;
+        }
+
+        if (!EntityClassStartsWith(e, "light") || EntityHasClass(e, "light_brush")) {
+            continue;
+        }
+        if (e.properties.find("_surface") != e.properties.end()) {
+            continue;
+        }
+
+        Vector3 originTB{0, 0, 0};
         ParseVec3Prop(e, "origin", originTB);
-        ParseVec3Prop(e, "_color", color255);
+        const Vector3 origin = ConvertTBtoRaylibEntities(originTB);
 
-        float intensity = 300.0f;
-        ParseFloatProp(e, "intensity", intensity);
+        Vector3 color255{255, 255, 255};
+        float brightness = 300.0f;
+        bool hasLightColor = ParseLightColor255AndBrightness(e, color255, &brightness);
+        if (!hasLightColor) {
+            ParseColor255Prop(e, "_color", color255);
+        }
+        ParseFloatProp(e, "light", brightness);
 
-        PointLight pl;
-        pl.position  = ConvertTBtoRaylibEntities(originTB);
-        pl.color     = { color255.x/255.0f, color255.y/255.0f, color255.z/255.0f };
-        pl.intensity = intensity;
+        int delay = 0;
+        ParseIntProp(e, "delay", delay);
+
+        float wait = 1.0f;
+        ParseFloatProp(e, "wait", wait);
+
+        PointLight pl{};
+        pl.position = origin;
+        pl.color = Color255ToUnit(color255);
+        pl.intensity = std::max(1.0f, brightness * std::max(0.01f, wait));
         pl.emissionNormal = { 0.0f, 0.0f, 0.0f };
         pl.directional = 0;
         pl.ignoreOccluderGroup = -1;
-        lights.push_back(pl);
-        printf("PointLight at (%.1f,%.1f,%.1f) radius=%.1f\n",
-               pl.position.x, pl.position.y, pl.position.z, pl.intensity);
+        pl.attenuationMode = DelayToAttenuationMode(delay);
+        pl.angleScale = ParseAngleScaleProp(e, 0.5f);
+        pl.dirt = ParseDirtOverrideProp(e, "_dirt", pl.dirt);
+        ParseFloatProp(e, "_dirtscale", pl.dirtScale);
+        ParseFloatProp(e, "_dirtgain", pl.dirtGain);
+
+        Vector3 lightDirection{};
+        if (ParseLightDirection(map, e, origin, lightDirection)) {
+            float outerAngle = 40.0f;
+            ParseFloatProp(e, "angle", outerAngle);
+            float softAngle = 0.0f;
+            ParseFloatProp(e, "_softangle", softAngle);
+            const float outerHalf = std::clamp(outerAngle, 1.0f, 179.0f) * 0.5f * DEG2RAD;
+            const float innerHalf = std::clamp((softAngle > 0.0f) ? softAngle : outerAngle, 1.0f, std::clamp(outerAngle, 1.0f, 179.0f)) * 0.5f * DEG2RAD;
+            pl.spotDirection = lightDirection;
+            pl.spotOuterCos = cosf(outerHalf);
+            pl.spotInnerCos = cosf(innerHalf);
+        }
+
+        float deviance = 0.0f;
+        ParseFloatProp(e, "_deviance", deviance);
+        int samples = 16;
+        ParseIntProp(e, "_samples", samples);
+        AppendDeviatedLights(pl, deviance, samples, nextLightSeedSalt++, lights);
+        printf("Light at (%.1f,%.1f,%.1f) radius=%.1f delay=%d wait=%.2f\n",
+               pl.position.x, pl.position.y, pl.position.z, pl.intensity, delay, wait);
     }
 
     int nextLightBrushGroup = 0;
-    for (auto& entity : map.entities) {
+    for (const Entity& entity : map.entities) {
         if (!EntityHasClass(entity, "light_brush")) continue;
 
         const Vector3 color255 = ReadLightBrushColor255(entity);
@@ -798,13 +1178,15 @@ std::vector<PointLight> GetPointLights(const Map &map) {
                     (color255.z / 255.0f) * invSampleCount
                 };
                 for (const Vector3& samplePos : samples) {
-                    PointLight pl;
+                    PointLight pl{};
                     pl.position = samplePos;
                     pl.color = sampleColor;
                     pl.intensity = intensity;
                     pl.emissionNormal = poly.normal;
                     pl.directional = 1;
                     pl.ignoreOccluderGroup = -1;
+                    pl.attenuationMode = POINT_LIGHT_ATTEN_QUADRATIC;
+                    pl.angleScale = 1.0f;
                     lights.push_back(pl);
                 }
                 printf("LightBrush face emitters: %zu samples radius=%.1f normal=(%.2f,%.2f,%.2f)\n",
@@ -813,6 +1195,66 @@ std::vector<PointLight> GetPointLights(const Map &map) {
         }
     }
     return lights;
+}
+
+std::vector<SurfaceLightTemplate> GetSurfaceLightTemplates(const Map& map) {
+    std::vector<SurfaceLightTemplate> templates;
+    for (const Entity& e : map.entities) {
+        if (!EntityClassStartsWith(e, "light")) {
+            continue;
+        }
+
+        auto surfaceIt = e.properties.find("_surface");
+        if (surfaceIt == e.properties.end() || surfaceIt->second.empty()) {
+            continue;
+        }
+
+        Vector3 color255{255, 255, 255};
+        float brightness = 300.0f;
+        bool hasLightColor = ParseLightColor255AndBrightness(e, color255, &brightness);
+        if (!hasLightColor) {
+            ParseColor255Prop(e, "_color", color255);
+        }
+        ParseFloatProp(e, "light", brightness);
+
+        int delay = 0;
+        ParseIntProp(e, "delay", delay);
+
+        float wait = 1.0f;
+        ParseFloatProp(e, "wait", wait);
+
+        SurfaceLightTemplate templ{};
+        templ.texture = surfaceIt->second;
+        ParseIntProp(e, "_surflight_group", templ.surfaceLightGroup);
+        ParseFloatProp(e, "_surface_offset", templ.surfaceOffset);
+        ParseIntProp(e, "_surface_spotlight", templ.surfaceSpotlight);
+        ParseFloatProp(e, "_deviance", templ.deviance);
+        ParseIntProp(e, "_samples", templ.devianceSamples);
+        templ.light.color = Vector3Scale(Color255ToUnit(color255), std::max(0.0f, brightness) / 300.0f);
+        templ.light.intensity = std::max(1.0f, brightness * std::max(0.01f, wait));
+        templ.light.attenuationMode = DelayToAttenuationMode(delay);
+        templ.light.angleScale = ParseAngleScaleProp(e, 0.5f);
+        templ.light.dirt = ParseDirtOverrideProp(e, "_dirt", templ.light.dirt);
+        ParseFloatProp(e, "_dirtscale", templ.light.dirtScale);
+        ParseFloatProp(e, "_dirtgain", templ.light.dirtGain);
+
+        Vector3 originTB{};
+        ParseVec3Prop(e, "origin", originTB);
+        const Vector3 origin = ConvertTBtoRaylibEntities(originTB);
+        Vector3 lightDirection{};
+        if (ParseLightDirection(map, e, origin, lightDirection)) {
+            float outerAngle = 40.0f;
+            ParseFloatProp(e, "angle", outerAngle);
+            float softAngle = 0.0f;
+            ParseFloatProp(e, "_softangle", softAngle);
+            templ.light.spotDirection = lightDirection;
+            templ.light.spotOuterCos = cosf(std::clamp(outerAngle, 1.0f, 179.0f) * 0.5f * DEG2RAD);
+            templ.light.spotInnerCos = cosf(std::clamp((softAngle > 0.0f) ? softAngle : outerAngle, 1.0f, std::clamp(outerAngle, 1.0f, 179.0f)) * 0.5f * DEG2RAD);
+        }
+
+        templates.push_back(std::move(templ));
+    }
+    return templates;
 }
 
 std::vector<PlayerStart> GetPlayerStarts(const Map &map) {
@@ -884,6 +1326,7 @@ Vector2 ComputeFaceUV(const Vector3& vert,
 ------------------------------------------------------------
 */
 static void AppendBrushEntityPolygons(const Entity& entity,
+                                      int sourceEntityId,
                                       bool devMode,
                                       bool exteriorOnly,
                                       int* nextLightBrushGroup,
@@ -898,6 +1341,19 @@ static void AppendBrushEntityPolygons(const Entity& entity,
     if (!ShouldRenderBrushEntity(entity, devMode)) {
         return;
     }
+
+    int phongEnabled = 0;
+    ParseIntProp(entity, "_phong", phongEnabled);
+    float phongAngle = 89.0f;
+    if (ParseFloatProp(entity, "_phong_angle", phongAngle)) {
+        phongEnabled = 1;
+    }
+    float phongAngleConcave = 0.0f;
+    ParseFloatProp(entity, "_phong_angle_concave", phongAngleConcave);
+    int phongGroup = 0;
+    ParseIntProp(entity, "_phong_group", phongGroup);
+    int surfaceLightGroup = 0;
+    ParseIntProp(entity, "_surflight_group", surfaceLightGroup);
 
     std::vector<MapPolygon> entityPolys;
 
@@ -958,7 +1414,13 @@ static void AppendBrushEntityPolygons(const Entity& entity,
             mp.texture  = isLightBrush ? lightBrushTexture : brush.faces[i].texture;
             mp.occluderGroup = lightBrushGroup;
             mp.sourceBrushId = sourceBrushId;
+            mp.sourceEntityId = sourceEntityId;
             mp.sourceFaceIndex = i;
+            mp.surfaceLightGroup = surfaceLightGroup;
+            mp.phong = phongEnabled != 0;
+            mp.phongAngle = std::max(1.0f, phongAngle);
+            mp.phongAngleConcave = std::max(0.0f, phongAngleConcave);
+            mp.phongGroup = phongGroup;
             mp.texAxisU = ConvertTBtoRaylib(brush.faces[i].textureAxes1);
             mp.texAxisV = ConvertTBtoRaylib(brush.faces[i].textureAxes2);
             mp.offU     = brush.faces[i].offsetX;
@@ -991,8 +1453,8 @@ std::vector<MapPolygon> BuildMapPolygons(const Map &map, bool devMode)
     int nextLightBrushGroup = 0;
     int nextSourceBrushId = 0;
     size_t sourceFaceCount = 0;
-    for (auto& entity : map.entities) {
-        AppendBrushEntityPolygons(entity, devMode, false, &nextLightBrushGroup, &nextSourceBrushId, &sourceFaceCount, out);
+    for (size_t entityIndex = 0; entityIndex < map.entities.size(); ++entityIndex) {
+        AppendBrushEntityPolygons(map.entities[entityIndex], (int)entityIndex, devMode, false, &nextLightBrushGroup, &nextSourceBrushId, &sourceFaceCount, out);
     }
     printf("[MapParser] Built %zu polygons from %zu brush faces.\n", out.size(), sourceFaceCount);
     return out;
@@ -1004,8 +1466,8 @@ std::vector<MapPolygon> BuildExteriorMapPolygons(const Map &map, bool devMode)
     int nextLightBrushGroup = 0;
     int nextSourceBrushId = 0;
     size_t sourceFaceCount = 0;
-    for (auto& entity : map.entities) {
-        AppendBrushEntityPolygons(entity, devMode, true, &nextLightBrushGroup, &nextSourceBrushId, &sourceFaceCount, out);
+    for (size_t entityIndex = 0; entityIndex < map.entities.size(); ++entityIndex) {
+        AppendBrushEntityPolygons(map.entities[entityIndex], (int)entityIndex, devMode, true, &nextLightBrushGroup, &nextSourceBrushId, &sourceFaceCount, out);
     }
     printf("[MapParser] Built %zu exterior occluder polygons from %zu brush faces.\n", out.size(), sourceFaceCount);
     return out;

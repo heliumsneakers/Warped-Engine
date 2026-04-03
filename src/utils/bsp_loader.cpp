@@ -6,6 +6,53 @@
 #include <cstring>
 #include <sstream>
 
+namespace {
+
+static constexpr uint32_t kLegacyBspVersion = 2u;
+static constexpr size_t kLegacyLumpCount = 8;
+
+#pragma pack(push, 1)
+struct BSPHeaderV2Compat {
+    uint32_t magic;
+    uint32_t version;
+    BSPLump  lumps[kLegacyLumpCount];
+};
+#pragma pack(pop)
+
+static bool ReadHeader(FILE* f, BSPHeader* out) {
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    if (fread(&magic, sizeof(magic), 1, f) != 1 ||
+        fread(&version, sizeof(version), 1, f) != 1)
+    {
+        return false;
+    }
+    if (magic != WBSP_MAGIC) {
+        return false;
+    }
+
+    fseek(f, 0, SEEK_SET);
+    if (version == WBSP_VERSION) {
+        return fread(out, sizeof(*out), 1, f) == 1;
+    }
+    if (version == kLegacyBspVersion) {
+        BSPHeaderV2Compat legacy{};
+        if (fread(&legacy, sizeof(legacy), 1, f) != 1) {
+            return false;
+        }
+        memset(out, 0, sizeof(*out));
+        out->magic = legacy.magic;
+        out->version = legacy.version;
+        for (size_t i = 0; i < kLegacyLumpCount; ++i) {
+            out->lumps[i] = legacy.lumps[i];
+        }
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
 template<typename T>
 static std::vector<T> ReadLump(FILE* f, const BSPLump& l) {
     std::vector<T> v(l.length / sizeof(T));
@@ -16,14 +63,17 @@ static std::vector<T> ReadLump(FILE* f, const BSPLump& l) {
 bool LoadBSP(const char* path, BSPData& out)
 {
     out = {};
+    out.tree.rootChild = -1;
+    out.tree.outsideLeaf = -1;
 
     FILE* f = fopen(path, "rb");
     if (!f) { printf("[BSP] cannot open %s\n", path); return false; }
 
     BSPHeader hdr{};
-    fread(&hdr, sizeof(hdr), 1, f);
-    if (hdr.magic != WBSP_MAGIC || hdr.version != WBSP_VERSION) {
-        printf("[BSP] bad header in %s\n", path); fclose(f); return false;
+    if (!ReadHeader(f, &hdr)) {
+        printf("[BSP] bad or unsupported header in %s\n", path);
+        fclose(f);
+        return false;
     }
 
     auto textures = ReadLump<BSPTexture>(f, hdr.lumps[LUMP_TEXTURES]);
@@ -110,11 +160,26 @@ bool LoadBSP(const char* path, BSPData& out)
         }
     }
 
+    // ----- structural bsp -----------------------------------------------
+    if (hdr.version >= WBSP_VERSION) {
+        const BSPLump& treeLump = hdr.lumps[LUMP_BSP_TREE];
+        if (treeLump.length >= sizeof(BSPTreeHeader)) {
+            fseek(f, treeLump.offset, SEEK_SET);
+            fread(&out.tree, sizeof(out.tree), 1, f);
+        }
+        out.planes = ReadLump<BSPPlane>(f, hdr.lumps[LUMP_BSP_PLANES]);
+        out.bspFaces = ReadLump<BSPFace>(f, hdr.lumps[LUMP_BSP_FACES]);
+        out.bspFaceVerts = ReadLump<BSPVec3>(f, hdr.lumps[LUMP_BSP_FACE_VERTS]);
+        out.bspNodes = ReadLump<BSPNode>(f, hdr.lumps[LUMP_BSP_NODES]);
+        out.bspLeaves = ReadLump<BSPLeaf>(f, hdr.lumps[LUMP_BSP_LEAVES]);
+        out.bspFaceRefs = ReadLump<uint32_t>(f, hdr.lumps[LUMP_BSP_FACE_REFS]);
+    }
+
     fclose(f);
     out.assetPackPath = GetCompanionRresPath(path);
-    printf("[BSP] loaded %s: %zu meshes, %zu hulls, %zu ents, %zu lightmap pages\n",
+    printf("[BSP] loaded %s: %zu meshes, %zu hulls, %zu ents, %zu lightmap pages, %zu bsp faces, %zu bsp nodes, %zu bsp leaves\n",
            path, out.buckets.size(), out.hulls.size(), out.entities.size(),
-           out.lightmapPages.size());
+           out.lightmapPages.size(), out.bspFaces.size(), out.bspNodes.size(), out.bspLeaves.size());
     return true;
 }
 
