@@ -45,6 +45,10 @@ constexpr float kRayEps = 1e-4f;
 
 using GpuPointLight = warped_lightmap_bake_point_light_t;
 using GpuOccluderTri = warped_lightmap_bake_occluder_tri_t;
+using GpuBrushSolid = warped_lightmap_bake_brush_solid_t;
+using GpuSolidPlane = warped_lightmap_bake_solid_plane_t;
+using GpuRepairSourcePoly = warped_lightmap_bake_repair_source_poly_t;
+using GpuRepairSourceNeighbor = warped_lightmap_bake_repair_source_neighbor_t;
 using GpuFaceParams = warped_lightmap_bake_cs_face_params_t;
 using GpuPackedPixel = warped_lightmap_bake_packed_pixel_t;
 
@@ -363,6 +367,10 @@ bool LightmapComputePlatform_ReadbackBuffer(sg_buffer buffer, size_t numBytes, v
 
 bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          const std::vector<LightmapComputeOccluderTri>& occluders,
+                         const std::vector<LightmapComputeBrushSolid>& brushSolids,
+                         const std::vector<LightmapComputeSolidPlane>& solidPlanes,
+                         const std::vector<LightmapComputeRepairSourcePoly>& repairSourcePolys,
+                         const std::vector<LightmapComputeRepairSourceNeighbor>& repairSourceNeighbors,
                          const std::vector<PointLight>& lights,
                          const LightBakeSettings& settings,
                          float skyTraceDistance,
@@ -411,6 +419,52 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         gpuOccluders[i]._pad4 = 0.0f;
     }
 
+    std::vector<GpuBrushSolid> gpuBrushSolids(std::max<size_t>(1, brushSolids.size()));
+    for (size_t i = 0; i < brushSolids.size(); ++i) {
+        gpuBrushSolids[i].first_plane = brushSolids[i].firstPlane;
+        gpuBrushSolids[i].plane_count = brushSolids[i].planeCount;
+        gpuBrushSolids[i]._pad[0] = 0.0f;
+        gpuBrushSolids[i]._pad[1] = 0.0f;
+    }
+
+    std::vector<GpuSolidPlane> gpuSolidPlanes(std::max<size_t>(1, solidPlanes.size()));
+    for (size_t i = 0; i < solidPlanes.size(); ++i) {
+        CopyVec3(gpuSolidPlanes[i].point, solidPlanes[i].point);
+        gpuSolidPlanes[i]._pad0 = 0.0f;
+        CopyVec3(gpuSolidPlanes[i].normal, solidPlanes[i].normal);
+        gpuSolidPlanes[i]._pad1 = 0.0f;
+    }
+
+    std::vector<GpuRepairSourcePoly> gpuRepairSourcePolys(std::max<size_t>(1, repairSourcePolys.size()));
+    for (size_t i = 0; i < repairSourcePolys.size(); ++i) {
+        CopyVec3(gpuRepairSourcePolys[i].plane_point, repairSourcePolys[i].planePoint);
+        gpuRepairSourcePolys[i]._pad0 = 0.0f;
+        CopyVec3(gpuRepairSourcePolys[i].axis_u, repairSourcePolys[i].axisU);
+        gpuRepairSourcePolys[i]._pad1 = 0.0f;
+        CopyVec3(gpuRepairSourcePolys[i].axis_v, repairSourcePolys[i].axisV);
+        gpuRepairSourcePolys[i]._pad2 = 0.0f;
+        CopyVec3(gpuRepairSourcePolys[i].normal, repairSourcePolys[i].normal);
+        gpuRepairSourcePolys[i].poly_count = repairSourcePolys[i].polyCount;
+        gpuRepairSourcePolys[i].first_neighbor = repairSourcePolys[i].firstNeighbor;
+        gpuRepairSourcePolys[i].neighbor_count = repairSourcePolys[i].neighborCount;
+        gpuRepairSourcePolys[i]._pad3[0] = 0.0f;
+        gpuRepairSourcePolys[i]._pad3[1] = 0.0f;
+        for (int vi = 0; vi < LIGHTMAP_COMPUTE_MAX_POLY_VERTS; ++vi) {
+            gpuRepairSourcePolys[i].poly_verts[vi][0] = repairSourcePolys[i].polyVerts[vi][0];
+            gpuRepairSourcePolys[i].poly_verts[vi][1] = repairSourcePolys[i].polyVerts[vi][1];
+            gpuRepairSourcePolys[i].poly_verts[vi][2] = repairSourcePolys[i].polyVerts[vi][2];
+            gpuRepairSourcePolys[i].poly_verts[vi][3] = repairSourcePolys[i].polyVerts[vi][3];
+        }
+    }
+
+    std::vector<GpuRepairSourceNeighbor> gpuRepairSourceNeighbors(std::max<size_t>(1, repairSourceNeighbors.size()));
+    for (size_t i = 0; i < repairSourceNeighbors.size(); ++i) {
+        gpuRepairSourceNeighbors[i].source_poly_index = repairSourceNeighbors[i].sourcePolyIndex;
+        gpuRepairSourceNeighbors[i].edge_index = repairSourceNeighbors[i].edgeIndex;
+        gpuRepairSourceNeighbors[i]._pad[0] = 0.0f;
+        gpuRepairSourceNeighbors[i]._pad[1] = 0.0f;
+    }
+
     sg_environment environment{};
     if (!LightmapComputePlatform_Init(&environment, error)) {
         return false;
@@ -419,9 +473,17 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     bool success = false;
     sg_buffer lightsBuffer{};
     sg_buffer occluderBuffer{};
+    sg_buffer solidBuffer{};
+    sg_buffer solidPlaneBuffer{};
+    sg_buffer repairSourcePolyBuffer{};
+    sg_buffer repairSourceNeighborBuffer{};
     sg_buffer outputBuffer{};
     sg_view lightsView{};
     sg_view occluderView{};
+    sg_view solidView{};
+    sg_view solidPlaneView{};
+    sg_view repairSourcePolyView{};
+    sg_view repairSourceNeighborView{};
     sg_view outputView{};
     sg_shader shader{};
     sg_pipeline pipeline{};
@@ -429,17 +491,25 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     sg_pipeline_desc pipelineDesc{};
     sg_buffer_desc lightsDesc{};
     sg_buffer_desc occluderDesc{};
+    sg_buffer_desc solidDesc{};
+    sg_buffer_desc solidPlaneDesc{};
+    sg_buffer_desc repairSourcePolyDesc{};
+    sg_buffer_desc repairSourceNeighborDesc{};
     sg_buffer_desc outputDesc{};
     sg_view_desc lightsViewDesc{};
     sg_view_desc occluderViewDesc{};
+    sg_view_desc solidViewDesc{};
+    sg_view_desc solidPlaneViewDesc{};
+    sg_view_desc repairSourcePolyViewDesc{};
+    sg_view_desc repairSourceNeighborViewDesc{};
     sg_view_desc outputViewDesc{};
     sg_pass pass{};
     sg_bindings bindings{};
 
-    setupDesc.buffer_pool_size = 8;
+    setupDesc.buffer_pool_size = 10;
     setupDesc.shader_pool_size = 2;
     setupDesc.pipeline_pool_size = 2;
-    setupDesc.view_pool_size = 8;
+    setupDesc.view_pool_size = 10;
     // One face-params upload is issued per rect dispatch. On Metal these uploads
     // are placed into a ring buffer with 256-byte alignment, so a 32-rect batch
     // needs far more than the old fixed 4 KB allocation.
@@ -494,6 +564,34 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     occluderDesc.label = "lightmap-occluders";
     occluderBuffer = sg_make_buffer(&occluderDesc);
 
+    solidDesc.size = gpuBrushSolids.size() * sizeof(GpuBrushSolid);
+    solidDesc.usage.storage_buffer = true;
+    solidDesc.usage.immutable = true;
+    solidDesc.data = ByteRange(gpuBrushSolids);
+    solidDesc.label = "lightmap-solids";
+    solidBuffer = sg_make_buffer(&solidDesc);
+
+    solidPlaneDesc.size = gpuSolidPlanes.size() * sizeof(GpuSolidPlane);
+    solidPlaneDesc.usage.storage_buffer = true;
+    solidPlaneDesc.usage.immutable = true;
+    solidPlaneDesc.data = ByteRange(gpuSolidPlanes);
+    solidPlaneDesc.label = "lightmap-solid-planes";
+    solidPlaneBuffer = sg_make_buffer(&solidPlaneDesc);
+
+    repairSourcePolyDesc.size = gpuRepairSourcePolys.size() * sizeof(GpuRepairSourcePoly);
+    repairSourcePolyDesc.usage.storage_buffer = true;
+    repairSourcePolyDesc.usage.immutable = true;
+    repairSourcePolyDesc.data = ByteRange(gpuRepairSourcePolys);
+    repairSourcePolyDesc.label = "lightmap-repair-source-polys";
+    repairSourcePolyBuffer = sg_make_buffer(&repairSourcePolyDesc);
+
+    repairSourceNeighborDesc.size = gpuRepairSourceNeighbors.size() * sizeof(GpuRepairSourceNeighbor);
+    repairSourceNeighborDesc.usage.storage_buffer = true;
+    repairSourceNeighborDesc.usage.immutable = true;
+    repairSourceNeighborDesc.data = ByteRange(gpuRepairSourceNeighbors);
+    repairSourceNeighborDesc.label = "lightmap-repair-source-neighbors";
+    repairSourceNeighborBuffer = sg_make_buffer(&repairSourceNeighborDesc);
+
     outputDesc.size = packedPixels.size() * sizeof(GpuPackedPixel);
     outputDesc.usage.storage_buffer = true;
     outputDesc.usage.immutable = true;
@@ -502,12 +600,20 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     outputBuffer = sg_make_buffer(&outputDesc);
     if ((sg_query_buffer_state(lightsBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(occluderBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(solidBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(solidPlaneBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(repairSourcePolyBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(repairSourceNeighborBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(outputBuffer) != SG_RESOURCESTATE_VALID))
     {
         SetError(error,
-                 "Failed to create compute buffers: lights=%s occluders=%s output=%s.",
+                 "Failed to create compute buffers: lights=%s occluders=%s solids=%s solid_planes=%s repair_polys=%s repair_neighbors=%s output=%s.",
                  ResourceStateName(sg_query_buffer_state(lightsBuffer)),
                  ResourceStateName(sg_query_buffer_state(occluderBuffer)),
+                 ResourceStateName(sg_query_buffer_state(solidBuffer)),
+                 ResourceStateName(sg_query_buffer_state(solidPlaneBuffer)),
+                 ResourceStateName(sg_query_buffer_state(repairSourcePolyBuffer)),
+                 ResourceStateName(sg_query_buffer_state(repairSourceNeighborBuffer)),
                  ResourceStateName(sg_query_buffer_state(outputBuffer)));
         goto cleanup;
     }
@@ -520,17 +626,41 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     occluderViewDesc.label = "lightmap-occluders-view";
     occluderView = sg_make_view(&occluderViewDesc);
 
+    solidViewDesc.storage_buffer.buffer = solidBuffer;
+    solidViewDesc.label = "lightmap-solids-view";
+    solidView = sg_make_view(&solidViewDesc);
+
+    solidPlaneViewDesc.storage_buffer.buffer = solidPlaneBuffer;
+    solidPlaneViewDesc.label = "lightmap-solid-planes-view";
+    solidPlaneView = sg_make_view(&solidPlaneViewDesc);
+
+    repairSourcePolyViewDesc.storage_buffer.buffer = repairSourcePolyBuffer;
+    repairSourcePolyViewDesc.label = "lightmap-repair-source-polys-view";
+    repairSourcePolyView = sg_make_view(&repairSourcePolyViewDesc);
+
+    repairSourceNeighborViewDesc.storage_buffer.buffer = repairSourceNeighborBuffer;
+    repairSourceNeighborViewDesc.label = "lightmap-repair-source-neighbors-view";
+    repairSourceNeighborView = sg_make_view(&repairSourceNeighborViewDesc);
+
     outputViewDesc.storage_buffer.buffer = outputBuffer;
     outputViewDesc.label = "lightmap-output-view";
     outputView = sg_make_view(&outputViewDesc);
     if ((sg_query_view_state(lightsView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(occluderView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(solidView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(solidPlaneView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(repairSourcePolyView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(repairSourceNeighborView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(outputView) != SG_RESOURCESTATE_VALID))
     {
         SetError(error,
-                 "Failed to create compute buffer views: lights=%s occluders=%s output=%s.",
+                 "Failed to create compute buffer views: lights=%s occluders=%s solids=%s solid_planes=%s repair_polys=%s repair_neighbors=%s output=%s.",
                  ResourceStateName(sg_query_view_state(lightsView)),
                  ResourceStateName(sg_query_view_state(occluderView)),
+                 ResourceStateName(sg_query_view_state(solidView)),
+                 ResourceStateName(sg_query_view_state(solidPlaneView)),
+                 ResourceStateName(sg_query_view_state(repairSourcePolyView)),
+                 ResourceStateName(sg_query_view_state(repairSourceNeighborView)),
                  ResourceStateName(sg_query_view_state(outputView)));
         goto cleanup;
     }
@@ -541,6 +671,10 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
 
     bindings.views[VIEW_warped_lightmap_bake_cs_lights] = lightsView;
     bindings.views[VIEW_warped_lightmap_bake_cs_occluders] = occluderView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_solids] = solidView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_solid_planes] = solidPlaneView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_repair_source_polys] = repairSourcePolyView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_repair_source_neighbors] = repairSourceNeighborView;
     bindings.views[VIEW_warped_lightmap_bake_cs_output] = outputView;
 
     for (size_t batchStart = 0; batchStart < rects.size(); batchStart += kDispatchBatchSize) {
@@ -560,6 +694,12 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             params.rect_h = rect.h;
             params.light_count = (int) lights.size();
             params.tri_count = (int) occluders.size();
+            params.solid_count = (int) brushSolids.size();
+            params.solid_plane_count = (int) solidPlanes.size();
+            params.repair_poly_count = (int) repairSourcePolys.size();
+            params.repair_link_count = (int) repairSourceNeighbors.size();
+            params.repair_source_poly_index = rect.sourcePolyIndex;
+            params._pad_repair0 = 0;
             params.min_u = rect.minU;
             params.min_v = rect.minV;
             params.luxel_size = rect.luxelSize;
@@ -591,9 +731,7 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             CopyVec3(params.normal, rect.normal);
             params._pad3 = 0.0f;
             params.poly_count = rect.polyCount;
-            params._pad_poly_count[0] = 0.0f;
-            params._pad_poly_count[1] = 0.0f;
-            params._pad_poly_count[2] = 0.0f;
+            params._pad_poly_count = 0;
             params.phong_base_normal_weight[0] = rect.phongBaseNormal.x;
             params.phong_base_normal_weight[1] = rect.phongBaseNormal.y;
             params.phong_base_normal_weight[2] = rect.phongBaseNormal.z;
@@ -659,6 +797,18 @@ cleanup:
     if (outputView.id) {
         sg_destroy_view(outputView);
     }
+    if (repairSourceNeighborView.id) {
+        sg_destroy_view(repairSourceNeighborView);
+    }
+    if (repairSourcePolyView.id) {
+        sg_destroy_view(repairSourcePolyView);
+    }
+    if (solidPlaneView.id) {
+        sg_destroy_view(solidPlaneView);
+    }
+    if (solidView.id) {
+        sg_destroy_view(solidView);
+    }
     if (occluderView.id) {
         sg_destroy_view(occluderView);
     }
@@ -667,6 +817,18 @@ cleanup:
     }
     if (outputBuffer.id) {
         sg_destroy_buffer(outputBuffer);
+    }
+    if (repairSourceNeighborBuffer.id) {
+        sg_destroy_buffer(repairSourceNeighborBuffer);
+    }
+    if (repairSourcePolyBuffer.id) {
+        sg_destroy_buffer(repairSourcePolyBuffer);
+    }
+    if (solidPlaneBuffer.id) {
+        sg_destroy_buffer(solidPlaneBuffer);
+    }
+    if (solidBuffer.id) {
+        sg_destroy_buffer(solidBuffer);
     }
     if (occluderBuffer.id) {
         sg_destroy_buffer(occluderBuffer);

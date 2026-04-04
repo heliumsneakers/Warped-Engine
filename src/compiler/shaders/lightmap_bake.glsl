@@ -1,6 +1,40 @@
 @module warped_lightmap_bake
 
 @cs cs_bake
+struct brush_solid {
+    int first_plane;
+    int plane_count;
+    vec2 _pad;
+};
+
+struct solid_plane {
+    vec3 point;
+    float _pad0;
+    vec3 normal;
+    float _pad1;
+};
+
+struct repair_source_neighbor {
+    int source_poly_index;
+    int edge_index;
+    vec2 _pad;
+};
+
+struct repair_source_poly {
+    vec3 plane_point;
+    float _pad0;
+    vec3 axis_u;
+    float _pad1;
+    vec3 axis_v;
+    float _pad2;
+    vec3 normal;
+    int poly_count;
+    int first_neighbor;
+    int neighbor_count;
+    vec2 _pad3;
+    vec4 poly_verts[32];
+};
+
 layout(binding=0) uniform cs_face_params {
     int atlas_width;
     int atlas_height;
@@ -10,6 +44,12 @@ layout(binding=0) uniform cs_face_params {
     int rect_h;
     int light_count;
     int tri_count;
+    int solid_count;
+    int solid_plane_count;
+    int repair_poly_count;
+    int repair_link_count;
+    int repair_source_poly_index;
+    int _pad_repair0;
     float min_u;
     float min_v;
     float luxel_size;
@@ -40,7 +80,7 @@ layout(binding=0) uniform cs_face_params {
     vec3 normal;
     float _pad3;
     int poly_count;
-    vec3 _pad_poly_count;
+    int _pad_poly_count;
     vec4 phong_base_normal_weight;
     vec4 poly_verts[32];
     vec4 phong_neighbor_edge_a[32];
@@ -94,7 +134,23 @@ layout(binding=1) readonly buffer cs_occluders {
     occluder_tri tris[];
 };
 
-layout(binding=2) buffer cs_output {
+layout(binding=2) readonly buffer cs_solids {
+    brush_solid solids[];
+};
+
+layout(binding=3) readonly buffer cs_solid_planes {
+    solid_plane solid_planes[];
+};
+
+layout(binding=4) readonly buffer cs_repair_source_polys {
+    repair_source_poly repair_source_polys[];
+};
+
+layout(binding=5) readonly buffer cs_repair_source_neighbors {
+    repair_source_neighbor repair_source_neighbors[];
+};
+
+layout(binding=6) buffer cs_output {
     packed_pixel pixels[];
 };
 
@@ -118,6 +174,7 @@ const int DIRT_RAY_COUNT = DIRT_NUM_ANGLE_STEPS * DIRT_NUM_ELEVATION_STEPS;
 const int SKYDOME_ELEVATION_STEPS = 5;
 const int SKYDOME_ANGLE_STEPS = SKYDOME_ELEVATION_STEPS * 4;
 const int SKYDOME_SAMPLE_COUNT = SKYDOME_ANGLE_STEPS * SKYDOME_ELEVATION_STEPS + 1;
+const int REPAIR_RECURSION_MAX = 3;
 
 vec3 safe_normalize(vec3 v, vec3 fallback) {
     float len_sq = dot(v, v);
@@ -133,11 +190,11 @@ void face_basis(vec3 n, out vec3 u, out vec3 v) {
     v = cross(n, u);
 }
 
-bool inside_poly_2d(float px, float py) {
-    for (int i = 0; i < poly_count; ++i) {
-        int j = (i + 1) % poly_count;
-        vec2 a = poly_verts[i].xy;
-        vec2 b = poly_verts[j].xy;
+bool inside_poly_array(float px, float py, int count, vec4 verts[32]) {
+    for (int i = 0; i < count; ++i) {
+        int j = (i + 1) % count;
+        vec2 a = verts[i].xy;
+        vec2 b = verts[j].xy;
         vec2 edge = b - a;
         vec2 rel = vec2(px, py) - a;
         if ((edge.x * rel.y - edge.y * rel.x) < -1e-3) {
@@ -145,6 +202,10 @@ bool inside_poly_2d(float px, float py) {
         }
     }
     return true;
+}
+
+bool inside_poly_2d(float px, float py) {
+    return inside_poly_array(px, py, poly_count, poly_verts);
 }
 
 float dist_sq_point_segment_2d(vec2 p, vec2 a, vec2 b) {
@@ -168,6 +229,30 @@ float min_dist_to_poly_edge_2d(float px, float py) {
         min_dist_sq = min(min_dist_sq, dist_sq_point_segment_2d(p, poly_verts[i].xy, poly_verts[j].xy));
     }
     return sqrt(min_dist_sq);
+}
+
+vec2 closest_point_on_poly_boundary_2d(vec2 p, int count, vec4 verts[32]) {
+    vec2 best = p;
+    float best_dist_sq = 3.402823e38;
+    for (int i = 0; i < count; ++i) {
+        int j = (i + 1) % count;
+        vec2 a = verts[i].xy;
+        vec2 b = verts[j].xy;
+        vec2 ab = b - a;
+        float ab_len_sq = dot(ab, ab);
+        float t = 0.0;
+        if (ab_len_sq > 1e-8) {
+            t = clamp(dot(p - a, ab) / ab_len_sq, 0.0, 1.0);
+        }
+        vec2 q = a + ab * t;
+        vec2 d = p - q;
+        float dist_sq = dot(d, d);
+        if (dist_sq < best_dist_sq) {
+            best_dist_sq = dist_sq;
+            best = q;
+        }
+    }
+    return best;
 }
 
 float dist_point_segment_3d(vec3 p, vec3 a, vec3 b) {
@@ -316,6 +401,32 @@ float closest_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, int ig
     return closest;
 }
 
+vec3 project_point_onto_plane(vec3 point, vec3 plane_point, vec3 plane_normal) {
+    vec3 n = safe_normalize(plane_normal, vec3(0.0, 1.0, 0.0));
+    float plane_dist = dot(n, point - plane_point);
+    return point - n * plane_dist;
+}
+
+bool point_inside_brush_solid(brush_solid solid, vec3 point) {
+    for (int i = 0; i < solid.plane_count; ++i) {
+        solid_plane plane = solid_planes[solid.first_plane + i];
+        float plane_dist = dot(plane.normal, point - plane.point);
+        if (plane_dist > 0.05) {
+            return false;
+        }
+    }
+    return solid.plane_count > 0;
+}
+
+bool point_inside_any_solid(vec3 point) {
+    for (int i = 0; i < solid_count; ++i) {
+        if (point_inside_brush_solid(solids[i], point)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 uint pack_rgba8(vec4 color) {
     uvec4 c = uvec4(clamp(color, 0.0, 1.0) * 255.0);
     return (c.x) | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
@@ -412,6 +523,318 @@ vec3 build_ericw_dirt_vector(int sample_index, inout uint state) {
     float elevation = elevation_step * (0.5 + float(elevation_index));
     float sin_elevation = sin(elevation);
     return vec3(sin_elevation * cos(angle), sin_elevation * sin(angle), cos(elevation));
+}
+
+struct repaired_sample {
+    vec3 plane_point;
+    vec3 sample_point;
+    int source_poly_index;
+};
+
+bool repair_source_poly_valid(int source_poly_index) {
+    return (source_poly_index >= 0) &&
+           (source_poly_index < repair_poly_count) &&
+           (repair_source_polys[source_poly_index].poly_count > 0);
+}
+
+bool inside_repair_source_poly(int source_poly_index, vec2 point_uv) {
+    if (!repair_source_poly_valid(source_poly_index)) {
+        return false;
+    }
+
+    int count = repair_source_polys[source_poly_index].poly_count;
+    for (int i = 0; i < count; ++i) {
+        int j = (i + 1) % count;
+        vec2 a = repair_source_polys[source_poly_index].poly_verts[i].xy;
+        vec2 b = repair_source_polys[source_poly_index].poly_verts[j].xy;
+        vec2 edge = b - a;
+        vec2 rel = point_uv - a;
+        if ((edge.x * rel.y - edge.y * rel.x) < -1e-3) {
+            return false;
+        }
+    }
+    return count > 0;
+}
+
+vec2 closest_point_on_repair_source_poly_boundary_2d(vec2 point_uv, int source_poly_index) {
+    if (!repair_source_poly_valid(source_poly_index)) {
+        return point_uv;
+    }
+
+    int count = repair_source_polys[source_poly_index].poly_count;
+    vec2 best = point_uv;
+    float best_dist_sq = 3.402823e38;
+    for (int i = 0; i < count; ++i) {
+        int j = (i + 1) % count;
+        vec2 a = repair_source_polys[source_poly_index].poly_verts[i].xy;
+        vec2 b = repair_source_polys[source_poly_index].poly_verts[j].xy;
+        vec2 ab = b - a;
+        float ab_len_sq = dot(ab, ab);
+        float t = 0.0;
+        if (ab_len_sq > 1e-8) {
+            t = clamp(dot(point_uv - a, ab) / ab_len_sq, 0.0, 1.0);
+        }
+        vec2 q = a + ab * t;
+        vec2 d = point_uv - q;
+        float dist_sq = dot(d, d);
+        if (dist_sq < best_dist_sq) {
+            best_dist_sq = dist_sq;
+            best = q;
+        }
+    }
+    return best;
+}
+
+float repair_edge_distance(int source_poly_index, int edge_index, vec2 point_uv) {
+    if (!repair_source_poly_valid(source_poly_index)) {
+        return 3.402823e38;
+    }
+    int count = repair_source_polys[source_poly_index].poly_count;
+    if ((edge_index < 0) || (edge_index >= count)) {
+        return 3.402823e38;
+    }
+    vec2 a = repair_source_polys[source_poly_index].poly_verts[edge_index].xy;
+    vec2 b = repair_source_polys[source_poly_index].poly_verts[(edge_index + 1) % count].xy;
+    return sqrt(dist_sq_point_segment_2d(point_uv, a, b));
+}
+
+int find_best_repair_edge_index(int source_poly_index, vec2 point_uv) {
+    if (!repair_source_poly_valid(source_poly_index)) {
+        return -1;
+    }
+
+    int count = repair_source_polys[source_poly_index].poly_count;
+    int best_edge_index = -1;
+    float best_edge_dist = 3.402823e38;
+    for (int i = 0; i < count; ++i) {
+        int j = (i + 1) % count;
+        vec2 a = repair_source_polys[source_poly_index].poly_verts[i].xy;
+        vec2 b = repair_source_polys[source_poly_index].poly_verts[j].xy;
+        vec2 edge = b - a;
+        vec2 rel = point_uv - a;
+        if ((edge.x * rel.y - edge.y * rel.x) >= -1e-3) {
+            continue;
+        }
+
+        float edge_len = length(edge);
+        float edge_len_sq = edge_len * edge_len;
+        float t = (edge_len_sq > 1e-8) ? dot(point_uv - a, edge) / edge_len_sq : 0.0;
+        float edge_dist = 0.0;
+        if (t < 0.0) {
+            edge_dist = abs(t) * edge_len;
+        } else if (t > 1.0) {
+            edge_dist = (t - 1.0) * edge_len;
+        }
+        if (edge_dist < best_edge_dist) {
+            best_edge_dist = edge_dist;
+            best_edge_index = i;
+        }
+    }
+    return best_edge_index;
+}
+
+bool source_poly_visited(int visited[REPAIR_RECURSION_MAX + 1], int visited_count, int source_poly_index) {
+    for (int i = 0; i < visited_count; ++i) {
+        if (visited[i] == source_poly_index) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool try_repair_candidate(vec3 plane_point, vec3 face_normal, out vec3 repaired_point) {
+    repaired_point = plane_point + safe_normalize(face_normal, normal) * SURFACE_SAMPLE_OFFSET;
+    if (!point_inside_any_solid(repaired_point)) {
+        return true;
+    }
+
+    for (int x = -1; x <= 1; x += 2) {
+        for (int y = -1; y <= 1; y += 2) {
+            for (int z = -1; z <= 1; z += 2) {
+                vec3 jitter = vec3(float(x), float(y), float(z)) * 0.5;
+                vec3 jittered = repaired_point + jitter;
+                if (!point_inside_any_solid(jittered)) {
+                    repaired_point = jittered;
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+bool try_recursive_repair_walk(int start_source_poly_index, vec3 start_seed_point, out repaired_sample result) {
+    int stack_poly[REPAIR_RECURSION_MAX + 1];
+    vec3 stack_seed[REPAIR_RECURSION_MAX + 1];
+    vec3 stack_projected[REPAIR_RECURSION_MAX + 1];
+    vec2 stack_projected_uv[REPAIR_RECURSION_MAX + 1];
+    vec3 stack_face_seed[REPAIR_RECURSION_MAX + 1];
+    int stack_stage[REPAIR_RECURSION_MAX + 1];
+    int stack_inside_face[REPAIR_RECURSION_MAX + 1];
+    int stack_best_edge[REPAIR_RECURSION_MAX + 1];
+    int stack_last_neighbor[REPAIR_RECURSION_MAX + 1];
+    float stack_last_metric[REPAIR_RECURSION_MAX + 1];
+    int visited[REPAIR_RECURSION_MAX + 1];
+
+    int depth = 0;
+    stack_poly[0] = start_source_poly_index;
+    stack_seed[0] = start_seed_point;
+    stack_stage[0] = 0;
+    stack_inside_face[0] = 0;
+    stack_best_edge[0] = -1;
+    stack_last_neighbor[0] = -1;
+    stack_last_metric[0] = -1.0;
+    visited[0] = start_source_poly_index;
+
+    while (depth >= 0) {
+        int source_poly_index = stack_poly[depth];
+        if (!repair_source_poly_valid(source_poly_index)) {
+            depth -= 1;
+            continue;
+        }
+
+        repair_source_poly poly = repair_source_polys[source_poly_index];
+        if (stack_stage[depth] == 0) {
+            vec3 projected = project_point_onto_plane(stack_seed[depth], poly.plane_point, poly.normal);
+            vec2 projected_uv = vec2(dot(projected, poly.axis_u), dot(projected, poly.axis_v));
+            stack_projected[depth] = projected;
+            stack_projected_uv[depth] = projected_uv;
+            stack_face_seed[depth] = projected + safe_normalize(poly.normal, normal) * SURFACE_SAMPLE_OFFSET;
+            stack_inside_face[depth] = inside_repair_source_poly(source_poly_index, projected_uv) ? 1 : 0;
+            stack_best_edge[depth] = (stack_inside_face[depth] != 0)
+                ? -1
+                : find_best_repair_edge_index(source_poly_index, projected_uv);
+            stack_last_neighbor[depth] = -1;
+            stack_last_metric[depth] = -1.0;
+
+            if (stack_inside_face[depth] != 0) {
+                vec3 repaired_point;
+                if (try_repair_candidate(projected, poly.normal, repaired_point)) {
+                    result.plane_point = projected;
+                    result.sample_point = repaired_point;
+                    result.source_poly_index = source_poly_index;
+                    return true;
+                }
+            }
+
+            stack_stage[depth] = 1;
+            continue;
+        }
+
+        if (stack_stage[depth] == 1) {
+            bool pushed_child = false;
+            if (depth < REPAIR_RECURSION_MAX && poly.neighbor_count > 0) {
+                int best_neighbor_buffer_index = -1;
+                int best_neighbor_source_poly = -1;
+                float best_metric = 3.402823e38;
+                float edge_limit = max(1.0, luxel_size * 1.5);
+                for (int i = 0; i < poly.neighbor_count; ++i) {
+                    int neighbor_buffer_index = poly.first_neighbor + i;
+                    if ((neighbor_buffer_index < 0) || (neighbor_buffer_index >= repair_link_count)) {
+                        continue;
+                    }
+                    repair_source_neighbor neighbor = repair_source_neighbors[neighbor_buffer_index];
+                    if ((neighbor.source_poly_index < 0) ||
+                        !repair_source_poly_valid(neighbor.source_poly_index) ||
+                        source_poly_visited(visited, depth + 1, neighbor.source_poly_index))
+                    {
+                        continue;
+                    }
+
+                    float metric = 0.0;
+                    if (stack_inside_face[depth] != 0) {
+                        metric = repair_edge_distance(source_poly_index, neighbor.edge_index, stack_projected_uv[depth]);
+                        if (metric > edge_limit) {
+                            continue;
+                        }
+                    } else {
+                        if (neighbor.edge_index != stack_best_edge[depth]) {
+                            continue;
+                        }
+                    }
+
+                    if ((metric < stack_last_metric[depth] - 1e-4) ||
+                        ((abs(metric - stack_last_metric[depth]) <= 1e-4) && (neighbor_buffer_index <= stack_last_neighbor[depth])))
+                    {
+                        continue;
+                    }
+
+                    if ((best_neighbor_buffer_index < 0) ||
+                        (metric < best_metric - 1e-4) ||
+                        ((abs(metric - best_metric) <= 1e-4) && (neighbor_buffer_index < best_neighbor_buffer_index)))
+                    {
+                        best_neighbor_buffer_index = neighbor_buffer_index;
+                        best_neighbor_source_poly = neighbor.source_poly_index;
+                        best_metric = metric;
+                    }
+                }
+
+                if (best_neighbor_buffer_index >= 0) {
+                    stack_last_neighbor[depth] = best_neighbor_buffer_index;
+                    stack_last_metric[depth] = best_metric;
+                    depth += 1;
+                    stack_poly[depth] = best_neighbor_source_poly;
+                    stack_seed[depth] = stack_face_seed[depth - 1];
+                    stack_stage[depth] = 0;
+                    stack_inside_face[depth] = 0;
+                    stack_best_edge[depth] = -1;
+                    stack_last_neighbor[depth] = -1;
+                    stack_last_metric[depth] = -1.0;
+                    visited[depth] = best_neighbor_source_poly;
+                    pushed_child = true;
+                }
+            }
+
+            if (pushed_child) {
+                continue;
+            }
+
+            stack_stage[depth] = 2;
+            continue;
+        }
+
+        vec2 snapped_uv = closest_point_on_repair_source_poly_boundary_2d(stack_projected_uv[depth], source_poly_index);
+        vec3 snapped_point = stack_projected[depth]
+            + poly.axis_u * (snapped_uv.x - stack_projected_uv[depth].x)
+            + poly.axis_v * (snapped_uv.y - stack_projected_uv[depth].y);
+        if (distance(snapped_point, stack_projected[depth]) <= luxel_size) {
+            vec3 repaired_point;
+            if (try_repair_candidate(snapped_point, poly.normal, repaired_point)) {
+                result.plane_point = snapped_point;
+                result.sample_point = repaired_point;
+                result.source_poly_index = source_poly_index;
+                return true;
+            }
+        }
+
+        depth -= 1;
+    }
+
+    return false;
+}
+
+repaired_sample repair_sample_point(vec3 plane_point) {
+    repaired_sample result;
+    result.plane_point = plane_point;
+    result.sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * SURFACE_SAMPLE_OFFSET;
+    result.source_poly_index = repair_source_poly_index;
+    if (!point_inside_any_solid(result.sample_point)) {
+        return result;
+    }
+
+    if (try_repair_candidate(plane_point, normal, result.sample_point)) {
+        return result;
+    }
+
+    if (repair_source_poly_valid(repair_source_poly_index)) {
+        repaired_sample repaired;
+        if (try_recursive_repair_walk(repair_source_poly_index, result.sample_point, repaired)) {
+            return repaired;
+        }
+    }
+
+    return result;
 }
 
 vec3 sample_cone_direction(vec3 axis, float cone_angle_deg, int sample_index, int sample_count) {
@@ -535,8 +958,9 @@ void main() {
                 continue;
             }
             vec3 plane_point = origin + axis_u * (ju * luxel_size) + axis_v * (jv * luxel_size);
-            vec3 sample_normal = evaluate_phong_normal(plane_point);
-            vec3 sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * SURFACE_SAMPLE_OFFSET;
+            repaired_sample repaired = repair_sample_point(plane_point);
+            vec3 sample_normal = evaluate_phong_normal(repaired.plane_point);
+            vec3 sample_point = repaired.sample_point;
             float edge_dist_luxels = min_dist_to_poly_edge_2d(ju, jv);
             float edge_factor = clamp(1.0 - edge_dist_luxels / EDGE_SEAM_GUARD_LUXELS, 0.0, 1.0);
             float near_hit_t = shadow_bias + (shadow_bias * EDGE_SEAM_TMIN_SCALE) * edge_factor;

@@ -22,6 +22,8 @@ static constexpr int   LIGHTMAP_PAGE_SIZE = 2048;
 static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face luxel cap (interior only)
 static constexpr float SURFACE_SAMPLE_OFFSET = 1.0f;
 static constexpr float SHADOW_BIAS        = 0.03125f;
+static constexpr float SOLID_REPAIR_EPSILON = 0.05f;
+static constexpr float SAMPLE_REPAIR_JITTER = 0.5f;
 static constexpr float RAY_EPS            = 1e-4f;
 static constexpr float OCCLUSION_NEAR_TMIN = SHADOW_BIAS;
 static constexpr float EDGE_SEAM_GUARD_LUXELS = 0.75f;
@@ -169,6 +171,22 @@ struct PhongSourcePoly {
     Vector3 normal{};
     float areaWeight = 1.0f;
     std::vector<PhongNeighbor> neighbors;
+};
+
+static constexpr int SAMPLE_REPAIR_RECURSION_MAX = 3;
+
+struct RepairSourceNeighbor {
+    uint32_t sourcePolyIndex = 0;
+    int edgeIndex = -1;
+};
+
+struct RepairSourcePoly {
+    Vector3 planePoint{};
+    Vector3 normal{};
+    Vector3 axisU{};
+    Vector3 axisV{};
+    std::vector<Vector2> poly2d;
+    std::vector<RepairSourceNeighbor> neighbors;
 };
 
 static uint32_t HashLightSeed(const Vector3& position, int extra) {
@@ -388,6 +406,28 @@ static bool IsConcaveJoint(const MapPolygon& a, const MapPolygon& b) {
            Vector3DotProduct(b.normal, Vector3Subtract(ca, cb)) > 1e-3f;
 }
 
+static int FindMatchingPolyEdgeIndex(const MapPolygon& poly,
+                                     const Vector3& edgeA,
+                                     const Vector3& edgeB)
+{
+    if (poly.verts.size() < 2) {
+        return -1;
+    }
+
+    constexpr float kMatchEpsilon = 0.05f;
+    for (size_t edgeIndex = 0; edgeIndex < poly.verts.size(); ++edgeIndex) {
+        const Vector3& a = poly.verts[edgeIndex];
+        const Vector3& b = poly.verts[(edgeIndex + 1) % poly.verts.size()];
+        if ((PointsEqualEps(a, edgeA, kMatchEpsilon) && PointsEqualEps(b, edgeB, kMatchEpsilon)) ||
+            (PointsEqualEps(a, edgeB, kMatchEpsilon) && PointsEqualEps(b, edgeA, kMatchEpsilon)))
+        {
+            return (int)edgeIndex;
+        }
+    }
+
+    return -1;
+}
+
 static std::vector<PhongSourcePoly> BuildPhongSourcePolys(const std::vector<MapPolygon>& polys) {
     std::vector<PhongSourcePoly> sourcePolys(polys.size());
     constexpr float kEdgeKeyEpsilon = 0.05f;
@@ -455,6 +495,44 @@ static std::vector<PhongSourcePoly> BuildPhongSourcePolys(const std::vector<MapP
     }
 
     return sourcePolys;
+}
+
+static std::vector<RepairSourcePoly> BuildRepairSourcePolys(const std::vector<MapPolygon>& polys,
+                                                            const std::vector<PhongSourcePoly>& sourcePhongs)
+{
+    std::vector<RepairSourcePoly> repairPolys(polys.size());
+    for (size_t i = 0; i < polys.size(); ++i) {
+        const MapPolygon& poly = polys[i];
+        RepairSourcePoly& repair = repairPolys[i];
+        repair.planePoint = poly.verts.empty() ? Vector3Zero() : poly.verts[0];
+        repair.normal = poly.normal;
+        FaceBasis(poly.normal, repair.axisU, repair.axisV);
+        repair.poly2d.reserve(poly.verts.size());
+        for (const Vector3& vert : poly.verts) {
+            repair.poly2d.push_back({
+                Vector3DotProduct(vert, repair.axisU),
+                Vector3DotProduct(vert, repair.axisV)
+            });
+        }
+
+        if (i >= sourcePhongs.size()) {
+            continue;
+        }
+
+        repair.neighbors.reserve(sourcePhongs[i].neighbors.size());
+        for (const PhongNeighbor& neighbor : sourcePhongs[i].neighbors) {
+            if (neighbor.sourcePolyIndex >= polys.size()) {
+                continue;
+            }
+            const int edgeIndex = FindMatchingPolyEdgeIndex(poly, neighbor.edgeA, neighbor.edgeB);
+            if (edgeIndex < 0) {
+                continue;
+            }
+            repair.neighbors.push_back({ neighbor.sourcePolyIndex, edgeIndex });
+        }
+    }
+
+    return repairPolys;
 }
 
 static Vector3 EvaluatePhongNormal(const std::vector<PhongSourcePoly>& sourcePolys,
@@ -699,6 +777,12 @@ struct BrushSolid {
     std::vector<BrushSolidPlane> planes;
 };
 
+struct RepairedSamplePoint {
+    Vector3 planePoint{};
+    Vector3 samplePoint{};
+    uint32_t sourcePolyIndex = 0;
+};
+
 static bool InsidePoly2D(const std::vector<Vector2>& poly, float px, float py);
 
 static std::vector<BrushSolid> BuildBrushSolids(const std::vector<MapPolygon>& polys) {
@@ -714,7 +798,21 @@ static std::vector<BrushSolid> BuildBrushSolids(const std::vector<MapPolygon>& p
             solid.sourceBrushId = poly.sourceBrushId;
             solids.push_back(std::move(solid));
         }
-        solids[it->second].planes.push_back({ poly.verts[0], Vector3Normalize(poly.normal) });
+        BrushSolid& solid = solids[it->second];
+        const Vector3 normal = Vector3Normalize(poly.normal);
+        bool duplicatePlane = false;
+        for (const BrushSolidPlane& existing : solid.planes) {
+            if (Vector3DotProduct(existing.normal, normal) < 0.9999f) {
+                continue;
+            }
+            if (fabsf(Vector3DotProduct(normal, Vector3Subtract(poly.verts[0], existing.point))) <= 1e-3f) {
+                duplicatePlane = true;
+                break;
+            }
+        }
+        if (!duplicatePlane) {
+            solid.planes.push_back({ poly.verts[0], normal });
+        }
     }
     return solids;
 }
@@ -727,6 +825,15 @@ static bool PointInsideBrushSolid(const BrushSolid& solid, const Vector3& point,
         }
     }
     return !solid.planes.empty();
+}
+
+static bool PointInsideAnySolid(const std::vector<BrushSolid>& solids, const Vector3& point, float epsilon) {
+    for (const BrushSolid& solid : solids) {
+        if (PointInsideBrushSolid(solid, point, epsilon)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static SurfaceVisibilityInfo AnalyzeSurfaceVisibility(const std::vector<MapPolygon>& polys) {
@@ -975,6 +1082,68 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
     return o;
 }
 
+static void BuildComputeBrushSolids(const std::vector<BrushSolid>& solids,
+                                    std::vector<LightmapComputeBrushSolid>* outSolids,
+                                    std::vector<LightmapComputeSolidPlane>* outPlanes)
+{
+    if (!outSolids || !outPlanes) {
+        return;
+    }
+
+    outSolids->clear();
+    outPlanes->clear();
+    outSolids->reserve(solids.size());
+    for (const BrushSolid& solid : solids) {
+        LightmapComputeBrushSolid gpuSolid{};
+        gpuSolid.firstPlane = (int)outPlanes->size();
+        gpuSolid.planeCount = (int)solid.planes.size();
+        outSolids->push_back(gpuSolid);
+        for (const BrushSolidPlane& plane : solid.planes) {
+            LightmapComputeSolidPlane gpuPlane{};
+            gpuPlane.point = plane.point;
+            gpuPlane.normal = plane.normal;
+            outPlanes->push_back(gpuPlane);
+        }
+    }
+}
+
+static void BuildComputeRepairSourceGraph(const std::vector<RepairSourcePoly>& repairPolys,
+                                          std::vector<LightmapComputeRepairSourcePoly>* outPolys,
+                                          std::vector<LightmapComputeRepairSourceNeighbor>* outNeighbors)
+{
+    if (!outPolys || !outNeighbors) {
+        return;
+    }
+
+    outPolys->clear();
+    outNeighbors->clear();
+    outPolys->reserve(repairPolys.size());
+    for (const RepairSourcePoly& repairPoly : repairPolys) {
+        LightmapComputeRepairSourcePoly gpuPoly{};
+        gpuPoly.planePoint = repairPoly.planePoint;
+        gpuPoly.axisU = repairPoly.axisU;
+        gpuPoly.axisV = repairPoly.axisV;
+        gpuPoly.normal = repairPoly.normal;
+        gpuPoly.polyCount = (int)std::min(repairPoly.poly2d.size(), (size_t)LIGHTMAP_COMPUTE_MAX_POLY_VERTS);
+        gpuPoly.firstNeighbor = (int)outNeighbors->size();
+        gpuPoly.neighborCount = (int)repairPoly.neighbors.size();
+        for (int i = 0; i < gpuPoly.polyCount; ++i) {
+            gpuPoly.polyVerts[i][0] = repairPoly.poly2d[(size_t)i].x;
+            gpuPoly.polyVerts[i][1] = repairPoly.poly2d[(size_t)i].y;
+            gpuPoly.polyVerts[i][2] = 0.0f;
+            gpuPoly.polyVerts[i][3] = 0.0f;
+        }
+        outPolys->push_back(gpuPoly);
+
+        for (const RepairSourceNeighbor& neighbor : repairPoly.neighbors) {
+            LightmapComputeRepairSourceNeighbor gpuNeighbor{};
+            gpuNeighbor.sourcePolyIndex = (int)neighbor.sourcePolyIndex;
+            gpuNeighbor.edgeIndex = neighbor.edgeIndex;
+            outNeighbors->push_back(gpuNeighbor);
+        }
+    }
+}
+
 static bool RayTriDistance(const Vector3& ro, const Vector3& rd,
                            const LightmapComputeOccluderTri& tr, float tmin, float tmax, float* outT = nullptr)
 {
@@ -1091,6 +1260,72 @@ static float DistSqPointSegment2D(const Vector2& p, const Vector2& a, const Vect
     return dx * dx + dy * dy;
 }
 
+static Vector2 ClosestPointOnPolyBoundary2D(const std::vector<Vector2>& poly, const Vector2& p) {
+    if (poly.size() < 2) {
+        return p;
+    }
+
+    float bestDistSq = FLT_MAX;
+    Vector2 bestPoint = p;
+    for (size_t i = 0; i < poly.size(); ++i) {
+        const Vector2& a = poly[i];
+        const Vector2& b = poly[(i + 1) % poly.size()];
+        const Vector2 ab = { b.x - a.x, b.y - a.y };
+        const float abLenSq = ab.x * ab.x + ab.y * ab.y;
+        float t = 0.0f;
+        if (abLenSq > 1e-8f) {
+            t = std::clamp(((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / abLenSq, 0.0f, 1.0f);
+        }
+        const Vector2 q = { a.x + ab.x * t, a.y + ab.y * t };
+        const float dx = p.x - q.x;
+        const float dy = p.y - q.y;
+        const float distSq = dx * dx + dy * dy;
+        if (distSq < bestDistSq) {
+            bestDistSq = distSq;
+            bestPoint = q;
+        }
+    }
+
+    return bestPoint;
+}
+
+static int FindBestRepairEdgeIndex(const RepairSourcePoly& poly, const Vector2& pointUv) {
+    if (poly.poly2d.size() < 2) {
+        return -1;
+    }
+
+    int bestEdgeIndex = -1;
+    float bestEdgeDist = FLT_MAX;
+    for (size_t edgeIndex = 0; edgeIndex < poly.poly2d.size(); ++edgeIndex) {
+        const Vector2& a = poly.poly2d[edgeIndex];
+        const Vector2& b = poly.poly2d[(edgeIndex + 1) % poly.poly2d.size()];
+        const Vector2 edge = { b.x - a.x, b.y - a.y };
+        const Vector2 rel = { pointUv.x - a.x, pointUv.y - a.y };
+        if (edge.x * rel.y - edge.y * rel.x >= -1e-3f) {
+            continue;
+        }
+
+        const float edgeLen = sqrtf(std::max(1e-8f, edge.x * edge.x + edge.y * edge.y));
+        const float edgeLenSq = edgeLen * edgeLen;
+        const float t = edgeLenSq > 1e-8f
+            ? ((pointUv.x - a.x) * edge.x + (pointUv.y - a.y) * edge.y) / edgeLenSq
+            : 0.0f;
+        float edgeDist = 0.0f;
+        if (t < 0.0f) {
+            edgeDist = fabsf(t) * edgeLen;
+        } else if (t > 1.0f) {
+            edgeDist = (t - 1.0f) * edgeLen;
+        }
+
+        if (edgeDist < bestEdgeDist) {
+            bestEdgeDist = edgeDist;
+            bestEdgeIndex = (int)edgeIndex;
+        }
+    }
+
+    return bestEdgeIndex;
+}
+
 static float MinDistToPolyEdge2D(const std::vector<Vector2>& poly, float px, float py) {
     if (poly.size() < 2) {
         return 0.0f;
@@ -1103,6 +1338,47 @@ static float MinDistToPolyEdge2D(const std::vector<Vector2>& poly, float px, flo
         minDistSq = std::min(minDistSq, DistSqPointSegment2D(p, a, b));
     }
     return sqrtf(minDistSq);
+}
+
+static Vector3 ProjectPointOntoPlane(const Vector3& point,
+                                     const Vector3& planePoint,
+                                     const Vector3& planeNormal)
+{
+    const Vector3 normal = Vector3Normalize(planeNormal);
+    const float planeDist = Vector3DotProduct(normal, Vector3Subtract(point, planePoint));
+    return Vector3Subtract(point, Vector3Scale(normal, planeDist));
+}
+
+static bool PointInsidePolygonProjected(const std::vector<Vector2>& poly2d,
+                                        const Vector3& point,
+                                        const Vector3& axisU,
+                                        const Vector3& axisV)
+{
+    return InsidePoly2D(poly2d,
+                        Vector3DotProduct(point, axisU),
+                        Vector3DotProduct(point, axisV));
+}
+
+static Vector3 ClosestPointOnPolyBoundaryProjected(const std::vector<Vector2>& poly2d,
+                                                   const Vector3& planePoint,
+                                                   const Vector3& axisU,
+                                                   const Vector3& axisV)
+{
+    if (poly2d.size() < 2) {
+        return planePoint;
+    }
+
+    const Vector2 point2d = {
+        Vector3DotProduct(planePoint, axisU),
+        Vector3DotProduct(planePoint, axisV)
+    };
+    const Vector2 bestPoint = ClosestPointOnPolyBoundary2D(poly2d, point2d);
+
+    const float currentU = Vector3DotProduct(planePoint, axisU);
+    const float currentV = Vector3DotProduct(planePoint, axisV);
+    return Vector3Add(planePoint,
+                      Vector3Add(Vector3Scale(axisU, bestPoint.x - currentU),
+                                 Vector3Scale(axisV, bestPoint.y - currentV)));
 }
 
 struct FaceRect {
@@ -1143,6 +1419,7 @@ static float DistSqPointAABB(const Vector3& p, const AABB& bounds) {
 
 static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patches,
                                             const std::vector<PointLight>& lights,
+                                            const std::vector<RepairSourcePoly>& repairPolys,
                                             const std::vector<PhongSourcePoly>& sourcePhongs,
                                             float luxelSize) {
     std::vector<FaceRect> rects(patches.size());
@@ -1173,8 +1450,16 @@ static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patche
         r.gpu.axisV = V;
         r.gpu.normal = p.normal;
         r.sourcePolyIndex = patches[i].sourcePolyIndex;
+        r.gpu.sourcePolyIndex = (int)r.sourcePolyIndex;
         r.maxU = maxU;
         r.maxV = maxV;
+        if (r.sourcePolyIndex >= repairPolys.size()) {
+            r.computeCompatible = false;
+            r.computeFallbackReason = "page references an invalid repair source polygon";
+        } else if (repairPolys[r.sourcePolyIndex].poly2d.size() > LIGHTMAP_COMPUTE_MAX_POLY_VERTS) {
+            r.computeCompatible = false;
+            r.computeFallbackReason = "page contains source polygon(s) exceeding compute repair vertex limit";
+        }
         if (r.sourcePolyIndex < sourcePhongs.size()) {
             const PhongSourcePoly& source = sourcePhongs[r.sourcePolyIndex];
             r.gpu.phongBaseNormal = source.normal;
@@ -2163,6 +2448,221 @@ static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
     return std::clamp(1.0f - (avgHitDistance / depth), 0.0f, 1.0f);
 }
 
+static bool TryRepairSampleCandidate(const std::vector<BrushSolid>& solids,
+                                     const Vector3& planePoint,
+                                     const Vector3& faceNormal,
+                                     RepairedSamplePoint* ioSample)
+{
+    if (!ioSample) {
+        return false;
+    }
+
+    ioSample->planePoint = planePoint;
+    ioSample->samplePoint = OffsetSamplePointOffSurface(planePoint, faceNormal);
+    if (!PointInsideAnySolid(solids, ioSample->samplePoint, SOLID_REPAIR_EPSILON)) {
+        return true;
+    }
+
+    for (int x = -1; x <= 1; x += 2) {
+        for (int y = -1; y <= 1; y += 2) {
+            for (int z = -1; z <= 1; z += 2) {
+                const Vector3 jitter = {
+                    (float)x * SAMPLE_REPAIR_JITTER,
+                    (float)y * SAMPLE_REPAIR_JITTER,
+                    (float)z * SAMPLE_REPAIR_JITTER
+                };
+                const Vector3 jitteredPoint = Vector3Add(ioSample->samplePoint, jitter);
+                if (!PointInsideAnySolid(solids, jitteredPoint, SOLID_REPAIR_EPSILON)) {
+                    ioSample->samplePoint = jitteredPoint;
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool SourcePolyVisited(const std::vector<uint32_t>& visitedPath, uint32_t sourcePolyIndex) {
+    return std::find(visitedPath.begin(), visitedPath.end(), sourcePolyIndex) != visitedPath.end();
+}
+
+static bool TryRecursiveRepairWalk(const std::vector<RepairSourcePoly>& repairPolys,
+                                   const std::vector<BrushSolid>& solids,
+                                   uint32_t sourcePolyIndex,
+                                   const Vector3& seedPoint,
+                                   float luxelSize,
+                                   int depth,
+                                   std::vector<uint32_t>& visitedPath,
+                                   RepairedSamplePoint* outSample)
+{
+    if (!outSample || sourcePolyIndex >= repairPolys.size()) {
+        return false;
+    }
+
+    const RepairSourcePoly& poly = repairPolys[sourcePolyIndex];
+    if (poly.poly2d.size() < 3 || Vector3LengthSq(poly.normal) <= 1e-8f) {
+        return false;
+    }
+
+    const Vector3 projected = ProjectPointOntoPlane(seedPoint, poly.planePoint, poly.normal);
+    const Vector2 projectedUv = {
+        Vector3DotProduct(projected, poly.axisU),
+        Vector3DotProduct(projected, poly.axisV)
+    };
+    const Vector3 faceSeedPoint = OffsetSamplePointOffSurface(projected, poly.normal);
+    const bool insideFace = InsidePoly2D(poly.poly2d, projectedUv.x, projectedUv.y);
+    if (insideFace) {
+        RepairedSamplePoint candidate{};
+        candidate.sourcePolyIndex = sourcePolyIndex;
+        if (TryRepairSampleCandidate(solids, projected, poly.normal, &candidate)) {
+            *outSample = candidate;
+            return true;
+        }
+    }
+
+    if (depth < SAMPLE_REPAIR_RECURSION_MAX && !poly.neighbors.empty()) {
+        if (insideFace) {
+            struct NeighborCandidate {
+                float edgeDist = 0.0f;
+                uint32_t sourcePolyIndex = 0;
+            };
+
+            std::vector<NeighborCandidate> candidates;
+            candidates.reserve(poly.neighbors.size());
+            const float edgeDistanceLimit = std::max(1.0f, luxelSize * 1.5f);
+            for (const RepairSourceNeighbor& neighbor : poly.neighbors) {
+                if (neighbor.sourcePolyIndex >= repairPolys.size() ||
+                    neighbor.edgeIndex < 0 ||
+                    SourcePolyVisited(visitedPath, neighbor.sourcePolyIndex))
+                {
+                    continue;
+                }
+
+                const size_t edgeIndex = (size_t)neighbor.edgeIndex;
+                if (edgeIndex >= poly.poly2d.size()) {
+                    continue;
+                }
+                const Vector2& a = poly.poly2d[edgeIndex];
+                const Vector2& b = poly.poly2d[(edgeIndex + 1) % poly.poly2d.size()];
+                const float edgeDist = sqrtf(DistSqPointSegment2D(projectedUv, a, b));
+                if (edgeDist > edgeDistanceLimit) {
+                    continue;
+                }
+                candidates.push_back({ edgeDist, neighbor.sourcePolyIndex });
+            }
+
+            std::sort(candidates.begin(), candidates.end(), [](const NeighborCandidate& a, const NeighborCandidate& b) {
+                if (fabsf(a.edgeDist - b.edgeDist) > 1e-4f) {
+                    return a.edgeDist < b.edgeDist;
+                }
+                return a.sourcePolyIndex < b.sourcePolyIndex;
+            });
+
+            for (const NeighborCandidate& candidate : candidates) {
+                visitedPath.push_back(candidate.sourcePolyIndex);
+                if (TryRecursiveRepairWalk(repairPolys,
+                                           solids,
+                                           candidate.sourcePolyIndex,
+                                           faceSeedPoint,
+                                           luxelSize,
+                                           depth + 1,
+                                           visitedPath,
+                                           outSample))
+                {
+                    return true;
+                }
+                visitedPath.pop_back();
+            }
+        } else {
+            const int bestEdgeIndex = FindBestRepairEdgeIndex(poly, projectedUv);
+            if (bestEdgeIndex >= 0) {
+                for (const RepairSourceNeighbor& neighbor : poly.neighbors) {
+                    if (neighbor.edgeIndex != bestEdgeIndex ||
+                        neighbor.sourcePolyIndex >= repairPolys.size() ||
+                        SourcePolyVisited(visitedPath, neighbor.sourcePolyIndex))
+                    {
+                        continue;
+                    }
+
+                    visitedPath.push_back(neighbor.sourcePolyIndex);
+                    if (TryRecursiveRepairWalk(repairPolys,
+                                               solids,
+                                               neighbor.sourcePolyIndex,
+                                               faceSeedPoint,
+                                               luxelSize,
+                                               depth + 1,
+                                               visitedPath,
+                                               outSample))
+                    {
+                        return true;
+                    }
+                    visitedPath.pop_back();
+                }
+            }
+        }
+    }
+
+    const Vector2 snappedUv = ClosestPointOnPolyBoundary2D(poly.poly2d, projectedUv);
+    const Vector3 snappedPoint = Vector3Add(
+        projected,
+        Vector3Add(Vector3Scale(poly.axisU, snappedUv.x - projectedUv.x),
+                   Vector3Scale(poly.axisV, snappedUv.y - projectedUv.y)));
+    if (Vector3LengthSq(Vector3Subtract(snappedPoint, projected)) <= (luxelSize * luxelSize)) {
+        RepairedSamplePoint boundarySample{};
+        boundarySample.sourcePolyIndex = sourcePolyIndex;
+        if (TryRepairSampleCandidate(solids, snappedPoint, poly.normal, &boundarySample)) {
+            *outSample = boundarySample;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static RepairedSamplePoint RepairSamplePoint(const FaceRect& rect,
+                                             const std::vector<RepairSourcePoly>& repairPolys,
+                                             const std::vector<BrushSolid>& solids,
+                                             const Vector3& planePoint,
+                                             float luxelSize)
+{
+    RepairedSamplePoint repaired{};
+    repaired.sourcePolyIndex = rect.sourcePolyIndex;
+    repaired.planePoint = planePoint;
+    const Vector3 baseNormal = (rect.sourcePolyIndex < repairPolys.size() &&
+                                Vector3LengthSq(repairPolys[rect.sourcePolyIndex].normal) > 1e-8f)
+        ? repairPolys[rect.sourcePolyIndex].normal
+        : rect.gpu.normal;
+    repaired.samplePoint = OffsetSamplePointOffSurface(planePoint, baseNormal);
+    if (!PointInsideAnySolid(solids, repaired.samplePoint, SOLID_REPAIR_EPSILON)) {
+        return repaired;
+    }
+
+    if (TryRepairSampleCandidate(solids, planePoint, baseNormal, &repaired)) {
+        return repaired;
+    }
+
+    if (rect.sourcePolyIndex < repairPolys.size()) {
+        std::vector<uint32_t> visitedPath;
+        visitedPath.reserve(SAMPLE_REPAIR_RECURSION_MAX + 2);
+        visitedPath.push_back(rect.sourcePolyIndex);
+        RepairedSamplePoint recursivelyRepaired{};
+        if (TryRecursiveRepairWalk(repairPolys,
+                                   solids,
+                                   rect.sourcePolyIndex,
+                                   repaired.samplePoint,
+                                   luxelSize,
+                                   0,
+                                   visitedPath,
+                                   &recursivelyRepaired))
+        {
+            return recursivelyRepaired;
+        }
+    }
+
+    return repaired;
+}
+
 static bool SkyDomeUsesDirt(const LightBakeSettings& settings) {
     const int dirtSetting = (settings.sunlight2Dirt == -2) ? settings.dirt : settings.sunlight2Dirt;
     return dirtSetting == 1;
@@ -2239,11 +2739,13 @@ static bool PageUsesCPUOnlyLightingFeatures(uint32_t pageIndex,
 
 static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 const std::vector<PhongSourcePoly>& sourcePhongs,
+                                const std::vector<RepairSourcePoly>& repairPolys,
                                 const std::vector<PointLight>& lights,
                                 const std::vector<FaceRect>& rects,
                                 const std::vector<std::vector<uint32_t>>* lightIndicesByRect,
                                 uint32_t pageIndex,
                                 const OccluderSet& occ,
+                                const std::vector<BrushSolid>& repairSolids,
                                 const LightBakeSettings& settings,
                                 float skyTraceDistance,
                                 LightmapPage& page)
@@ -2272,8 +2774,12 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             continue;
                         }
                         const Vector3 planePoint = ComputeLuxelPlanePoint(r, ju, jv);
-                        const Vector3 sampleNormal = EvaluatePhongNormal(sourcePhongs, r.sourcePolyIndex, planePoint, r.gpu.luxelSize);
-                        const Vector3 samplePoint = OffsetSamplePointOffSurface(planePoint, r.gpu.normal);
+                        const RepairedSamplePoint repairedSample = RepairSamplePoint(r, repairPolys, repairSolids, planePoint, r.gpu.luxelSize);
+                        Vector3 sampleNormal = EvaluatePhongNormal(sourcePhongs, repairedSample.sourcePolyIndex, repairedSample.planePoint, r.gpu.luxelSize);
+                        if (Vector3LengthSq(sampleNormal) <= 1e-8f) {
+                            sampleNormal = r.gpu.normal;
+                        }
+                        const Vector3 samplePoint = repairedSample.samplePoint;
                         const float edgeDistLuxels = MinDistToPolyEdge2D(r.poly2d, ju, jv);
                         const float edgeFactor = std::clamp(
                             1.0f - edgeDistLuxels / EDGE_SEAM_GUARD_LUXELS,
@@ -2375,12 +2881,14 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         fflush(stdout);
     }
     const std::vector<PhongSourcePoly> sourcePhongs = BuildPhongSourcePolys(visiblePolys);
+    const std::vector<RepairSourcePoly> repairPolys = BuildRepairSourcePolys(visiblePolys, sourcePhongs);
     const AABB visibleBounds = ComputeMapBounds(visiblePolys);
     const Vector3 mapCenter = Vector3Scale(Vector3Add(visibleBounds.min, visibleBounds.max), 0.5f);
     const float skyTraceDistance = std::max(2048.0f, sqrtf(Vector3LengthSq(Vector3Subtract(visibleBounds.max, visibleBounds.min))) * 2.0f + 1024.0f);
     const std::vector<PointLight> allLights = BuildExpandedLights(visiblePolys, lights, surfaceLights, settings, mapCenter, skyTraceDistance);
     std::vector<BakePatch> patches = SubdivideLightmappedPolygons(visiblePolys, luxelSize);
-    std::vector<FaceRect> rects = BuildFaceRects(patches, allLights, sourcePhongs, luxelSize);
+    std::vector<FaceRect> rects = BuildFaceRects(patches, allLights, repairPolys, sourcePhongs, luxelSize);
+    const std::vector<BrushSolid> repairSolids = BuildBrushSolids(polys);
 
     std::vector<LightmapPageLayout> layouts = PackLightmapPages(rects);
     if (layouts.empty() && !rects.empty()) {
@@ -2403,6 +2911,26 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
     }
 
     OccluderSet occ = BuildOccluders(occluderPolys.empty() ? visiblePolys : occluderPolys);
+    std::vector<LightmapComputeBrushSolid> computeBrushSolids;
+    std::vector<LightmapComputeSolidPlane> computeSolidPlanes;
+    std::vector<LightmapComputeRepairSourcePoly> computeRepairSourcePolys;
+    std::vector<LightmapComputeRepairSourceNeighbor> computeRepairSourceNeighbors;
+    BuildComputeBrushSolids(repairSolids, &computeBrushSolids, &computeSolidPlanes);
+    BuildComputeRepairSourceGraph(repairPolys, &computeRepairSourcePolys, &computeRepairSourceNeighbors);
+    const bool repairGraphExceedsComputeVerts = std::any_of(
+        repairPolys.begin(),
+        repairPolys.end(),
+        [](const RepairSourcePoly& poly) {
+            return poly.poly2d.size() > LIGHTMAP_COMPUTE_MAX_POLY_VERTS;
+        });
+    if (repairGraphExceedsComputeVerts) {
+        for (FaceRect& rect : rects) {
+            rect.computeCompatible = false;
+            if (rect.computeFallbackReason.empty()) {
+                rect.computeFallbackReason = "page contains source polygon(s) exceeding compute repair vertex limit";
+            }
+        }
+    }
     printf("[Lightmap] %zu source faces -> %zu bake patches across %zu pages of up to %dx%d, %zu explicit/direct lights, %zu tris, %zu luxels x %d samples = %zu rays/light (luxel=%.3f, ambient=%.2f/%.2f/%.2f, bounces=%d, bounceScale=%.2f)\n",
            visiblePolys.size(), patches.size(), atlas.pages.size(), LIGHTMAP_PAGE_SIZE, LIGHTMAP_PAGE_SIZE,
            allLights.size(), occ.tris.size(),
@@ -2455,11 +2983,11 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         if (!pageRequiresCPU && PageUsesCPUOnlyLightingFeatures(pageIndex, rects, sourcePhongs, pageLights, settings, &computeError)) {
             pageRequiresCPU = true;
         }
-        if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageLights, settings, skyTraceDistance, page.width, page.height, page.pixels, &computeError)) {
+        if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, computeBrushSolids, computeSolidPlanes, computeRepairSourcePolys, computeRepairSourceNeighbors, pageLights, settings, skyTraceDistance, page.width, page.height, page.pixels, &computeError)) {
             printf("[Lightmap] page %u compute bake unavailable, falling back to CPU: %s\n",
                    pageIndex, computeError.c_str());
             fflush(stdout);
-            BakeLightmapCPUPage(patches, sourcePhongs, allLights, rects, nullptr, pageIndex, occ, settings, skyTraceDistance, page);
+            BakeLightmapCPUPage(patches, sourcePhongs, repairPolys, allLights, rects, nullptr, pageIndex, occ, repairSolids, settings, skyTraceDistance, page);
             usedCPUFallback = true;
             printf("[Lightmap] page %u CPU bake complete\n", pageIndex);
             fflush(stdout);
@@ -2483,7 +3011,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                        darkStats.darkValidCount, darkStats.validCount,
                        darkStats.darkFullCoverageCount, darkStats.fullCoverageCount);
                 fflush(stdout);
-                BakeLightmapCPUPage(patches, sourcePhongs, allLights, rects, nullptr, pageIndex, occ, settings, skyTraceDistance, page);
+                BakeLightmapCPUPage(patches, sourcePhongs, repairPolys, allLights, rects, nullptr, pageIndex, occ, repairSolids, settings, skyTraceDistance, page);
                 edgeTexelsStabilized = false;
                 printf("[Lightmap] page %u CPU re-bake complete\n", pageIndex);
                 fflush(stdout);
@@ -2561,11 +3089,11 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
             bounceSettings.ambientColor = Vector3Zero();
             bounceSettings.sunlight2Intensity = 0.0f;
             bounceSettings.sunlight3Intensity = 0.0f;
-            if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageIndirectLights, bounceSettings, skyTraceDistance, page.width, page.height, bouncedPage.pixels, &computeError)) {
+            if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, computeBrushSolids, computeSolidPlanes, computeRepairSourcePolys, computeRepairSourceNeighbors, pageIndirectLights, bounceSettings, skyTraceDistance, page.width, page.height, bouncedPage.pixels, &computeError)) {
                 printf("[Lightmap] page %u bounce %d compute unavailable, falling back to CPU: %s\n",
                        pageIndex, bouncePass + 1, computeError.c_str());
                 fflush(stdout);
-                BakeLightmapCPUPage(patches, sourcePhongs, indirectLights, rects, &indirectLightIndices, pageIndex, occ, bounceSettings, skyTraceDistance, bouncedPage);
+                BakeLightmapCPUPage(patches, sourcePhongs, repairPolys, indirectLights, rects, &indirectLightIndices, pageIndex, occ, repairSolids, bounceSettings, skyTraceDistance, bouncedPage);
             }
 
             StabilizeEdgeTexels(bouncedPage, coverageMasks[pageIndex]);
