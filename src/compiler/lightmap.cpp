@@ -996,32 +996,6 @@ static SurfaceVisibilityInfo AnalyzeSurfaceVisibility(const std::vector<MapPolyg
             info.hidden[i] = 1;
             continue;
         }
-
-        for (size_t j = 0; j < polys.size(); ++j) {
-            if (i == j) {
-                continue;
-            }
-            const MapPolygon& other = polys[j];
-            if (Vector3DotProduct(poly.normal, other.normal) > -0.99f) {
-                continue;
-            }
-
-            const float centroidPlaneDist = Vector3DotProduct(other.normal, Vector3Subtract(centroid, other.verts[0]));
-            if (fabsf(centroidPlaneDist) > 0.05f) {
-                continue;
-            }
-
-            const float frontPlaneDist = Vector3DotProduct(other.normal, Vector3Subtract(frontSample, other.verts[0]));
-            if (frontPlaneDist > -0.05f) {
-                continue;
-            }
-
-            const Vector3 projected = Vector3Subtract(frontSample, Vector3Scale(other.normal, frontPlaneDist));
-            if (pointInsidePolygonProjected(other, projected)) {
-                info.hidden[i] = 1;
-                break;
-            }
-        }
     }
 
     for (size_t i = 0; i < polys.size(); ++i) {
