@@ -48,6 +48,8 @@ struct point_light {
     float angle_scale;
     vec3 emission_normal;
     int directional;
+    vec3 parallel_direction;
+    int parallel;
     vec3 spot_direction;
     float spot_outer_cos;
     int ignore_occluder_group;
@@ -57,6 +59,7 @@ struct point_light {
     float dirt_scale;
     float dirt_gain;
     float _pad0;
+    float _pad1;
 };
 
 struct occluder_tri {
@@ -433,12 +436,24 @@ void main() {
             float dirt_occlusion = uses_dirt ? compute_dirt_occlusion_ratio(wp, sample_normal) : 0.0;
             for (int li = 0; li < light_count; ++li) {
                 point_light light = lights[li];
-                vec3 to_light = light.position - wp;
-                float dist = length(to_light);
-                if ((dist > light.intensity) || (dist < 1e-3)) {
-                    continue;
+                vec3 dir;
+                float dist;
+                float attenuation = 1.0;
+                if (light.parallel != 0) {
+                    dir = safe_normalize(light.parallel_direction, vec3(0.0, 1.0, 0.0));
+                    dist = max(1.0, light.intensity);
+                } else {
+                    vec3 to_light = light.position - wp;
+                    dist = length(to_light);
+                    if ((dist > light.intensity) || (dist < 1e-3)) {
+                        continue;
+                    }
+                    dir = to_light / dist;
+                    attenuation = evaluate_light_attenuation(light, dist);
+                    if (attenuation <= 0.0) {
+                        continue;
+                    }
                 }
-                vec3 dir = to_light / dist;
                 vec3 ro = wp + sample_normal * shadow_bias + dir * shadow_bias;
                 float emit = 1.0;
                 if (light.directional != 0) {
@@ -457,10 +472,6 @@ void main() {
                     continue;
                 }
                 if (occluded(ro, dir, near_hit_t, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group)) {
-                    continue;
-                }
-                float attenuation = evaluate_light_attenuation(light, dist);
-                if (attenuation <= 0.0) {
                     continue;
                 }
                 float dirt = light_uses_dirt(light)

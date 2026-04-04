@@ -68,9 +68,11 @@ enum PointLightAttenuationMode : uint8_t {
 struct PointLight {
     Vector3 position;     // world-space (GL coords)
     Vector3 color;        // 0..1
-    float   intensity;    // radius in world units
+    float   intensity;    // radius in world units, or max trace distance for parallel suns
     Vector3 emissionNormal{0.0f, 0.0f, 0.0f};
     int     directional = 0;
+    Vector3 parallelDirection{0.0f, 0.0f, 0.0f}; // surface -> light direction for parallel sun/skydome samples
+    int     parallel = 0;
     int     ignoreOccluderGroup = -1;
     uint8_t attenuationMode = POINT_LIGHT_ATTEN_QUADRATIC;
     float   angleScale = 1.0f;

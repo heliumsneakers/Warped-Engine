@@ -382,6 +382,8 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         gpuLights[i].angle_scale = lights[i].angleScale;
         CopyVec3(gpuLights[i].emission_normal, lights[i].emissionNormal);
         gpuLights[i].directional = lights[i].directional;
+        CopyVec3(gpuLights[i].parallel_direction, lights[i].parallelDirection);
+        gpuLights[i].parallel = lights[i].parallel;
         CopyVec3(gpuLights[i].spot_direction, lights[i].spotDirection);
         gpuLights[i].spot_outer_cos = lights[i].spotOuterCos;
         gpuLights[i].ignore_occluder_group = lights[i].ignoreOccluderGroup;
@@ -391,6 +393,7 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         gpuLights[i].dirt_scale = lights[i].dirtScale;
         gpuLights[i].dirt_gain = lights[i].dirtGain;
         gpuLights[i]._pad0 = 0;
+        gpuLights[i]._pad1 = 0;
     }
 
     std::vector<GpuOccluderTri> gpuOccluders(std::max<size_t>(1, occluders.size()));

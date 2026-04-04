@@ -36,6 +36,7 @@ static constexpr float INDIRECT_BOUNCE_RADIUS_MIN = 32.0f;
 static constexpr float INDIRECT_BOUNCE_RADIUS_MAX = 160.0f;
 static constexpr int   AA_GRID            = 4;      // AA_GRID² samples per luxel
 static constexpr int   DILATE_PASSES      = 4;
+static constexpr int   ERICW_SUNSAMPLES   = 64;     // matches ericw-tools default sunsamples
 
 // --------------------------------------------------------------------------
 //  Planar basis
@@ -115,6 +116,10 @@ static float EvaluateSpotlightFactor(const PointLight& light, const Vector3& dir
         return 1.0f;
     }
     return std::clamp((spotCos - light.spotOuterCos) / (light.spotInnerCos - light.spotOuterCos), 0.0f, 1.0f);
+}
+
+static bool IsParallelLight(const PointLight& light) {
+    return light.parallel != 0 && Vector3LengthSq(light.parallelDirection) > 1e-6f;
 }
 
 static bool LightUsesDirt(const PointLight& light, const LightBakeSettings& settings) {
@@ -1142,6 +1147,10 @@ static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patche
         r.lightIndices.reserve(lights.size());
         for (uint32_t lightIndex = 0; lightIndex < lights.size(); ++lightIndex) {
             const PointLight& light = lights[lightIndex];
+            if (IsParallelLight(light)) {
+                r.lightIndices.push_back(lightIndex);
+                continue;
+            }
             const float radiusSq = light.intensity * light.intensity;
             if (DistSqPointAABB(light.position, r.bounds) <= radiusSq) {
                 r.lightIndices.push_back(lightIndex);
@@ -1669,6 +1678,10 @@ static std::vector<std::vector<uint32_t>> BuildRectLightIndices(const std::vecto
         indices.reserve(lights.size());
         for (uint32_t lightIndex = 0; lightIndex < lights.size(); ++lightIndex) {
             const PointLight& light = lights[lightIndex];
+            if (IsParallelLight(light)) {
+                indices.push_back(lightIndex);
+                continue;
+            }
             const float radiusSq = light.intensity * light.intensity;
             if (DistSqPointAABB(light.position, r.bounds) <= radiusSq) {
                 indices.push_back(lightIndex);
@@ -1755,6 +1768,41 @@ static Vector3 SampleHemisphereDirection(const Vector3& axis, int sampleIndex, i
     return Vector3Normalize(Vector3Add(Vector3Scale(dirAxis, cosTheta), Vector3Scale(radial, sinTheta)));
 }
 
+static std::vector<Vector3> GenerateEricwSkyDomeDirections(const Vector3& upAxis, bool upperHemisphere) {
+    int iterations = (int)lroundf(sqrtf((float)(ERICW_SUNSAMPLES - 1) / 4.0f)) + 1;
+    iterations = std::max(iterations, 2);
+
+    const int elevationSteps = iterations - 1;
+    const int angleSteps = elevationSteps * 4;
+    const float elevationStep = (90.0f / (float)(elevationSteps + 1)) * DEG2RAD;
+    const float angleStep = (360.0f / (float)angleSteps) * DEG2RAD;
+
+    Vector3 axis = Vector3Normalize(upAxis);
+    Vector3 tangent{};
+    Vector3 bitangent{};
+    FaceBasis(axis, tangent, bitangent);
+
+    std::vector<Vector3> directions;
+    directions.reserve((size_t)(angleSteps * elevationSteps + 1));
+    float angle = 0.0f;
+    for (int i = 0; i < elevationSteps; ++i) {
+        const float elevation = elevationStep * (0.5f + (float)i);
+        const float radialScale = cosf(elevation);
+        const float verticalScale = sinf(elevation) * (upperHemisphere ? 1.0f : -1.0f);
+        for (int j = 0; j < angleSteps; ++j) {
+            const Vector3 radial = Vector3Add(Vector3Scale(tangent, cosf(angle)),
+                                              Vector3Scale(bitangent, sinf(angle)));
+            directions.push_back(Vector3Normalize(Vector3Add(Vector3Scale(radial, radialScale),
+                                                             Vector3Scale(axis, verticalScale))));
+            angle += angleStep;
+        }
+        angle += angleStep / (float)elevationSteps;
+    }
+
+    directions.push_back(upperHemisphere ? axis : Vector3Scale(axis, -1.0f));
+    return directions;
+}
+
 static PointLight BuildDirectionalSunLight(const Vector3& toLightDirection,
                                            const Vector3& color,
                                            float angleScale,
@@ -1763,9 +1811,12 @@ static PointLight BuildDirectionalSunLight(const Vector3& toLightDirection,
                                            float sunDistance)
 {
     PointLight light{};
-    light.position = Vector3Add(mapCenter, Vector3Scale(Vector3Normalize(toLightDirection), sunDistance));
+    const Vector3 dir = Vector3Normalize(toLightDirection);
+    light.position = Vector3Add(mapCenter, Vector3Scale(dir, sunDistance));
     light.color = color;
     light.intensity = std::max(1.0f, sunDistance * 2.0f);
+    light.parallelDirection = dir;
+    light.parallel = 1;
     light.attenuationMode = POINT_LIGHT_ATTEN_NONE;
     light.angleScale = angleScale;
     light.dirt = (int8_t)dirtOverride;
@@ -1838,7 +1889,7 @@ static std::vector<PointLight> BuildExpandedLights(const std::vector<MapPolygon>
     const float sunDistance = std::max(2048.0f, sqrtf(Vector3LengthSq(Vector3Subtract(bounds.max, bounds.min))) * 2.0f + 1024.0f);
 
     if (settings.sunlightIntensity > 0.0f) {
-        const int sunSamples = (settings.sunlightPenumbra > 0.1f) ? 16 : 1;
+        const int sunSamples = (settings.sunlightPenumbra > 0.1f) ? ERICW_SUNSAMPLES : 1;
         const Vector3 sampleColor = Vector3Scale(settings.sunlightColor, settings.sunlightIntensity / (300.0f * (float)sunSamples));
         const int dirtOverride = (settings.sunlightDirt == -2) ? settings.dirt : settings.sunlightDirt;
         for (int i = 0; i < sunSamples; ++i) {
@@ -1851,10 +1902,9 @@ static std::vector<PointLight> BuildExpandedLights(const std::vector<MapPolygon>
         if (intensity <= 0.0f) {
             return;
         }
-        const int domeSamples = 24;
-        const Vector3 sampleColor = Vector3Scale(color, intensity / (300.0f * (float)domeSamples));
-        for (int i = 0; i < domeSamples; ++i) {
-            const Vector3 toLight = SampleHemisphereDirection(axis, i, domeSamples);
+        const std::vector<Vector3> domeDirections = GenerateEricwSkyDomeDirections(axis, Vector3DotProduct(axis, (Vector3){0.0f, 1.0f, 0.0f}) >= 0.0f);
+        const Vector3 sampleColor = Vector3Scale(color, intensity / (300.0f * (float)domeDirections.size()));
+        for (const Vector3& toLight : domeDirections) {
             lights.push_back(BuildDirectionalSunLight(toLight, sampleColor, settings.sunlightAngleScale, dirtOverride, mapCenter, sunDistance));
         }
     };
@@ -2124,10 +2174,20 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                         const float dirtOcclusion = usesDirt ? ComputeDirtOcclusionRatio(occ, wp, sampleNormal, settings) : 0.0f;
                         for (uint32_t lightIndex : rectLightIndices) {
                             const PointLight& L = lights[lightIndex];
-                            const Vector3 toL = Vector3Subtract(L.position, wp);
-                            const float dist = Vector3Length(toL);
-                            if (dist > L.intensity || dist < 1e-3f) continue;
-                            const Vector3 dir = Vector3Scale(toL, 1.f / dist);
+                            Vector3 dir{};
+                            float dist = 0.0f;
+                            float att = 1.0f;
+                            if (IsParallelLight(L)) {
+                                dir = Vector3Normalize(L.parallelDirection);
+                                dist = std::max(1.0f, L.intensity);
+                            } else {
+                                const Vector3 toL = Vector3Subtract(L.position, wp);
+                                dist = Vector3Length(toL);
+                                if (dist > L.intensity || dist < 1e-3f) continue;
+                                dir = Vector3Scale(toL, 1.f / dist);
+                                att = EvaluateLightAttenuation(L, dist);
+                                if (att <= 0.0f) continue;
+                            }
                             const Vector3 ro = Vector3Add(
                                 Vector3Add(wp, Vector3Scale(sampleNormal, SHADOW_BIAS)),
                                 Vector3Scale(dir, SHADOW_BIAS));
@@ -2143,8 +2203,6 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             const float incidence = EvaluateIncidenceScale(L, ndl);
                             if (incidence <= 0.0f) continue;
                             if (Occluded(occ, ro, dir, nearHitT, std::max(0.0f, dist - (SHADOW_BIAS * 2.0f)), L.ignoreOccluderGroup)) continue;
-                            const float att = EvaluateLightAttenuation(L, dist);
-                            if (att <= 0.0f) continue;
                             const float dirt = LightUsesDirt(L, settings)
                                 ? ComputeDirtAttenuation(dirtOcclusion, EffectiveLightDirtScale(L, settings), EffectiveLightDirtGain(L, settings))
                                 : 1.0f;
