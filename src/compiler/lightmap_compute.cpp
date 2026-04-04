@@ -365,6 +365,7 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          const std::vector<LightmapComputeOccluderTri>& occluders,
                          const std::vector<PointLight>& lights,
                          const LightBakeSettings& settings,
+                         float skyTraceDistance,
                          int atlasWidth,
                          int atlasHeight,
                          std::vector<uint8_t>& outPixels,
@@ -567,12 +568,20 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             params.ray_eps = kRayEps;
             params.global_dirt = settings.dirt;
             params.dirt_mode = settings.dirtMode;
+            params.skylight_dirt = ((settings.sunlight2Dirt == -2) ? settings.dirt : settings.sunlight2Dirt) == 1 ? 1 : 0;
             params.phong_neighbor_count = rect.phongNeighborCount;
-            params._pad_scalar0 = 0;
             params.dirt_depth = settings.dirtDepth;
             params.dirt_scale = settings.dirtScale;
             params.dirt_gain = settings.dirtGain;
             params.dirt_angle = settings.dirtAngle;
+            params.skylight_angle_scale = settings.sunlightAngleScale;
+            params.sky_trace_distance = skyTraceDistance;
+            params._pad_scalar0[0] = 0.0f;
+            params._pad_scalar0[1] = 0.0f;
+            CopyVec3(params.sunlight2_color, settings.sunlight2Color);
+            params.sunlight2_intensity = settings.sunlight2Intensity;
+            CopyVec3(params.sunlight3_color, settings.sunlight3Color);
+            params.sunlight3_intensity = settings.sunlight3Intensity;
             CopyVec3(params.origin, rect.origin);
             params._pad0 = 0.0f;
             CopyVec3(params.axis_u, rect.axisU);

@@ -36,7 +36,7 @@ static constexpr float INDIRECT_BOUNCE_RADIUS_MIN = 32.0f;
 static constexpr float INDIRECT_BOUNCE_RADIUS_MAX = 160.0f;
 static constexpr int   AA_GRID            = 4;      // AA_GRID² samples per luxel
 static constexpr int   DILATE_PASSES      = 4;
-static constexpr int   ERICW_SUNSAMPLES   = 64;     // matches ericw-tools default sunsamples
+static constexpr int   ERICW_SUNSAMPLES   = 100;    // matches ericw-tools default sunsamples
 
 // --------------------------------------------------------------------------
 //  Planar basis
@@ -99,6 +99,12 @@ static float EvaluateLightAttenuation(const PointLight& light, float dist) {
 static float EvaluateIncidenceScale(const PointLight& light, float ndl) {
     const float clampedLambert = std::max(0.0f, ndl);
     const float t = std::clamp(light.angleScale, 0.0f, 1.0f);
+    return (1.0f - t) + t * clampedLambert;
+}
+
+static float EvaluateAngleScale(float angleScale, float ndl) {
+    const float clampedLambert = std::max(0.0f, ndl);
+    const float t = std::clamp(angleScale, 0.0f, 1.0f);
     return (1.0f - t) + t * clampedLambert;
 }
 
@@ -1754,53 +1760,38 @@ static Vector3 SampleConeDirection(const Vector3& axis, float coneAngleDeg, int 
     return Vector3Normalize(Vector3Add(Vector3Scale(dirAxis, cosTheta), Vector3Scale(radial, sinTheta)));
 }
 
-static Vector3 SampleHemisphereDirection(const Vector3& axis, int sampleIndex, int sampleCount) {
-    const Vector3 dirAxis = Vector3Normalize(axis);
-    Vector3 tangent{};
-    Vector3 bitangent{};
-    FaceBasis(dirAxis, tangent, bitangent);
-    const float u1 = ((float)sampleIndex + 0.5f) / (float)std::max(1, sampleCount);
-    const float u2 = fmodf(((float)sampleIndex + 0.5f) * 0.61803398875f, 1.0f);
-    const float cosTheta = sqrtf(std::max(0.0f, 1.0f - u1));
-    const float sinTheta = sqrtf(std::max(0.0f, 1.0f - cosTheta * cosTheta));
-    const float phi = u2 * PI * 2.0f;
-    const Vector3 radial = Vector3Add(Vector3Scale(tangent, cosf(phi)), Vector3Scale(bitangent, sinf(phi)));
-    return Vector3Normalize(Vector3Add(Vector3Scale(dirAxis, cosTheta), Vector3Scale(radial, sinTheta)));
-}
-
-static std::vector<Vector3> GenerateEricwSkyDomeDirections(const Vector3& upAxis, bool upperHemisphere) {
+static int EricwSkyDomeSampleCount() {
     int iterations = (int)lroundf(sqrtf((float)(ERICW_SUNSAMPLES - 1) / 4.0f)) + 1;
     iterations = std::max(iterations, 2);
-
     const int elevationSteps = iterations - 1;
     const int angleSteps = elevationSteps * 4;
+    return angleSteps * elevationSteps + 1;
+}
+
+static Vector3 EricwSkyDomeDirection(bool upperHemisphere, int sampleIndex, float rotationAngle) {
+    int iterations = (int)lroundf(sqrtf((float)(ERICW_SUNSAMPLES - 1) / 4.0f)) + 1;
+    iterations = std::max(iterations, 2);
+    const int elevationSteps = iterations - 1;
+    const int angleSteps = elevationSteps * 4;
+    const int sampleCount = angleSteps * elevationSteps + 1;
     const float elevationStep = (90.0f / (float)(elevationSteps + 1)) * DEG2RAD;
     const float angleStep = (360.0f / (float)angleSteps) * DEG2RAD;
 
-    Vector3 axis = Vector3Normalize(upAxis);
-    Vector3 tangent{};
-    Vector3 bitangent{};
-    FaceBasis(axis, tangent, bitangent);
-
-    std::vector<Vector3> directions;
-    directions.reserve((size_t)(angleSteps * elevationSteps + 1));
-    float angle = 0.0f;
-    for (int i = 0; i < elevationSteps; ++i) {
-        const float elevation = elevationStep * (0.5f + (float)i);
-        const float radialScale = cosf(elevation);
-        const float verticalScale = sinf(elevation) * (upperHemisphere ? 1.0f : -1.0f);
-        for (int j = 0; j < angleSteps; ++j) {
-            const Vector3 radial = Vector3Add(Vector3Scale(tangent, cosf(angle)),
-                                              Vector3Scale(bitangent, sinf(angle)));
-            directions.push_back(Vector3Normalize(Vector3Add(Vector3Scale(radial, radialScale),
-                                                             Vector3Scale(axis, verticalScale))));
-            angle += angleStep;
-        }
-        angle += angleStep / (float)elevationSteps;
+    if (sampleIndex >= sampleCount - 1) {
+        return upperHemisphere ? Vector3{0.0f, 1.0f, 0.0f} : Vector3{0.0f, -1.0f, 0.0f};
     }
 
-    directions.push_back(upperHemisphere ? axis : Vector3Scale(axis, -1.0f));
-    return directions;
+    const int ringIndex = sampleIndex / angleSteps;
+    const int angleIndex = sampleIndex % angleSteps;
+    const float elevation = elevationStep * (0.5f + (float)ringIndex);
+    const float angle = angleStep * ((float)angleIndex + ((float)ringIndex / (float)elevationSteps)) + rotationAngle;
+    const float radialScale = cosf(elevation);
+    const float verticalScale = sinf(elevation) * (upperHemisphere ? 1.0f : -1.0f);
+    return Vector3Normalize({
+        cosf(angle) * radialScale,
+        verticalScale,
+        sinf(angle) * radialScale
+    });
 }
 
 static PointLight BuildDirectionalSunLight(const Vector3& toLightDirection,
@@ -1881,12 +1872,11 @@ static std::vector<Vector3> GenerateSurfaceEmitterSamples(const MapPolygon& poly
 static std::vector<PointLight> BuildExpandedLights(const std::vector<MapPolygon>& polys,
                                                    const std::vector<PointLight>& explicitLights,
                                                    const std::vector<SurfaceLightTemplate>& surfaceLights,
-                                                   const LightBakeSettings& settings)
+                                                   const LightBakeSettings& settings,
+                                                   const Vector3& mapCenter,
+                                                   float sunDistance)
 {
     std::vector<PointLight> lights = explicitLights;
-    const AABB bounds = ComputeMapBounds(polys);
-    const Vector3 mapCenter = Vector3Scale(Vector3Add(bounds.min, bounds.max), 0.5f);
-    const float sunDistance = std::max(2048.0f, sqrtf(Vector3LengthSq(Vector3Subtract(bounds.max, bounds.min))) * 2.0f + 1024.0f);
 
     if (settings.sunlightIntensity > 0.0f) {
         const int sunSamples = (settings.sunlightPenumbra > 0.1f) ? ERICW_SUNSAMPLES : 1;
@@ -1897,20 +1887,6 @@ static std::vector<PointLight> BuildExpandedLights(const std::vector<MapPolygon>
             lights.push_back(BuildDirectionalSunLight(toLight, sampleColor, settings.sunlightAngleScale, dirtOverride, mapCenter, sunDistance));
         }
     }
-
-    auto appendHemisphere = [&](float intensity, const Vector3& color, const Vector3& axis, int dirtOverride) {
-        if (intensity <= 0.0f) {
-            return;
-        }
-        const std::vector<Vector3> domeDirections = GenerateEricwSkyDomeDirections(axis, Vector3DotProduct(axis, (Vector3){0.0f, 1.0f, 0.0f}) >= 0.0f);
-        const Vector3 sampleColor = Vector3Scale(color, intensity / (300.0f * (float)domeDirections.size()));
-        for (const Vector3& toLight : domeDirections) {
-            lights.push_back(BuildDirectionalSunLight(toLight, sampleColor, settings.sunlightAngleScale, dirtOverride, mapCenter, sunDistance));
-        }
-    };
-    const int skyDirtOverride = (settings.sunlight2Dirt == -2) ? settings.dirt : settings.sunlight2Dirt;
-    appendHemisphere(settings.sunlight2Intensity, settings.sunlight2Color, {0.0f, 1.0f, 0.0f}, skyDirtOverride);
-    appendHemisphere(settings.sunlight3Intensity, settings.sunlight3Color, {0.0f, -1.0f, 0.0f}, skyDirtOverride);
 
     int surfaceTemplateMatches = 0;
     for (const SurfaceLightTemplate& templ : surfaceLights) {
@@ -2097,6 +2073,64 @@ static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
     return (float)occludedCount / (float)rayCount;
 }
 
+static bool SkyDomeUsesDirt(const LightBakeSettings& settings) {
+    const int dirtSetting = (settings.sunlight2Dirt == -2) ? settings.dirt : settings.sunlight2Dirt;
+    return dirtSetting == 1;
+}
+
+static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
+                                          const Vector3& samplePoint,
+                                          const Vector3& sampleNormal,
+                                          float nearHitT,
+                                          float skyTraceDistance,
+                                          float dirtOcclusion,
+                                          const LightBakeSettings& settings)
+{
+    Vector3 contrib = Vector3Zero();
+    const int sampleCount = EricwSkyDomeSampleCount();
+    const float upperPerSample = (settings.sunlight2Intensity > 0.0f)
+        ? settings.sunlight2Intensity / (300.0f * (float)sampleCount)
+        : 0.0f;
+    const float lowerPerSample = (settings.sunlight3Intensity > 0.0f)
+        ? settings.sunlight3Intensity / (300.0f * (float)sampleCount)
+        : 0.0f;
+    if (upperPerSample <= 0.0f && lowerPerSample <= 0.0f) {
+        return contrib;
+    }
+
+    uint32_t upperSeed = HashLightSeed(samplePoint, 13007);
+    uint32_t lowerSeed = HashLightSeed(samplePoint, 17011);
+    const float upperRotation = RandomFloat01(upperSeed) * PI * 2.0f;
+    const float lowerRotation = RandomFloat01(lowerSeed) * PI * 2.0f;
+    const bool useDirt = SkyDomeUsesDirt(settings);
+    const float dirtScale = useDirt ? ComputeDirtAttenuation(dirtOcclusion, settings.dirtScale, settings.dirtGain) : 1.0f;
+
+    for (int i = 0; i < sampleCount; ++i) {
+        if (upperPerSample > 0.0f) {
+            const Vector3 dir = EricwSkyDomeDirection(true, i, upperRotation);
+            const Vector3 ro = Vector3Add(Vector3Add(samplePoint, Vector3Scale(sampleNormal, SHADOW_BIAS)),
+                                          Vector3Scale(dir, SHADOW_BIAS));
+            if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1)) {
+                const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
+                const float scale = upperPerSample * incidence * dirtScale;
+                contrib = Vector3Add(contrib, Vector3Scale(settings.sunlight2Color, scale));
+            }
+        }
+        if (lowerPerSample > 0.0f) {
+            const Vector3 dir = EricwSkyDomeDirection(false, i, lowerRotation);
+            const Vector3 ro = Vector3Add(Vector3Add(samplePoint, Vector3Scale(sampleNormal, SHADOW_BIAS)),
+                                          Vector3Scale(dir, SHADOW_BIAS));
+            if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1)) {
+                const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
+                const float scale = lowerPerSample * incidence * dirtScale;
+                contrib = Vector3Add(contrib, Vector3Scale(settings.sunlight3Color, scale));
+            }
+        }
+    }
+
+    return contrib;
+}
+
 static bool PageUsesCPUOnlyLightingFeatures(uint32_t pageIndex,
                                             const std::vector<FaceRect>& rects,
                                             const std::vector<PhongSourcePoly>& sourcePhongs,
@@ -2123,6 +2157,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 uint32_t pageIndex,
                                 const OccluderSet& occ,
                                 const LightBakeSettings& settings,
+                                float skyTraceDistance,
                                 LightmapPage& page)
 {
     const int W = page.width;
@@ -2171,6 +2206,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 break;
                             }
                         }
+                        usesDirt = usesDirt || SkyDomeUsesDirt(settings);
                         const float dirtOcclusion = usesDirt ? ComputeDirtOcclusionRatio(occ, wp, sampleNormal, settings) : 0.0f;
                         for (uint32_t lightIndex : rectLightIndices) {
                             const PointLight& L = lights[lightIndex];
@@ -2211,6 +2247,11 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             cg += L.color.y * contrib;
                             cb += L.color.z * contrib;
                         }
+                        const Vector3 skyContrib = ComputeSkyDomeContribution(
+                            occ, wp, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
+                        cr += skyContrib.x;
+                        cg += skyContrib.y;
+                        cb += skyContrib.z;
                         ar += cr; ag += cg; ab += cb;
                         ++usedSamples;
                     }
@@ -2250,7 +2291,10 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         fflush(stdout);
     }
     const std::vector<PhongSourcePoly> sourcePhongs = BuildPhongSourcePolys(visiblePolys);
-    const std::vector<PointLight> allLights = BuildExpandedLights(visiblePolys, lights, surfaceLights, settings);
+    const AABB visibleBounds = ComputeMapBounds(visiblePolys);
+    const Vector3 mapCenter = Vector3Scale(Vector3Add(visibleBounds.min, visibleBounds.max), 0.5f);
+    const float skyTraceDistance = std::max(2048.0f, sqrtf(Vector3LengthSq(Vector3Subtract(visibleBounds.max, visibleBounds.min))) * 2.0f + 1024.0f);
+    const std::vector<PointLight> allLights = BuildExpandedLights(visiblePolys, lights, surfaceLights, settings, mapCenter, skyTraceDistance);
     std::vector<BakePatch> patches = SubdivideLightmappedPolygons(visiblePolys, luxelSize);
     std::vector<FaceRect> rects = BuildFaceRects(patches, allLights, sourcePhongs, luxelSize);
 
@@ -2275,7 +2319,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
     }
 
     OccluderSet occ = BuildOccluders(occluderPolys.empty() ? visiblePolys : occluderPolys);
-    printf("[Lightmap] %zu source faces -> %zu bake patches across %zu pages of up to %dx%d, %zu lights, %zu tris, %zu luxels x %d samples = %zu rays/light (luxel=%.3f, ambient=%.2f/%.2f/%.2f, bounces=%d, bounceScale=%.2f)\n",
+    printf("[Lightmap] %zu source faces -> %zu bake patches across %zu pages of up to %dx%d, %zu explicit/direct lights, %zu tris, %zu luxels x %d samples = %zu rays/light (luxel=%.3f, ambient=%.2f/%.2f/%.2f, bounces=%d, bounceScale=%.2f)\n",
            visiblePolys.size(), patches.size(), atlas.pages.size(), LIGHTMAP_PAGE_SIZE, LIGHTMAP_PAGE_SIZE,
            allLights.size(), occ.tris.size(),
            totalLuxels, AA_GRID * AA_GRID, totalLuxels * (size_t)(AA_GRID * AA_GRID),
@@ -2314,19 +2358,24 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                 }
             }
         }
-        printf("[Lightmap] page %u stats: %zu rects, %zu lights, %zu luxels\n",
-               pageIndex, pageRects.size(), pageLights.size(), pageLuxels);
+        printf("[Lightmap] page %u stats: %zu rects, %zu explicit/direct lights%s%s, %zu luxels\n",
+               pageIndex,
+               pageRects.size(),
+               pageLights.size(),
+               (settings.sunlight2Intensity > 0.0f) ? ", + upper skylight" : "",
+               (settings.sunlight3Intensity > 0.0f) ? ", + lower skylight" : "",
+               pageLuxels);
         fflush(stdout);
 
         bool usedCPUFallback = false;
         if (!pageRequiresCPU && PageUsesCPUOnlyLightingFeatures(pageIndex, rects, sourcePhongs, pageLights, settings, &computeError)) {
             pageRequiresCPU = true;
         }
-        if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageLights, settings, page.width, page.height, page.pixels, &computeError)) {
+        if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageLights, settings, skyTraceDistance, page.width, page.height, page.pixels, &computeError)) {
             printf("[Lightmap] page %u compute bake unavailable, falling back to CPU: %s\n",
                    pageIndex, computeError.c_str());
             fflush(stdout);
-            BakeLightmapCPUPage(patches, sourcePhongs, allLights, rects, nullptr, pageIndex, occ, settings, page);
+            BakeLightmapCPUPage(patches, sourcePhongs, allLights, rects, nullptr, pageIndex, occ, settings, skyTraceDistance, page);
             usedCPUFallback = true;
             printf("[Lightmap] page %u CPU bake complete\n", pageIndex);
             fflush(stdout);
@@ -2350,7 +2399,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                        darkStats.darkValidCount, darkStats.validCount,
                        darkStats.darkFullCoverageCount, darkStats.fullCoverageCount);
                 fflush(stdout);
-                BakeLightmapCPUPage(patches, sourcePhongs, allLights, rects, nullptr, pageIndex, occ, settings, page);
+                BakeLightmapCPUPage(patches, sourcePhongs, allLights, rects, nullptr, pageIndex, occ, settings, skyTraceDistance, page);
                 edgeTexelsStabilized = false;
                 printf("[Lightmap] page %u CPU re-bake complete\n", pageIndex);
                 fflush(stdout);
@@ -2426,11 +2475,13 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
             }
             LightBakeSettings bounceSettings = settings;
             bounceSettings.ambientColor = Vector3Zero();
-            if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageIndirectLights, bounceSettings, page.width, page.height, bouncedPage.pixels, &computeError)) {
+            bounceSettings.sunlight2Intensity = 0.0f;
+            bounceSettings.sunlight3Intensity = 0.0f;
+            if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, pageIndirectLights, bounceSettings, skyTraceDistance, page.width, page.height, bouncedPage.pixels, &computeError)) {
                 printf("[Lightmap] page %u bounce %d compute unavailable, falling back to CPU: %s\n",
                        pageIndex, bouncePass + 1, computeError.c_str());
                 fflush(stdout);
-                BakeLightmapCPUPage(patches, sourcePhongs, indirectLights, rects, &indirectLightIndices, pageIndex, occ, bounceSettings, bouncedPage);
+                BakeLightmapCPUPage(patches, sourcePhongs, indirectLights, rects, &indirectLightIndices, pageIndex, occ, bounceSettings, skyTraceDistance, bouncedPage);
             }
 
             StabilizeEdgeTexels(bouncedPage, coverageMasks[pageIndex]);

@@ -18,12 +18,19 @@ layout(binding=0) uniform cs_face_params {
     float ray_eps;
     int global_dirt;
     int dirt_mode;
+    int skylight_dirt;
     int phong_neighbor_count;
-    int _pad_scalar0;
     float dirt_depth;
     float dirt_scale;
     float dirt_gain;
     float dirt_angle;
+    float skylight_angle_scale;
+    float sky_trace_distance;
+    vec2 _pad_scalar0;
+    vec3 sunlight2_color;
+    float sunlight2_intensity;
+    vec3 sunlight3_color;
+    float sunlight3_intensity;
     vec3 origin;
     float _pad0;
     vec3 axis_u;
@@ -105,6 +112,9 @@ const int POINT_LIGHT_ATTEN_NONE = 4;
 const int POINT_LIGHT_ATTEN_LOCAL_MINLIGHT = 5;
 const int POINT_LIGHT_ATTEN_INVERSE_SQUARE_B = 6;
 const int DIRT_RAY_COUNT = 16;
+const int SKYDOME_ELEVATION_STEPS = 5;
+const int SKYDOME_ANGLE_STEPS = SKYDOME_ELEVATION_STEPS * 4;
+const int SKYDOME_SAMPLE_COUNT = SKYDOME_ANGLE_STEPS * SKYDOME_ELEVATION_STEPS + 1;
 
 vec3 safe_normalize(vec3 v, vec3 fallback) {
     float len_sq = dot(v, v);
@@ -315,6 +325,12 @@ float evaluate_incidence_scale(point_light light, float ndl) {
     return (1.0 - t) + t * lambert;
 }
 
+float evaluate_angle_scale(float angle_scale, float ndl) {
+    float lambert = max(0.0, ndl);
+    float t = clamp(angle_scale, 0.0, 1.0);
+    return (1.0 - t) + t * lambert;
+}
+
 float evaluate_spotlight_factor(point_light light, vec3 dir_to_light) {
     if ((light.spot_outer_cos <= -1.5) || (dot(light.spot_direction, light.spot_direction) <= 1e-6)) {
         return 1.0;
@@ -365,6 +381,61 @@ vec3 sample_cone_direction(vec3 axis, float cone_angle_deg, int sample_index, in
     float phi = u2 * 6.28318530718;
     vec3 radial = tangent * cos(phi) + bitangent * sin(phi);
     return safe_normalize(dir_axis * cos_theta + radial * sin_theta, dir_axis);
+}
+
+vec3 ericw_skydome_direction(bool upper_hemisphere, int sample_index, float rotation_angle) {
+    if (sample_index >= (SKYDOME_SAMPLE_COUNT - 1)) {
+        return upper_hemisphere ? vec3(0.0, 1.0, 0.0) : vec3(0.0, -1.0, 0.0);
+    }
+
+    int ring_index = sample_index / SKYDOME_ANGLE_STEPS;
+    int angle_index = sample_index % SKYDOME_ANGLE_STEPS;
+    float elevation_step = radians(90.0 / float(SKYDOME_ELEVATION_STEPS + 1));
+    float angle_step = radians(360.0 / float(SKYDOME_ANGLE_STEPS));
+    float elevation = elevation_step * (0.5 + float(ring_index));
+    float angle = angle_step * (float(angle_index) + (float(ring_index) / float(SKYDOME_ELEVATION_STEPS))) + rotation_angle;
+    float radial_scale = cos(elevation);
+    float vertical_scale = sin(elevation) * (upper_hemisphere ? 1.0 : -1.0);
+    return safe_normalize(vec3(cos(angle) * radial_scale, vertical_scale, sin(angle) * radial_scale),
+                          upper_hemisphere ? vec3(0.0, 1.0, 0.0) : vec3(0.0, -1.0, 0.0));
+}
+
+vec3 compute_skydome_lighting(vec3 sample_point, vec3 sample_normal, float near_hit_t, float dirt_occlusion) {
+    vec3 result = vec3(0.0);
+    float upper_per_sample = (sunlight2_intensity > 0.0) ? (sunlight2_intensity / (300.0 * float(SKYDOME_SAMPLE_COUNT))) : 0.0;
+    float lower_per_sample = (sunlight3_intensity > 0.0) ? (sunlight3_intensity / (300.0 * float(SKYDOME_SAMPLE_COUNT))) : 0.0;
+    if ((upper_per_sample <= 0.0) && (lower_per_sample <= 0.0)) {
+        return result;
+    }
+
+    uint upper_seed = hash_point_seed(sample_point, 13007);
+    uint lower_seed = hash_point_seed(sample_point, 17011);
+    float upper_rotation = random_float_01(upper_seed) * 6.28318530718;
+    float lower_rotation = random_float_01(lower_seed) * 6.28318530718;
+    float dirt = (skylight_dirt != 0)
+        ? compute_dirt_attenuation(dirt_occlusion, dirt_scale, dirt_gain)
+        : 1.0;
+
+    for (int i = 0; i < SKYDOME_SAMPLE_COUNT; ++i) {
+        if (upper_per_sample > 0.0) {
+            vec3 dir = ericw_skydome_direction(true, i, upper_rotation);
+            vec3 ro = sample_point + sample_normal * shadow_bias + dir * shadow_bias;
+            if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1)) {
+                float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
+                result += sunlight2_color * (upper_per_sample * incidence * dirt);
+            }
+        }
+        if (lower_per_sample > 0.0) {
+            vec3 dir = ericw_skydome_direction(false, i, lower_rotation);
+            vec3 ro = sample_point + sample_normal * shadow_bias + dir * shadow_bias;
+            if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1)) {
+                float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
+                result += sunlight3_color * (lower_per_sample * incidence * dirt);
+            }
+        }
+    }
+
+    return result;
 }
 
 vec3 evaluate_phong_normal(vec3 sample_point) {
@@ -426,7 +497,7 @@ void main() {
             float near_hit_t = shadow_bias + EDGE_SEAM_TMIN_BOOST * edge_factor;
 
             vec3 sample_rgb = ambient_color;
-            bool uses_dirt = false;
+            bool uses_dirt = skylight_dirt != 0;
             for (int li = 0; li < light_count; ++li) {
                 if (light_uses_dirt(lights[li])) {
                     uses_dirt = true;
@@ -479,6 +550,7 @@ void main() {
                     : 1.0;
                 sample_rgb += light.color * (emit * spotlight * incidence * attenuation * dirt);
             }
+            sample_rgb += compute_skydome_lighting(wp, sample_normal, near_hit_t, dirt_occlusion);
             accum += sample_rgb;
             used_samples += 1;
         }
