@@ -20,7 +20,8 @@
 static constexpr int   LM_PAD             = 2;      // border luxels (filled by dilate)
 static constexpr int   LIGHTMAP_PAGE_SIZE = 2048;
 static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face luxel cap (interior only)
-static constexpr float SHADOW_BIAS        = 0.25f;
+static constexpr float SURFACE_SAMPLE_OFFSET = 1.0f;
+static constexpr float SHADOW_BIAS        = 0.03125f;
 static constexpr float RAY_EPS            = 1e-4f;
 static constexpr float OCCLUSION_NEAR_TMIN = SHADOW_BIAS;
 static constexpr float EDGE_SEAM_GUARD_LUXELS = 0.75f;
@@ -37,6 +38,9 @@ static constexpr float INDIRECT_BOUNCE_RADIUS_MAX = 160.0f;
 static constexpr int   AA_GRID            = 4;      // AA_GRID² samples per luxel
 static constexpr int   DILATE_PASSES      = 4;
 static constexpr int   ERICW_SUNSAMPLES   = 100;    // matches ericw-tools default sunsamples
+static constexpr int   DIRT_NUM_ANGLE_STEPS = 16;
+static constexpr int   DIRT_NUM_ELEVATION_STEPS = 3;
+static constexpr int   DIRT_RAY_COUNT = DIRT_NUM_ANGLE_STEPS * DIRT_NUM_ELEVATION_STEPS;
 
 // --------------------------------------------------------------------------
 //  Planar basis
@@ -196,6 +200,43 @@ static Vector3 RandomPointInUnitSphere(uint32_t& state) {
         }
     }
     return {0.0f, 0.0f, 0.0f};
+}
+
+static Vector3 TransformToTangentSpace(const Vector3& normal,
+                                       const Vector3& tangent,
+                                       const Vector3& bitangent,
+                                       const Vector3& local)
+{
+    return Vector3Add(Vector3Add(Vector3Scale(bitangent, local.x),
+                                 Vector3Scale(tangent, local.y)),
+                      Vector3Scale(normal, local.z));
+}
+
+static Vector3 BuildEricwDirtVector(const LightBakeSettings& settings, int sampleIndex, uint32_t& seed) {
+    const float dirtAngle = std::clamp(settings.dirtAngle, 1.0f, 90.0f);
+    if (settings.dirtMode == 1) {
+        const float angle = RandomFloat01(seed) * PI * 2.0f;
+        const float elevation = RandomFloat01(seed) * dirtAngle * DEG2RAD;
+        const float sinElevation = sinf(elevation);
+        return {
+            cosf(angle) * sinElevation,
+            sinf(angle) * sinElevation,
+            cosf(elevation)
+        };
+    }
+
+    const float angleStep = (PI * 2.0f) / (float)DIRT_NUM_ANGLE_STEPS;
+    const float elevationStep = (dirtAngle * DEG2RAD) / (float)DIRT_NUM_ELEVATION_STEPS;
+    const int angleIndex = sampleIndex / DIRT_NUM_ELEVATION_STEPS;
+    const int elevationIndex = sampleIndex % DIRT_NUM_ELEVATION_STEPS;
+    const float angle = (float)angleIndex * angleStep;
+    const float elevation = elevationStep * (0.5f + (float)elevationIndex);
+    const float sinElevation = sinf(elevation);
+    return {
+        sinElevation * cosf(angle),
+        sinElevation * sinf(angle),
+        cosf(elevation)
+    };
 }
 
 static void AppendDeviatedLights(const PointLight& baseLight,
@@ -934,8 +975,8 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
     return o;
 }
 
-static bool RayTri(const Vector3& ro, const Vector3& rd,
-                   const LightmapComputeOccluderTri& tr, float tmin, float tmax)
+static bool RayTriDistance(const Vector3& ro, const Vector3& rd,
+                           const LightmapComputeOccluderTri& tr, float tmin, float tmax, float* outT = nullptr)
 {
     Vector3 e1 = Vector3Subtract(tr.b, tr.a);
     Vector3 e2 = Vector3Subtract(tr.c, tr.a);
@@ -948,7 +989,13 @@ static bool RayTri(const Vector3& ro, const Vector3& rd,
     Vector3 q = Vector3CrossProduct(s, e1);
     float v = Vector3DotProduct(rd, q) * inv;     if (v < 0 || u + v > 1) return false;
     float t = Vector3DotProduct(e2, q) * inv;
-    return t > tmin && t < tmax;
+    if (t <= tmin || t >= tmax) {
+        return false;
+    }
+    if (outT) {
+        *outT = t;
+    }
+    return true;
 }
 
 static bool RayAABB(const Vector3& ro, const Vector3& inv_rd,
@@ -977,9 +1024,38 @@ static bool Occluded(const OccluderSet& o, const Vector3& ro,
             continue;
         }
         if (!RayAABB(ro, inv, tri.bounds, dist)) continue;
-        if (RayTri(ro, rd, tri, minHitT, dist)) return true;
+        if (RayTriDistance(ro, rd, tri, minHitT, dist)) return true;
     }
     return false;
+}
+
+static float ClosestHitDistance(const OccluderSet& o,
+                                const Vector3& ro,
+                                const Vector3& rd,
+                                float minHitT,
+                                float dist,
+                                int ignoreOccluderGroup)
+{
+    Vector3 inv = {
+        1.0f / (fabsf(rd.x) > RAY_EPS ? rd.x : RAY_EPS),
+        1.0f / (fabsf(rd.y) > RAY_EPS ? rd.y : RAY_EPS),
+        1.0f / (fabsf(rd.z) > RAY_EPS ? rd.z : RAY_EPS)
+    };
+
+    float closest = dist;
+    for (const auto& tri : o.tris) {
+        if ((ignoreOccluderGroup >= 0) && (tri.occluderGroup == ignoreOccluderGroup)) {
+            continue;
+        }
+        if (!RayAABB(ro, inv, tri.bounds, closest)) {
+            continue;
+        }
+        float hitT = 0.0f;
+        if (RayTriDistance(ro, rd, tri, minHitT, closest, &hitT)) {
+            closest = hitT;
+        }
+    }
+    return closest;
 }
 
 // --------------------------------------------------------------------------
@@ -2041,6 +2117,17 @@ static void AddPagePixels(LightmapPage& dst, const LightmapPage& src) {
     }
 }
 
+static Vector3 ComputeLuxelPlanePoint(const FaceRect& rect, float ju, float jv) {
+    return Vector3Add(
+        rect.gpu.origin,
+        Vector3Add(Vector3Scale(rect.gpu.axisU, ju * rect.gpu.luxelSize),
+                   Vector3Scale(rect.gpu.axisV, jv * rect.gpu.luxelSize)));
+}
+
+static Vector3 OffsetSamplePointOffSurface(const Vector3& planePoint, const Vector3& faceNormal) {
+    return Vector3Add(planePoint, Vector3Scale(Vector3Normalize(faceNormal), SURFACE_SAMPLE_OFFSET));
+}
+
 static float ComputeDirtAttenuation(float occlusionRatio, float dirtScale, float dirtGain) {
     const float scaled = std::clamp(occlusionRatio * std::max(0.0f, dirtScale), 0.0f, 1.0f);
     const float gained = powf(scaled, std::max(0.01f, dirtGain));
@@ -2052,25 +2139,28 @@ static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
                                        const Vector3& sampleNormal,
                                        const LightBakeSettings& settings)
 {
-    const int rayCount = 16;
-    const bool randomized = settings.dirtMode != 0;
-    const float coneAngle = std::clamp(settings.dirtAngle, 1.0f, 90.0f);
-    uint32_t seed = randomized ? HashLightSeed(samplePoint, 7919) : 1u;
-    int occludedCount = 0;
-    for (int i = 0; i < rayCount; ++i) {
-        Vector3 dir = SampleConeDirection(sampleNormal, coneAngle, i, rayCount);
-        if (randomized) {
-            dir = Vector3Normalize(Vector3Add(dir, Vector3Scale(RandomPointInUnitSphere(seed), 0.15f)));
-            if (Vector3DotProduct(dir, sampleNormal) < 0.0f) {
-                dir = Vector3Scale(dir, -1.0f);
-            }
-        }
-        const Vector3 ro = Vector3Add(samplePoint, Vector3Scale(sampleNormal, SHADOW_BIAS));
-        if (Occluded(occ, ro, dir, OCCLUSION_NEAR_TMIN, std::max(1.0f, settings.dirtDepth), -1)) {
-            ++occludedCount;
-        }
+    const float depth = std::max(1.0f, settings.dirtDepth);
+    const Vector3 normal = Vector3Normalize(sampleNormal);
+    Vector3 tangent{};
+    Vector3 bitangent{};
+    FaceBasis(normal, tangent, bitangent);
+
+    uint32_t seed = HashLightSeed(samplePoint, 7919);
+    float accumulatedDistance = 0.0f;
+    for (int i = 0; i < DIRT_RAY_COUNT; ++i) {
+        const Vector3 localDir = BuildEricwDirtVector(settings, i, seed);
+        const Vector3 dir = Vector3Normalize(TransformToTangentSpace(normal, tangent, bitangent, localDir));
+        const float hitDistance = ClosestHitDistance(
+            occ,
+            Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS)),
+            dir,
+            OCCLUSION_NEAR_TMIN,
+            depth,
+            -1);
+        accumulatedDistance += std::min(depth, hitDistance);
     }
-    return (float)occludedCount / (float)rayCount;
+    const float avgHitDistance = accumulatedDistance / (float)DIRT_RAY_COUNT;
+    return std::clamp(1.0f - (avgHitDistance / depth), 0.0f, 1.0f);
 }
 
 static bool SkyDomeUsesDirt(const LightBakeSettings& settings) {
@@ -2108,8 +2198,7 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
     for (int i = 0; i < sampleCount; ++i) {
         if (upperPerSample > 0.0f) {
             const Vector3 dir = EricwSkyDomeDirection(true, i, upperRotation);
-            const Vector3 ro = Vector3Add(Vector3Add(samplePoint, Vector3Scale(sampleNormal, SHADOW_BIAS)),
-                                          Vector3Scale(dir, SHADOW_BIAS));
+            const Vector3 ro = Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS));
             if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1)) {
                 const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
                 const float scale = upperPerSample * incidence * dirtScale;
@@ -2118,8 +2207,7 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
         }
         if (lowerPerSample > 0.0f) {
             const Vector3 dir = EricwSkyDomeDirection(false, i, lowerRotation);
-            const Vector3 ro = Vector3Add(Vector3Add(samplePoint, Vector3Scale(sampleNormal, SHADOW_BIAS)),
-                                          Vector3Scale(dir, SHADOW_BIAS));
+            const Vector3 ro = Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS));
             if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1)) {
                 const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
                 const float scale = lowerPerSample * incidence * dirtScale;
@@ -2183,11 +2271,9 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                         if (!InsidePoly2D(r.poly2d, ju, jv)) {
                             continue;
                         }
-                        const Vector3 wp = Vector3Add(
-                            r.gpu.origin,
-                            Vector3Add(Vector3Scale(r.gpu.axisU, ju * r.gpu.luxelSize),
-                                       Vector3Scale(r.gpu.axisV, jv * r.gpu.luxelSize)));
-                        const Vector3 sampleNormal = EvaluatePhongNormal(sourcePhongs, r.sourcePolyIndex, wp, r.gpu.luxelSize);
+                        const Vector3 planePoint = ComputeLuxelPlanePoint(r, ju, jv);
+                        const Vector3 sampleNormal = EvaluatePhongNormal(sourcePhongs, r.sourcePolyIndex, planePoint, r.gpu.luxelSize);
+                        const Vector3 samplePoint = OffsetSamplePointOffSurface(planePoint, r.gpu.normal);
                         const float edgeDistLuxels = MinDistToPolyEdge2D(r.poly2d, ju, jv);
                         const float edgeFactor = std::clamp(
                             1.0f - edgeDistLuxels / EDGE_SEAM_GUARD_LUXELS,
@@ -2204,10 +2290,10 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             if (LightUsesDirt(lights[lightIndex], settings)) {
                                 usesDirt = true;
                                 break;
-                            }
+                                }
                         }
                         usesDirt = usesDirt || SkyDomeUsesDirt(settings);
-                        const float dirtOcclusion = usesDirt ? ComputeDirtOcclusionRatio(occ, wp, sampleNormal, settings) : 0.0f;
+                        const float dirtOcclusion = usesDirt ? ComputeDirtOcclusionRatio(occ, samplePoint, sampleNormal, settings) : 0.0f;
                         for (uint32_t lightIndex : rectLightIndices) {
                             const PointLight& L = lights[lightIndex];
                             Vector3 dir{};
@@ -2217,16 +2303,14 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 dir = Vector3Normalize(L.parallelDirection);
                                 dist = std::max(1.0f, L.intensity);
                             } else {
-                                const Vector3 toL = Vector3Subtract(L.position, wp);
+                                const Vector3 toL = Vector3Subtract(L.position, samplePoint);
                                 dist = Vector3Length(toL);
                                 if (dist > L.intensity || dist < 1e-3f) continue;
                                 dir = Vector3Scale(toL, 1.f / dist);
                                 att = EvaluateLightAttenuation(L, dist);
                                 if (att <= 0.0f) continue;
                             }
-                            const Vector3 ro = Vector3Add(
-                                Vector3Add(wp, Vector3Scale(sampleNormal, SHADOW_BIAS)),
-                                Vector3Scale(dir, SHADOW_BIAS));
+                            const Vector3 ro = Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS));
                             float emit = 1.0f;
                             if (L.directional) {
                                 const Vector3 lightToSurface = Vector3Scale(dir, -1.0f);
@@ -2248,7 +2332,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             cb += L.color.z * contrib;
                         }
                         const Vector3 skyContrib = ComputeSkyDomeContribution(
-                            occ, wp, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
+                            occ, samplePoint, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
                         cr += skyContrib.x;
                         cg += skyContrib.y;
                         cb += skyContrib.z;

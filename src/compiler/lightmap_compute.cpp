@@ -40,7 +40,7 @@ namespace {
 constexpr int kWorkgroupSize = 8;
 constexpr int kDispatchBatchSize = 32;
 constexpr size_t kUniformUploadAlign = 256;
-constexpr float kShadowBias = 0.25f;
+constexpr float kShadowBias = 0.03125f;
 constexpr float kRayEps = 1e-4f;
 
 using GpuPointLight = warped_lightmap_bake_point_light_t;

@@ -103,7 +103,8 @@ layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
 const int AA_GRID = 4;
 const int SAMPLES = AA_GRID * AA_GRID;
 const float EDGE_SEAM_GUARD_LUXELS = 0.75;
-const float EDGE_SEAM_TMIN_BOOST = 0.75;
+const float EDGE_SEAM_TMIN_SCALE = 3.0;
+const float SURFACE_SAMPLE_OFFSET = 1.0;
 const int POINT_LIGHT_ATTEN_QUADRATIC = 0;
 const int POINT_LIGHT_ATTEN_LINEAR = 1;
 const int POINT_LIGHT_ATTEN_INVERSE = 2;
@@ -111,7 +112,9 @@ const int POINT_LIGHT_ATTEN_INVERSE_SQUARE = 3;
 const int POINT_LIGHT_ATTEN_NONE = 4;
 const int POINT_LIGHT_ATTEN_LOCAL_MINLIGHT = 5;
 const int POINT_LIGHT_ATTEN_INVERSE_SQUARE_B = 6;
-const int DIRT_RAY_COUNT = 16;
+const int DIRT_NUM_ANGLE_STEPS = 16;
+const int DIRT_NUM_ELEVATION_STEPS = 3;
+const int DIRT_RAY_COUNT = DIRT_NUM_ANGLE_STEPS * DIRT_NUM_ELEVATION_STEPS;
 const int SKYDOME_ELEVATION_STEPS = 5;
 const int SKYDOME_ANGLE_STEPS = SKYDOME_ELEVATION_STEPS * 4;
 const int SKYDOME_SAMPLE_COUNT = SKYDOME_ANGLE_STEPS * SKYDOME_ELEVATION_STEPS + 1;
@@ -236,26 +239,30 @@ bool ray_aabb(vec3 ro, vec3 inv_rd, vec3 bb_min, vec3 bb_max, float tmax) {
     return tf >= tn;
 }
 
-bool ray_tri(vec3 ro, vec3 rd, occluder_tri tri, float tmin, float tmax) {
+float ray_tri_t(vec3 ro, vec3 rd, occluder_tri tri) {
     vec3 e1 = tri.b - tri.a;
     vec3 e2 = tri.c - tri.a;
     vec3 p = cross(rd, e2);
     float det = dot(e1, p);
     if (abs(det) < ray_eps) {
-        return false;
+        return -1.0;
     }
     float inv = 1.0 / det;
     vec3 s = ro - tri.a;
     float u = dot(s, p) * inv;
     if ((u < 0.0) || (u > 1.0)) {
-        return false;
+        return -1.0;
     }
     vec3 q = cross(s, e1);
     float v = dot(rd, q) * inv;
     if ((v < 0.0) || ((u + v) > 1.0)) {
-        return false;
+        return -1.0;
     }
-    float t = dot(e2, q) * inv;
+    return dot(e2, q) * inv;
+}
+
+bool ray_tri(vec3 ro, vec3 rd, occluder_tri tri, float tmin, float tmax) {
+    float t = ray_tri_t(ro, rd, tri);
     return (t > tmin) && (t < tmax);
 }
 
@@ -288,6 +295,25 @@ bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder
         }
     }
     return false;
+}
+
+float closest_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group) {
+    vec3 inv_rd = safe_inverse_dir(rd);
+    float closest = dist;
+    for (int i = 0; i < tri_count; ++i) {
+        occluder_tri tri = tris[i];
+        if ((ignore_occluder_group >= 0) && (tri.occluder_group == ignore_occluder_group)) {
+            continue;
+        }
+        if (!ray_aabb(ro, inv_rd, tri.bounds_min, tri.bounds_max, closest)) {
+            continue;
+        }
+        float t = ray_tri_t(ro, rd, tri);
+        if ((t > min_hit_t) && (t < closest)) {
+            closest = t;
+        }
+    }
+    return closest;
 }
 
 uint pack_rgba8(vec4 color) {
@@ -365,6 +391,29 @@ float compute_dirt_attenuation(float occlusion_ratio, float dirt_scale_value, fl
     return clamp(1.0 - gained, 0.0, 1.0);
 }
 
+vec3 transform_to_tangent_space(vec3 normal, vec3 tangent, vec3 bitangent, vec3 local) {
+    return bitangent * local.x + tangent * local.y + normal * local.z;
+}
+
+vec3 build_ericw_dirt_vector(int sample_index, inout uint state) {
+    float dirt_angle_clamped = clamp(dirt_angle, 1.0, 90.0);
+    if (dirt_mode == 1) {
+        float angle = random_float_01(state) * 6.28318530718;
+        float elevation = random_float_01(state) * radians(dirt_angle_clamped);
+        float sin_elevation = sin(elevation);
+        return vec3(cos(angle) * sin_elevation, sin(angle) * sin_elevation, cos(elevation));
+    }
+
+    int angle_index = sample_index / DIRT_NUM_ELEVATION_STEPS;
+    int elevation_index = sample_index % DIRT_NUM_ELEVATION_STEPS;
+    float angle_step = 6.28318530718 / float(DIRT_NUM_ANGLE_STEPS);
+    float elevation_step = radians(dirt_angle_clamped) / float(DIRT_NUM_ELEVATION_STEPS);
+    float angle = float(angle_index) * angle_step;
+    float elevation = elevation_step * (0.5 + float(elevation_index));
+    float sin_elevation = sin(elevation);
+    return vec3(sin_elevation * cos(angle), sin_elevation * sin(angle), cos(elevation));
+}
+
 vec3 sample_cone_direction(vec3 axis, float cone_angle_deg, int sample_index, int sample_count) {
     vec3 dir_axis = safe_normalize(axis, vec3(0.0, 1.0, 0.0));
     if ((sample_count <= 1) || (cone_angle_deg <= 1e-3)) {
@@ -419,7 +468,7 @@ vec3 compute_skydome_lighting(vec3 sample_point, vec3 sample_normal, float near_
     for (int i = 0; i < SKYDOME_SAMPLE_COUNT; ++i) {
         if (upper_per_sample > 0.0) {
             vec3 dir = ericw_skydome_direction(true, i, upper_rotation);
-            vec3 ro = sample_point + sample_normal * shadow_bias + dir * shadow_bias;
+            vec3 ro = sample_point + dir * shadow_bias;
             if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1)) {
                 float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
                 result += sunlight2_color * (upper_per_sample * incidence * dirt);
@@ -427,7 +476,7 @@ vec3 compute_skydome_lighting(vec3 sample_point, vec3 sample_normal, float near_
         }
         if (lower_per_sample > 0.0) {
             vec3 dir = ericw_skydome_direction(false, i, lower_rotation);
-            vec3 ro = sample_point + sample_normal * shadow_bias + dir * shadow_bias;
+            vec3 ro = sample_point + dir * shadow_bias;
             if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1)) {
                 float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
                 result += sunlight3_color * (lower_per_sample * incidence * dirt);
@@ -454,24 +503,19 @@ vec3 evaluate_phong_normal(vec3 sample_point) {
 }
 
 float compute_dirt_occlusion_ratio(vec3 sample_point, vec3 sample_normal) {
-    bool randomized = dirt_mode != 0;
-    float cone_angle = clamp(dirt_angle, 1.0, 90.0);
-    uint seed = randomized ? hash_point_seed(sample_point, 7919) : 1u;
-    int occluded_count = 0;
+    vec3 tangent;
+    vec3 bitangent;
+    face_basis(sample_normal, tangent, bitangent);
+    uint seed = hash_point_seed(sample_point, 7919);
+    float accumulated_distance = 0.0;
     for (int i = 0; i < DIRT_RAY_COUNT; ++i) {
-        vec3 dir = sample_cone_direction(sample_normal, cone_angle, i, DIRT_RAY_COUNT);
-        if (randomized) {
-            dir = safe_normalize(dir + random_point_in_unit_sphere(seed) * 0.15, dir);
-            if (dot(dir, sample_normal) < 0.0) {
-                dir = -dir;
-            }
-        }
-        vec3 ro = sample_point + sample_normal * shadow_bias;
-        if (occluded(ro, dir, shadow_bias, max(1.0, dirt_depth), -1)) {
-            occluded_count += 1;
-        }
+        vec3 local_dir = build_ericw_dirt_vector(i, seed);
+        vec3 dir = safe_normalize(transform_to_tangent_space(sample_normal, tangent, bitangent, local_dir), sample_normal);
+        float hit_distance = closest_hit_distance(sample_point + dir * shadow_bias, dir, shadow_bias, max(1.0, dirt_depth), -1);
+        accumulated_distance += min(max(1.0, dirt_depth), hit_distance);
     }
-    return float(occluded_count) / float(DIRT_RAY_COUNT);
+    float avg_hit_distance = accumulated_distance / float(DIRT_RAY_COUNT);
+    return clamp(1.0 - (avg_hit_distance / max(1.0, dirt_depth)), 0.0, 1.0);
 }
 
 void main() {
@@ -490,11 +534,12 @@ void main() {
             if (!inside_poly_2d(ju, jv)) {
                 continue;
             }
-            vec3 wp = origin + axis_u * (ju * luxel_size) + axis_v * (jv * luxel_size);
-            vec3 sample_normal = evaluate_phong_normal(wp);
+            vec3 plane_point = origin + axis_u * (ju * luxel_size) + axis_v * (jv * luxel_size);
+            vec3 sample_normal = evaluate_phong_normal(plane_point);
+            vec3 sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * SURFACE_SAMPLE_OFFSET;
             float edge_dist_luxels = min_dist_to_poly_edge_2d(ju, jv);
             float edge_factor = clamp(1.0 - edge_dist_luxels / EDGE_SEAM_GUARD_LUXELS, 0.0, 1.0);
-            float near_hit_t = shadow_bias + EDGE_SEAM_TMIN_BOOST * edge_factor;
+            float near_hit_t = shadow_bias + (shadow_bias * EDGE_SEAM_TMIN_SCALE) * edge_factor;
 
             vec3 sample_rgb = ambient_color;
             bool uses_dirt = skylight_dirt != 0;
@@ -504,7 +549,7 @@ void main() {
                     break;
                 }
             }
-            float dirt_occlusion = uses_dirt ? compute_dirt_occlusion_ratio(wp, sample_normal) : 0.0;
+            float dirt_occlusion = uses_dirt ? compute_dirt_occlusion_ratio(sample_point, sample_normal) : 0.0;
             for (int li = 0; li < light_count; ++li) {
                 point_light light = lights[li];
                 vec3 dir;
@@ -514,7 +559,7 @@ void main() {
                     dir = safe_normalize(light.parallel_direction, vec3(0.0, 1.0, 0.0));
                     dist = max(1.0, light.intensity);
                 } else {
-                    vec3 to_light = light.position - wp;
+                    vec3 to_light = light.position - sample_point;
                     dist = length(to_light);
                     if ((dist > light.intensity) || (dist < 1e-3)) {
                         continue;
@@ -525,7 +570,7 @@ void main() {
                         continue;
                     }
                 }
-                vec3 ro = wp + sample_normal * shadow_bias + dir * shadow_bias;
+                vec3 ro = sample_point + dir * shadow_bias;
                 float emit = 1.0;
                 if (light.directional != 0) {
                     emit = dot(light.emission_normal, -dir);
@@ -550,7 +595,7 @@ void main() {
                     : 1.0;
                 sample_rgb += light.color * (emit * spotlight * incidence * attenuation * dirt);
             }
-            sample_rgb += compute_skydome_lighting(wp, sample_normal, near_hit_t, dirt_occlusion);
+            sample_rgb += compute_skydome_lighting(sample_point, sample_normal, near_hit_t, dirt_occlusion);
             accum += sample_rgb;
             used_samples += 1;
         }
