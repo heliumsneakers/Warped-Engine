@@ -20,7 +20,7 @@
 static constexpr int   LM_PAD             = 2;      // border luxels (filled by dilate)
 static constexpr int   LIGHTMAP_PAGE_SIZE = 2048;
 static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face luxel cap (interior only)
-static constexpr float SURFACE_SAMPLE_OFFSET = 1.0f;
+static constexpr float SURFACE_SAMPLE_OFFSET = 0.125f;
 static constexpr float SHADOW_BIAS        = 0.03125f;
 static constexpr float SOLID_REPAIR_EPSILON = 0.05f;
 static constexpr float SAMPLE_REPAIR_JITTER = 0.5f;
@@ -1916,6 +1916,125 @@ static void StabilizeEdgeTexels(LightmapPage& page,
     }
 }
 
+static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
+                            const std::vector<FaceRect>& rects,
+                            const std::vector<std::vector<uint8_t>>& validMasks,
+                            int lmAAScale) {
+    if (lmAAScale <= 0) return;
+
+    const float sigma = lmAAScale / 2.0f;
+    const int radius = (int)ceilf(2.0f * sigma);
+
+    // Precompute 1D Gaussian kernel
+    std::vector<float> kernel(radius + 1);
+    {
+        float sum = 0.0f;
+        for (int i = 0; i <= radius; ++i) {
+            kernel[i] = expf(-(float)(i * i) / (2.0f * sigma * sigma));
+            sum += (i == 0) ? kernel[i] : 2.0f * kernel[i];
+        }
+        for (int i = 0; i <= radius; ++i) kernel[i] /= sum;
+    }
+
+    // Build per-pixel face ID map for each page so the blur stays within each face rect
+    const uint32_t NO_FACE = UINT32_MAX;
+    std::vector<std::vector<uint32_t>> pageFaceIDs(pages.size());
+    for (uint32_t pageIndex = 0; pageIndex < pages.size(); ++pageIndex) {
+        const int W = pages[pageIndex].width;
+        const int H = pages[pageIndex].height;
+        pageFaceIDs[pageIndex].assign((size_t)W * H, NO_FACE);
+    }
+    for (uint32_t ri = 0; ri < rects.size(); ++ri) {
+        const FaceRect& r = rects[ri];
+        const int rx = r.gpu.x;
+        const int ry = r.gpu.y;
+        const int rw = r.gpu.w;
+        const int rh = r.gpu.h;
+        const uint32_t pi = r.page;
+        if (pi >= pages.size()) continue;
+        const int W = pages[pi].width;
+        auto& faceIDs = pageFaceIDs[pi];
+        for (int ly = 0; ly < rh; ++ly) {
+            for (int lx = 0; lx < rw; ++lx) {
+                const size_t idx = (size_t)(ry + ly) * W + (rx + lx);
+                faceIDs[idx] = ri;
+            }
+        }
+    }
+
+    for (uint32_t pageIndex = 0; pageIndex < pages.size(); ++pageIndex) {
+        LightmapPage& page = pages[pageIndex];
+        const std::vector<uint32_t>& faceIDs = pageFaceIDs[pageIndex];
+        const std::vector<uint8_t>& valid = validMasks[pageIndex];
+        const int W = page.width;
+        const int H = page.height;
+        const size_t pixelCount = (size_t)W * H;
+
+        // Temp buffer for intermediate horizontal pass (float RGB)
+        std::vector<float> tempR(pixelCount, 0.0f);
+        std::vector<float> tempG(pixelCount, 0.0f);
+        std::vector<float> tempB(pixelCount, 0.0f);
+
+        // Horizontal pass — only blend within same face rect AND valid pixels
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                const size_t idx = (size_t)y * W + x;
+                if (!valid[idx]) continue;
+                const uint32_t myFace = faceIDs[idx];
+                if (myFace == NO_FACE) continue;
+
+                float sumR = 0.0f, sumG = 0.0f, sumB = 0.0f;
+                float wTotal = 0.0f;
+                for (int k = -radius; k <= radius; ++k) {
+                    const int nx = x + k;
+                    if (nx < 0 || nx >= W) continue;
+                    const size_t ni = (size_t)y * W + nx;
+                    if (!valid[ni] || faceIDs[ni] != myFace) continue;
+                    const float w = kernel[abs(k)];
+                    sumR += w * page.pixels[ni * 4 + 0];
+                    sumG += w * page.pixels[ni * 4 + 1];
+                    sumB += w * page.pixels[ni * 4 + 2];
+                    wTotal += w;
+                }
+                if (wTotal > 0.0f) {
+                    tempR[idx] = sumR / wTotal;
+                    tempG[idx] = sumG / wTotal;
+                    tempB[idx] = sumB / wTotal;
+                }
+            }
+        }
+
+        // Vertical pass — only blend within same face rect AND valid pixels
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                const size_t idx = (size_t)y * W + x;
+                if (!valid[idx]) continue;
+                const uint32_t myFace = faceIDs[idx];
+                if (myFace == NO_FACE) continue;
+
+                float sumR = 0.0f, sumG = 0.0f, sumB = 0.0f;
+                float wTotal = 0.0f;
+                for (int k = -radius; k <= radius; ++k) {
+                    const int ny = y + k;
+                    if (ny < 0 || ny >= H) continue;
+                    const size_t ni = (size_t)ny * W + x;
+                    if (!valid[ni] || faceIDs[ni] != myFace) continue;
+                    const float w = kernel[abs(k)];
+                    sumR += w * tempR[ni];
+                    sumG += w * tempG[ni];
+                    sumB += w * tempB[ni];
+                    wTotal += w;
+                }
+                if (wTotal > 0.0f) {
+                    page.pixels[idx * 4 + 0] = (uint8_t)std::min(255.0f, sumR / wTotal + 0.5f);
+                    page.pixels[idx * 4 + 1] = (uint8_t)std::min(255.0f, sumG / wTotal + 0.5f);
+                    page.pixels[idx * 4 + 2] = (uint8_t)std::min(255.0f, sumB / wTotal + 0.5f);
+                }
+            }
+        }
+    }
+}
+
 static void DilatePage(LightmapPage& page, std::vector<uint8_t>& valid) {
     const int W = page.width;
     const int H = page.height;
@@ -2754,12 +2873,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             sampleNormal = r.gpu.normal;
                         }
                         const Vector3 samplePoint = repairedSample.samplePoint;
-                        const float edgeDistLuxels = MinDistToPolyEdge2D(r.poly2d, ju, jv);
-                        const float edgeFactor = std::clamp(
-                            1.0f - edgeDistLuxels / EDGE_SEAM_GUARD_LUXELS,
-                            0.0f,
-                            1.0f);
-                        const float nearHitT = OCCLUSION_NEAR_TMIN + EDGE_SEAM_TMIN_BOOST * edgeFactor;
+                        const float nearHitT = OCCLUSION_NEAR_TMIN;
 
                         float cr = settings.ambientColor.x;
                         float cg = settings.ambientColor.y;
@@ -2790,7 +2904,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 att = EvaluateLightAttenuation(L, dist);
                                 if (att <= 0.0f) continue;
                             }
-                            const Vector3 ro = Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS));
+                            const Vector3 ro = Vector3Add(repairedSample.planePoint, Vector3Scale(dir, SHADOW_BIAS));
                             float emit = 1.0f;
                             if (L.directional) {
                                 const Vector3 lightToSurface = Vector3Scale(dir, -1.0f);
@@ -3085,6 +3199,12 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
 
         bounceSourcePages = std::move(bouncedPages);
         bounceAmbient = Vector3Zero();
+    }
+
+    if (settings.lmAAScale > 0) {
+        printf("[Lightmap] applying post-bake AA (scale=%d, sigma=%.1f)\n", settings.lmAAScale, settings.lmAAScale / 2.0f);
+        fflush(stdout);
+        ApplyLightmapAA(atlas.pages, rects, baseValidMasks, settings.lmAAScale);
     }
 
     for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {

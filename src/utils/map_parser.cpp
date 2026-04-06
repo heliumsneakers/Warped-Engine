@@ -982,6 +982,7 @@ LightBakeSettings GetLightBakeSettings(const Map &map) {
         ParseFloatProp(entity, "_dirtscale", settings.dirtScale);
         ParseFloatProp(entity, "_dirtgain", settings.dirtGain);
         ParseFloatProp(entity, "_dirtangle", settings.dirtAngle);
+        ParseIntProp(entity, "_lm_AA_scale", settings.lmAAScale);
 
         Vector3 parsedColor{};
         if (ParseUnitOr255ColorProp(entity, "_sunlight_color", parsedColor) ||
@@ -1007,11 +1008,11 @@ LightBakeSettings GetLightBakeSettings(const Map &map) {
         break;
     }
 
-    printf("[LightSettings] ambient=(%.2f,%.2f,%.2f) luxel=%.3f bounces=%d bounceScale=%.2f sun=%.1f sun2=%.1f sun3=%.1f dirt=%d\n",
+    printf("[LightSettings] ambient=(%.2f,%.2f,%.2f) luxel=%.3f bounces=%d bounceScale=%.2f sun=%.1f sun2=%.1f sun3=%.1f dirt=%d lmAA=%d\n",
            settings.ambientColor.x, settings.ambientColor.y, settings.ambientColor.z,
            settings.luxelSize, settings.bounceCount, settings.bounceScale,
            settings.sunlightIntensity, settings.sunlight2Intensity, settings.sunlight3Intensity,
-           settings.dirt);
+           settings.dirt, settings.lmAAScale);
     return settings;
 }
 

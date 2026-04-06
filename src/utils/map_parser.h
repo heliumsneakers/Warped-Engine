@@ -116,6 +116,7 @@ struct LightBakeSettings {
     float   dirtScale = 1.0f;
     float   dirtGain = 1.0f;
     float   dirtAngle = 88.0f;
+    int     lmAAScale = 0;
 };
 
 // --------------------------------------------------------------------------

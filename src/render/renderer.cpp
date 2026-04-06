@@ -25,6 +25,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 
@@ -248,45 +249,72 @@ const TextureEntry* LoadTextureByName(TextureManager& mgr, const std::string& na
 
     std::string path = "../../assets/textures/" + name + ".png";
 
-    int w = 0, h = 0, comp = 0;
-    unsigned char* pixels = nullptr;
+    TextureEntry entry;
+    bool loaded = false;
 
+    // Try loading mipmapped asset from pack
     if (!mgr.activePackPath.empty()) {
-        std::vector<unsigned char> packedBytes;
-        if (LoadRawAssetFromPack(mgr.activePackPath, "textures/" + name + ".png", packedBytes)) {
-            pixels = stbi_load_from_memory(packedBytes.data(), (int)packedBytes.size(), &w, &h, &comp, 4);
-            if (!pixels) {
-                printf("[Renderer] Failed to decode packaged texture '%s' from '%s'.\n",
-                       name.c_str(), mgr.activePackPath.c_str());
+        MipmapChain mipChain;
+        if (LoadMipmappedAssetFromPack(mgr.activePackPath, "textures/" + name + ".png", mipChain) &&
+            !mipChain.levels.empty()) {
+            const int numMips = std::min((int)mipChain.levels.size(), (int)SG_MAX_MIPMAPS);
+            printf("[Renderer] Loaded mipmapped texture '%s': %dx%d, %d mip levels\n",
+                   name.c_str(), mipChain.levels[0].width, mipChain.levels[0].height, numMips);
+            sg_image_desc id = {};
+            id.width = mipChain.levels[0].width;
+            id.height = mipChain.levels[0].height;
+            id.num_mipmaps = numMips;
+            id.pixel_format = SG_PIXELFORMAT_RGBA8;
+            for (int m = 0; m < numMips; ++m) {
+                id.data.mip_levels[m] = {
+                    mipChain.levels[m].pixels.data(),
+                    (size_t)(mipChain.levels[m].width * mipChain.levels[m].height * 4)
+                };
             }
+            id.label = name.c_str();
+            sg_image img = sg_make_image(&id);
+
+            sg_view_desc vd = {};
+            vd.texture.image = img;
+            sg_view view = sg_make_view(&vd);
+
+            entry.image = img;
+            entry.view = view;
+            entry.width = id.width;
+            entry.height = id.height;
+            Renderer_LogTextureState(name.c_str(), entry);
+            loaded = true;
         }
     }
 
-    if (!pixels) {
-        pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
+    // Fallback: load single-level texture from filesystem (no mipmaps)
+    if (!loaded) {
+        int w = 0, h = 0, comp = 0;
+        unsigned char* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
+        if (pixels) {
+            sg_image_desc id = {};
+            id.width  = w;
+            id.height = h;
+            id.pixel_format = SG_PIXELFORMAT_RGBA8;
+            id.data.mip_levels[0] = { pixels, (size_t)(w * h * 4) };
+            id.label = name.c_str();
+            sg_image img = sg_make_image(&id);
+            stbi_image_free(pixels);
+
+            sg_view_desc vd = {};
+            vd.texture.image = img;
+            sg_view view = sg_make_view(&vd);
+
+            entry.image  = img;
+            entry.view   = view;
+            entry.width  = w;
+            entry.height = h;
+            Renderer_LogTextureState(name.c_str(), entry);
+            loaded = true;
+        }
     }
 
-    TextureEntry entry;
-    if (pixels) {
-        sg_image_desc id = {};
-        id.width  = w;
-        id.height = h;
-        id.pixel_format = SG_PIXELFORMAT_RGBA8;
-        id.data.mip_levels[0] = { pixels, (size_t)(w * h * 4) };
-        id.label = name.c_str();
-        sg_image img = sg_make_image(&id);
-        stbi_image_free(pixels);
-
-        sg_view_desc vd = {};
-        vd.texture.image = img;
-        sg_view view = sg_make_view(&vd);
-
-        entry.image  = img;
-        entry.view   = view;
-        entry.width  = w;
-        entry.height = h;
-        Renderer_LogTextureState(name.c_str(), entry);
-    } else {
+    if (!loaded) {
         printf("[Renderer] Failed to load '%s' – using fallback.\n", path.c_str());
         entry = MakeFallbackTexture();
         Renderer_LogTextureState("fallback-checker", entry);
@@ -311,10 +339,11 @@ void UnloadAllTextures(TextureManager& mgr) {
 void Renderer_Init(void) {
     sg_backend backend = sg_query_backend();
 
-    // --- sampler (repeat + bilinear) ------------------------------------
+    // --- sampler (repeat + trilinear) ------------------------------------
     sg_sampler_desc smp = {};
     smp.min_filter = SG_FILTER_LINEAR;
     smp.mag_filter = SG_FILTER_LINEAR;
+    smp.mipmap_filter = SG_FILTER_LINEAR;
     smp.max_anisotropy = 16;
     smp.wrap_u     = SG_WRAP_REPEAT;
     smp.wrap_v     = SG_WRAP_REPEAT;
@@ -325,6 +354,7 @@ void Renderer_Init(void) {
     sg_sampler_desc lsmp = {};
     lsmp.min_filter = SG_FILTER_LINEAR;
     lsmp.mag_filter = SG_FILTER_LINEAR;
+    lsmp.mipmap_filter = SG_FILTER_LINEAR;
     lsmp.max_anisotropy = 16;
     lsmp.wrap_u     = SG_WRAP_CLAMP_TO_EDGE;
     lsmp.wrap_v     = SG_WRAP_CLAMP_TO_EDGE;

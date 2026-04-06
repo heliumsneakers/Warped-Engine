@@ -160,7 +160,7 @@ const int AA_GRID = 4;
 const int SAMPLES = AA_GRID * AA_GRID;
 const float EDGE_SEAM_GUARD_LUXELS = 0.75;
 const float EDGE_SEAM_TMIN_SCALE = 3.0;
-const float SURFACE_SAMPLE_OFFSET = 1.0;
+const float SURFACE_SAMPLE_OFFSET = 0.125;
 const int POINT_LIGHT_ATTEN_QUADRATIC = 0;
 const int POINT_LIGHT_ATTEN_LINEAR = 1;
 const int POINT_LIGHT_ATTEN_INVERSE = 2;
@@ -961,9 +961,7 @@ void main() {
             repaired_sample repaired = repair_sample_point(plane_point);
             vec3 sample_normal = evaluate_phong_normal(repaired.plane_point);
             vec3 sample_point = repaired.sample_point;
-            float edge_dist_luxels = min_dist_to_poly_edge_2d(ju, jv);
-            float edge_factor = clamp(1.0 - edge_dist_luxels / EDGE_SEAM_GUARD_LUXELS, 0.0, 1.0);
-            float near_hit_t = shadow_bias + (shadow_bias * EDGE_SEAM_TMIN_SCALE) * edge_factor;
+            float near_hit_t = shadow_bias;
 
             vec3 sample_rgb = ambient_color;
             bool uses_dirt = skylight_dirt != 0;
@@ -994,7 +992,7 @@ void main() {
                         continue;
                     }
                 }
-                vec3 ro = sample_point + dir * shadow_bias;
+                vec3 ro = repaired.plane_point + dir * shadow_bias;
                 float emit = 1.0;
                 if (light.directional != 0) {
                     emit = dot(light.emission_normal, -dir);

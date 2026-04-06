@@ -263,7 +263,7 @@ int main(int argc, char** argv)
     fclose(f);
 
     std::string packError;
-    if (!WriteAssetPackRres(outPackName, packagedAssets, &packError)) {
+    if (!WriteAssetPackRresWithMipmaps(outPackName, packagedAssets, &packError)) {
         fprintf(stderr, "[compile_map] failed to write %s: %s\n", outPackName.c_str(), packError.c_str());
         return 1;
     }

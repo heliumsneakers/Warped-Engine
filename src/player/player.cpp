@@ -38,7 +38,7 @@
 bool cursorEnabled = false;
 float eyeOffset = 16.0f;
 
-static constexpr float MAX_SPEED = 250.0f;
+static constexpr float MAX_SPEED = 320.0f;
 static constexpr float ACCELERATION = 10.0f;
 static constexpr float AIR_ACCELERATION = 100.0f;
 static constexpr float FRICTION = 6.0f;

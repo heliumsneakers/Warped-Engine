@@ -103,6 +103,13 @@
     _color(color255) : "Sky Color" : "0 0 0" : "Color of the sky."
     _fog(color255) : "Fog Color" : "0 0 0" : "Fog color."
     _fogdensity(float) : "Fog Density" : 0 : "Density of the fog."
+    _lm_AA_scale(choices) : "Lightmap AA Scale" : 0 : "Post-bake anti-aliasing Gaussian filter applied to the compiled lightmap. Higher values produce smoother shadow edges but soften fine detail. 0 disables AA entirely." =
+    [
+        0 : "Off"
+        2 : "2x (Light smoothing)"
+        4 : "4x (Medium smoothing)"
+        8 : "8x (Heavy smoothing)"
+    ]
 ]
 
 // Player Spawn Entity
