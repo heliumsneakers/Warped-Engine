@@ -120,7 +120,7 @@ struct LightBakeSettings {
     // `_extra_samples` super-sampling grid size during the bake. 0 = off (1x1,
     // one sample per luxel), 2 = 2x2, 4 = 4x4 (historical default). Baked into
     // both the CPU path and the compute shader.
-    int     extraSamples = 4;
+    int     extraSamples = 0;
     // `_soften` post-process box filter radius (samples-per-side). 0 = off, 1 =
     // 3x3, 2 = 5x5, 3 = 7x7, 4 = 9x9. Runs CPU-side after the bake.
     int     soften = 0;

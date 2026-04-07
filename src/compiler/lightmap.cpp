@@ -34,7 +34,7 @@ static constexpr float EDGE_SEAM_TMIN_BOOST   = SHADOW_BIAS * 3.0f;
 // Keep it conservative so it lifts occluded regions without flattening direct
 // shadow contrast into an overcast look.
 static constexpr float INDIRECT_BOUNCE_REFLECTANCE = 0.18f;
-static constexpr float INDIRECT_BOUNCE_THRESHOLD   = 0.08f;
+static constexpr float INDIRECT_BOUNCE_EMITTER_THRESHOLD = 1.0f / 255.0f;
 static constexpr float INDIRECT_BOUNCE_RADIUS_BIAS = 32.0f;
 static constexpr float INDIRECT_BOUNCE_RADIUS_SCALE = 2.0f;
 static constexpr float INDIRECT_BOUNCE_RADIUS_MIN = 32.0f;
@@ -2688,7 +2688,8 @@ static std::vector<PointLight> BuildIndirectBounceLights(const std::vector<BakeP
                                                          float bounceScale)
 {
     std::vector<PointLight> bounceLights;
-    if (bounceScale <= 0.0f) {
+    const float emittedScale = INDIRECT_BOUNCE_REFLECTANCE * bounceScale;
+    if (emittedScale <= 0.0f) {
         return bounceLights;
     }
     bounceLights.reserve(patches.size());
@@ -2704,7 +2705,7 @@ static std::vector<PointLight> BuildIndirectBounceLights(const std::vector<BakeP
 
         const Vector3 avgDirect = AverageRectLighting(pages[rect.page], rect, coverageMasks[rect.page], ambientColor);
         const float maxChannel = std::max(avgDirect.x, std::max(avgDirect.y, avgDirect.z));
-        if (maxChannel < INDIRECT_BOUNCE_THRESHOLD) {
+        if (maxChannel * emittedScale < INDIRECT_BOUNCE_EMITTER_THRESHOLD) {
             continue;
         }
 
@@ -2716,7 +2717,7 @@ static std::vector<PointLight> BuildIndirectBounceLights(const std::vector<BakeP
 
         PointLight bounce{};
         bounce.position = Vector3Add(PolygonCentroid(patch.poly.verts), Vector3Scale(patch.poly.normal, 1.0f));
-        bounce.color = Vector3Scale(avgDirect, INDIRECT_BOUNCE_REFLECTANCE * bounceScale);
+        bounce.color = Vector3Scale(avgDirect, emittedScale);
         bounce.intensity = radius;
         bounce.emissionNormal = patch.poly.normal;
         bounce.directional = 1;
