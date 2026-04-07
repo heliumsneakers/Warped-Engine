@@ -716,8 +716,11 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             params.dirt_angle = settings.dirtAngle;
             params.skylight_angle_scale = settings.sunlightAngleScale;
             params.sky_trace_distance = skyTraceDistance;
-            params._pad_scalar0[0] = 0.0f;
-            params._pad_scalar0[1] = 0.0f;
+            // Mirror the CPU-side aaGrid derivation from settings.extraSamples.
+            // 0 -> 1x1 (off), 2 -> 2x2, 4 -> 4x4 (historical default).
+            params.extra_samples = (settings.extraSamples <= 0) ? 1
+                                 : (settings.extraSamples <= 2) ? 2 : 4;
+            params._pad_scalar0 = 0;
             CopyVec3(params.sunlight2_color, settings.sunlight2Color);
             params.sunlight2_intensity = settings.sunlight2Intensity;
             CopyVec3(params.sunlight3_color, settings.sunlight3Color);

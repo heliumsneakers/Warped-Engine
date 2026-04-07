@@ -984,6 +984,31 @@ LightBakeSettings GetLightBakeSettings(const Map &map) {
         ParseFloatProp(entity, "_dirtangle", settings.dirtAngle);
         ParseIntProp(entity, "_lm_AA_scale", settings.lmAAScale);
 
+        // _extra_samples: super-sampling grid size for the direct-light bake.
+        // Allowed values are 0 (off -> 1x1), 2 (2x2), 4 (4x4). Anything else
+        // clamps back to the nearest permitted value. The default is 4 so the
+        // historical bake quality is preserved when the key is not set.
+        int extraSamples = settings.extraSamples;
+        if (ParseIntProp(entity, "_extra_samples", extraSamples)) {
+            if (extraSamples <= 0) {
+                extraSamples = 0;
+            } else if (extraSamples <= 2) {
+                extraSamples = 2;
+            } else {
+                extraSamples = 4;
+            }
+            settings.extraSamples = extraSamples;
+        }
+
+        // _soften: post-process box filter radius. Allowed values 0..4 → off,
+        // 3x3, 5x5, 7x7, 9x9. Clamped into range.
+        int soften = settings.soften;
+        if (ParseIntProp(entity, "_soften", soften)) {
+            if (soften < 0) soften = 0;
+            if (soften > 4) soften = 4;
+            settings.soften = soften;
+        }
+
         Vector3 parsedColor{};
         if (ParseUnitOr255ColorProp(entity, "_sunlight_color", parsedColor) ||
             ParseUnitOr255ColorProp(entity, "_sun_color", parsedColor)) {
@@ -1008,11 +1033,11 @@ LightBakeSettings GetLightBakeSettings(const Map &map) {
         break;
     }
 
-    printf("[LightSettings] ambient=(%.2f,%.2f,%.2f) luxel=%.3f bounces=%d bounceScale=%.2f sun=%.1f sun2=%.1f sun3=%.1f dirt=%d lmAA=%d\n",
+    printf("[LightSettings] ambient=(%.2f,%.2f,%.2f) luxel=%.3f bounces=%d bounceScale=%.2f sun=%.1f sun2=%.1f sun3=%.1f dirt=%d lmAA=%d extraSamples=%d soften=%d\n",
            settings.ambientColor.x, settings.ambientColor.y, settings.ambientColor.z,
            settings.luxelSize, settings.bounceCount, settings.bounceScale,
            settings.sunlightIntensity, settings.sunlight2Intensity, settings.sunlight3Intensity,
-           settings.dirt, settings.lmAAScale);
+           settings.dirt, settings.lmAAScale, settings.extraSamples, settings.soften);
     return settings;
 }
 

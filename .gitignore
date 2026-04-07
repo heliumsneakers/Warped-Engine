@@ -2,6 +2,7 @@
 *.tmp
 *.swp
 *.a
+*.patch
 .DS_Store
 
 # Ignore build artifacts

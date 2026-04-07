@@ -37,7 +37,15 @@ static constexpr float INDIRECT_BOUNCE_RADIUS_BIAS = 32.0f;
 static constexpr float INDIRECT_BOUNCE_RADIUS_SCALE = 2.0f;
 static constexpr float INDIRECT_BOUNCE_RADIUS_MIN = 32.0f;
 static constexpr float INDIRECT_BOUNCE_RADIUS_MAX = 160.0f;
-static constexpr int   AA_GRID            = 4;      // AA_GRID² samples per luxel
+// Runtime super-sampling grid size set at the top of BakeLightmap from
+// settings.extraSamples (which parses the worldspawn `_extra_samples` key).
+// Valid values: 1 = off (1 sample per luxel), 2 = 2x2, 4 = 4x4 (historical
+// default). Shared by BakeLightmapCPUPage, BuildCoverageMask, and every
+// function that compares luxel coverage against g_aaGrid * g_aaGrid.
+static int g_aaGrid = 4;
+// Pass count for StabilizeEdgeTexels — kept independent of g_aaGrid so that
+// edge-propagation still works when extraSamples = 0 (g_aaGrid = 1).
+static constexpr int   STABILIZE_EDGE_PASSES = 4;
 static constexpr int   DILATE_PASSES      = 4;
 static constexpr int   ERICW_SUNSAMPLES   = 100;    // matches ericw-tools default sunsamples
 static constexpr int   DIRT_NUM_ANGLE_STEPS = 16;
@@ -1791,9 +1799,28 @@ static void FillPatchUVs(const std::vector<BakePatch>& patches,
         for (const Vector3& vv : p.verts) {
             const float u = (Vector3DotProduct(vv, r.gpu.axisU) - r.gpu.minU) / r.gpu.luxelSize;
             const float v = (Vector3DotProduct(vv, r.gpu.axisV) - r.gpu.minV) / r.gpu.luxelSize;
+            // Vertex UVs map to luxel-grid boundaries within the rect (NOT pixel
+            // centers). The bake loop samples luxel `k` over the polygon chunk
+            // [k, k+1) (see ju/jv in BakeLightmapCPUPage) so luxel k's value is
+            // geometrically centered at local coord k+0.5. Placing the polygon's
+            // vertex at the grid-line `k` lets linear interpolation of the vertex
+            // UVs hit luxel k's center exactly at u_local = k+0.5, and the
+            // polygon edges (u_local = 0 and u_local = interiorW) land at the
+            // boundary between an interior luxel and the adjacent padding luxel.
+            // After DilatePage those padding luxels carry the nearest interior
+            // value, so bilinear at the edge resolves to ~the edge luxel value.
+            //
+            // The old formula added `+ 0.5f` on top, which shifted the entire
+            // lightmap half-a-luxel across every polygon: the minU vertex still
+            // sampled the first interior luxel's center, but the maxU vertex
+            // sampled the *first padding luxel's* center (past the interior).
+            // At lmscale=1 that 0.5-luxel shift is 0.5 world units (invisible),
+            // but at lmscale=16 it's 8 world units, which manifests as very
+            // visible seams at polygon edges because adjacent polygons shift in
+            // different directions relative to their shared edge.
             atlas.patches[i].uv.push_back({
-                (r.gpu.x + LM_PAD + u + 0.5f) / page.width,
-                (r.gpu.y + LM_PAD + v + 0.5f) / page.height
+                (r.gpu.x + LM_PAD + u) / page.width,
+                (r.gpu.y + LM_PAD + v) / page.height
             });
         }
     }
@@ -1804,7 +1831,7 @@ static std::vector<uint8_t> BuildCoverageMask(const std::vector<FaceRect>& rects
                                               int W, int H)
 {
     std::vector<uint8_t> coverage((size_t)W * (size_t)H, 0);
-    const float invGrid = 1.0f / (float)AA_GRID;
+    const float invGrid = 1.0f / (float)g_aaGrid;
     for (const FaceRect& r : rects) {
         if (r.page != pageIndex) {
             continue;
@@ -1812,8 +1839,8 @@ static std::vector<uint8_t> BuildCoverageMask(const std::vector<FaceRect>& rects
         for (int ly = 0; ly < r.gpu.h; ++ly) {
             for (int lx = 0; lx < r.gpu.w; ++lx) {
                 uint8_t coveredSamples = 0;
-                for (int sy = 0; sy < AA_GRID; ++sy) {
-                    for (int sx = 0; sx < AA_GRID; ++sx) {
+                for (int sy = 0; sy < g_aaGrid; ++sy) {
+                    for (int sx = 0; sx < g_aaGrid; ++sx) {
                         const float cu = (lx - LM_PAD) + (sx + 0.5f) * invGrid;
                         const float cv = (ly - LM_PAD) + (sy + 0.5f) * invGrid;
                         if (InsidePoly2D(r.poly2d, cu, cv)) {
@@ -1841,7 +1868,7 @@ static void StabilizeEdgeTexels(LightmapPage& page,
 {
     const int W = page.width;
     const int H = page.height;
-    const uint8_t kFullCoverage = (uint8_t)(AA_GRID * AA_GRID);
+    const uint8_t kFullCoverage = (uint8_t)(g_aaGrid * g_aaGrid);
     const size_t pixelCount = (size_t)W * (size_t)H;
     if (coverage.size() < pixelCount) {
         return;
@@ -1863,7 +1890,7 @@ static void StabilizeEdgeTexels(LightmapPage& page,
         return;
     }
 
-    for (int pass = 0; pass < AA_GRID; ++pass) {
+    for (int pass = 0; pass < STABILIZE_EDGE_PASSES; ++pass) {
         bool changed = false;
         std::vector<uint8_t> nextStable = stable;
         std::vector<uint8_t> nextPixels = page.pixels;
@@ -2089,7 +2116,7 @@ static DarkLuxelStats GatherDarkLuxelStats(const LightmapPage& page,
         return stats;
     }
 
-    const uint8_t kFullCoverage = (uint8_t)(AA_GRID * AA_GRID);
+    const uint8_t kFullCoverage = (uint8_t)(g_aaGrid * g_aaGrid);
     for (size_t i = 0; i < pixelCount; ++i) {
         if (!valid[i]) {
             continue;
@@ -2389,7 +2416,7 @@ static Vector3 AverageRectLighting(const LightmapPage& page,
         return Vector3Zero();
     }
 
-    const uint8_t kFullCoverage = (uint8_t)(AA_GRID * AA_GRID);
+    const uint8_t kFullCoverage = (uint8_t)(g_aaGrid * g_aaGrid);
     Vector3 fullAccum = Vector3Zero();
     size_t fullCount = 0;
     Vector3 validAccum = Vector3Zero();
@@ -2844,8 +2871,9 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 LightmapPage& page)
 {
     const int W = page.width;
-    const int SAMPLES = AA_GRID * AA_GRID;
-    const float invG = 1.0f / (float)AA_GRID;
+    const int aaGrid = g_aaGrid;
+    const int SAMPLES = aaGrid * aaGrid;
+    const float invG = 1.0f / (float)aaGrid;
 
     for (size_t i = 0; i < patches.size(); ++i) {
         const MapPolygon& p = patches[i].poly;
@@ -2859,8 +2887,8 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                 float ar = 0, ag = 0, ab = 0;
                 int usedSamples = 0;
 
-                for (int sy = 0; sy < AA_GRID; ++sy) {
-                    for (int sx = 0; sx < AA_GRID; ++sx) {
+                for (int sy = 0; sy < aaGrid; ++sy) {
+                    for (int sx = 0; sx < aaGrid; ++sx) {
                         const float ju = (lx - LM_PAD) + (sx + 0.5f) * invG;
                         const float jv = (ly - LM_PAD) + (sy + 0.5f) * invG;
                         if (!InsidePoly2D(r.poly2d, ju, jv)) {
@@ -2904,7 +2932,17 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 att = EvaluateLightAttenuation(L, dist);
                                 if (att <= 0.0f) continue;
                             }
-                            const Vector3 ro = Vector3Add(repairedSample.planePoint, Vector3Scale(dir, SHADOW_BIAS));
+                            // Bias the ray origin off the source surface using `samplePoint`
+                            // (already pushed `SURFACE_SAMPLE_OFFSET` along the surface normal by
+                            // `OffsetSamplePointOffSurface`), not the bare `planePoint`. Using
+                            // planePoint here was the cause of the corner shadow-edge bleed bug:
+                            // adding only `dir * SHADOW_BIAS` leaves ro essentially on the source
+                            // surface, which lets a ray from a luxel near a face/face intersection
+                            // graze the adjacent face's near-corner triangles inside `nearHitT`.
+                            // Every other ray trace in this file (dirt, sky upper, sky lower) and
+                            // its mirror in lightmap_bake.glsl already uses the off-surface
+                            // samplePoint — this brings the direct-light path into line.
+                            const Vector3 ro = Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS));
                             float emit = 1.0f;
                             if (L.directional) {
                                 const Vector3 lightToSurface = Vector3Scale(dir, -1.0f);
@@ -2952,6 +2990,89 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
     }
 }
 
+// ---------------------------------------------------------------------------
+//  Post-process box-filter "soften" pass for `_soften`.
+//
+//  For each valid interior luxel in each rect, replace its value with the
+//  average of the (2n+1) x (2n+1) neighbourhood centred on it. The kernel is
+//  clipped at invalid (uncovered) luxels and at rect boundaries (via the
+//  per-pixel faceID map), so the softening stays within a single face — it
+//  never bleeds across the rect edge into the next face's luxels, and never
+//  averages with the still-black padding luxels that DilatePage will fill in
+//  later. Reads from a snapshot of page.pixels so the filter doesn't feed
+//  into itself as it sweeps.
+// ---------------------------------------------------------------------------
+static void ApplyLightmapSoften(std::vector<LightmapPage>& pages,
+                                const std::vector<FaceRect>& rects,
+                                const std::vector<std::vector<uint8_t>>& validMasks,
+                                int soften) {
+    if (soften <= 0) return;
+    const int n = std::min(4, soften);  // kernel radius, 1..4
+
+    const uint32_t NO_FACE = UINT32_MAX;
+    std::vector<std::vector<uint32_t>> pageFaceIDs(pages.size());
+    for (uint32_t pageIndex = 0; pageIndex < pages.size(); ++pageIndex) {
+        const int W = pages[pageIndex].width;
+        const int H = pages[pageIndex].height;
+        pageFaceIDs[pageIndex].assign((size_t)W * H, NO_FACE);
+    }
+    for (uint32_t ri = 0; ri < rects.size(); ++ri) {
+        const FaceRect& r = rects[ri];
+        const uint32_t pi = r.page;
+        if (pi >= pages.size()) continue;
+        const int W = pages[pi].width;
+        auto& faceIDs = pageFaceIDs[pi];
+        for (int ly = 0; ly < r.gpu.h; ++ly) {
+            for (int lx = 0; lx < r.gpu.w; ++lx) {
+                const size_t idx = (size_t)(r.gpu.y + ly) * W + (r.gpu.x + lx);
+                faceIDs[idx] = ri;
+            }
+        }
+    }
+
+    for (uint32_t pageIndex = 0; pageIndex < pages.size(); ++pageIndex) {
+        LightmapPage& page = pages[pageIndex];
+        if (pageIndex >= validMasks.size()) continue;
+        const std::vector<uint32_t>& faceIDs = pageFaceIDs[pageIndex];
+        const std::vector<uint8_t>& valid = validMasks[pageIndex];
+        const int W = page.width;
+        const int H = page.height;
+
+        // Snapshot so reads don't see the running filter output.
+        std::vector<uint8_t> src = page.pixels;
+
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                const size_t idx = (size_t)y * W + x;
+                if (idx >= valid.size() || !valid[idx]) continue;
+                const uint32_t myFace = faceIDs[idx];
+                if (myFace == NO_FACE) continue;
+
+                int sumR = 0, sumG = 0, sumB = 0, count = 0;
+                for (int oy = -n; oy <= n; ++oy) {
+                    const int ny = y + oy;
+                    if (ny < 0 || ny >= H) continue;
+                    for (int ox = -n; ox <= n; ++ox) {
+                        const int nx = x + ox;
+                        if (nx < 0 || nx >= W) continue;
+                        const size_t ni = (size_t)ny * W + nx;
+                        if (ni >= valid.size() || !valid[ni] || faceIDs[ni] != myFace) continue;
+                        sumR += src[ni * 4 + 0];
+                        sumG += src[ni * 4 + 1];
+                        sumB += src[ni * 4 + 2];
+                        ++count;
+                    }
+                }
+                if (count > 0) {
+                    page.pixels[idx * 4 + 0] = (uint8_t)(sumR / count);
+                    page.pixels[idx * 4 + 1] = (uint8_t)(sumG / count);
+                    page.pixels[idx * 4 + 2] = (uint8_t)(sumB / count);
+                }
+            }
+        }
+    }
+}
+
 // --------------------------------------------------------------------------
 LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                            const std::vector<MapPolygon>& occluderPolys,
@@ -2961,6 +3082,13 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
 {
     LightmapAtlas atlas;
     const float luxelSize = std::max(0.125f, settings.luxelSize);
+
+    // Pick the super-sampling grid size from the worldspawn `_extra_samples`
+    // key. 0 -> 1x1 (off), 2 -> 2x2, 4 -> 4x4 (historical default). This value
+    // is consulted by BakeLightmapCPUPage, BuildCoverageMask, and every
+    // coverage-threshold check in this TU via the file-scope g_aaGrid.
+    g_aaGrid = (settings.extraSamples <= 0) ? 1
+             : (settings.extraSamples <= 2) ? 2 : 4;
     const SurfaceVisibilityInfo sourceVisibility = AnalyzeSurfaceVisibility(polys);
     const std::vector<MapPolygon> visiblePolys = FilterVisibleBakePolygons(polys, sourceVisibility);
     if (sourceVisibility.hiddenCount > 0) {
@@ -3022,7 +3150,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
     printf("[Lightmap] %zu source faces -> %zu bake patches across %zu pages of up to %dx%d, %zu explicit/direct lights, %zu tris, %zu luxels x %d samples = %zu rays/light (luxel=%.3f, ambient=%.2f/%.2f/%.2f, bounces=%d, bounceScale=%.2f)\n",
            visiblePolys.size(), patches.size(), atlas.pages.size(), LIGHTMAP_PAGE_SIZE, LIGHTMAP_PAGE_SIZE,
            allLights.size(), occ.tris.size(),
-           totalLuxels, AA_GRID * AA_GRID, totalLuxels * (size_t)(AA_GRID * AA_GRID),
+           totalLuxels, g_aaGrid * g_aaGrid, totalLuxels * (size_t)(g_aaGrid * g_aaGrid),
            luxelSize,
            settings.ambientColor.x, settings.ambientColor.y, settings.ambientColor.z,
            settings.bounceCount, settings.bounceScale);
@@ -3205,6 +3333,38 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         printf("[Lightmap] applying post-bake AA (scale=%d, sigma=%.1f)\n", settings.lmAAScale, settings.lmAAScale / 2.0f);
         fflush(stdout);
         ApplyLightmapAA(atlas.pages, rects, baseValidMasks, settings.lmAAScale);
+
+        // Re-weld sibling patch seams AFTER the AA blur. ApplyLightmapAA's
+        // per-rect faceID mask prevents the gaussian kernel from crossing rect
+        // boundaries, and at rect edges it uses a truncated-and-renormalized
+        // kernel that biases edge luxels toward their in-rect neighbors —
+        // pulling them away from the values the earlier WeldSiblingPatchSeams
+        // passes had equalised with the sibling rect's matching edge. Without
+        // this final re-weld, the dark seam lines that intersect shadow edges
+        // visibly reappear whenever _lm_AA_scale > 0. The re-weld is cheap
+        // (only touches 1 luxel per sibling pair) and shipping it here, before
+        // DilatePage, ensures the welded values are what the runtime sees.
+        const size_t postAASeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks, luxelSize);
+        if (postAASeamWelded > 0) {
+            printf("[Lightmap] welded %zu post-AA seam-adjacent luxel pairs across split patches.\n", postAASeamWelded);
+            fflush(stdout);
+        }
+    }
+
+    // Post-process box-filter softening from the worldspawn `_soften` key. Runs
+    // after AA so the gaussian and the box filter compose cleanly, and re-welds
+    // sibling seams afterwards for the same reason ApplyLightmapAA does.
+    if (settings.soften > 0) {
+        printf("[Lightmap] applying _soften post-process (n=%d, %dx%d window)\n",
+               settings.soften, settings.soften * 2 + 1, settings.soften * 2 + 1);
+        fflush(stdout);
+        ApplyLightmapSoften(atlas.pages, rects, baseValidMasks, settings.soften);
+
+        const size_t postSoftenSeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks, luxelSize);
+        if (postSoftenSeamWelded > 0) {
+            printf("[Lightmap] welded %zu post-soften seam-adjacent luxel pairs across split patches.\n", postSoftenSeamWelded);
+            fflush(stdout);
+        }
     }
 
     for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {

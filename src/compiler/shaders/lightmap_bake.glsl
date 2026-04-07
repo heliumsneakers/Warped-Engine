@@ -66,7 +66,11 @@ layout(binding=0) uniform cs_face_params {
     float dirt_angle;
     float skylight_angle_scale;
     float sky_trace_distance;
-    vec2 _pad_scalar0;
+    // Super-sampling grid size for the bake (worldspawn `_extra_samples`
+    // key). Valid values: 1 (off), 2 (2x2), 4 (4x4). The CPU path uses the
+    // same derivation from settings.extraSamples via g_aaGrid.
+    int extra_samples;
+    int _pad_scalar0;
     vec3 sunlight2_color;
     float sunlight2_intensity;
     vec3 sunlight3_color;
@@ -949,9 +953,15 @@ void main() {
 
     vec3 accum = vec3(0.0);
     int used_samples = 0;
-    float inv_grid = 1.0 / float(AA_GRID);
-    for (int sy = 0; sy < AA_GRID; ++sy) {
-        for (int sx = 0; sx < AA_GRID; ++sx) {
+    // Runtime grid size from the worldspawn `_extra_samples` key. 0 -> 1x1
+    // (off), 2 -> 2x2, 4 -> 4x4 (historical default). Any unexpected value
+    // falls back to 4 via the ternary below so older compiled maps still bake
+    // at full quality.
+    int aa_grid = (extra_samples <= 0) ? 1
+               : (extra_samples <= 2) ? 2 : 4;
+    float inv_grid = 1.0 / float(aa_grid);
+    for (int sy = 0; sy < aa_grid; ++sy) {
+        for (int sx = 0; sx < aa_grid; ++sx) {
             float ju = float(local_xy.x - 2) + (float(sx) + 0.5) * inv_grid;
             float jv = float(local_xy.y - 2) + (float(sy) + 0.5) * inv_grid;
             if (!inside_poly_2d(ju, jv)) {
@@ -992,7 +1002,13 @@ void main() {
                         continue;
                     }
                 }
-                vec3 ro = repaired.plane_point + dir * shadow_bias;
+                // Use the off-surface sample_point as the ray origin (already pushed
+                // SURFACE_SAMPLE_OFFSET along the surface normal). Using repaired.plane_point
+                // here was the corner shadow-edge bleed bug: it left the ray origin on the
+                // source surface, so a luxel sitting right by a face/face intersection could
+                // graze the adjacent face inside near_hit_t. Every other ray trace in this
+                // shader (dirt, sky upper, sky lower) already uses sample_point.
+                vec3 ro = sample_point + dir * shadow_bias;
                 float emit = 1.0;
                 if (light.directional != 0) {
                     emit = dot(light.emission_normal, -dir);
