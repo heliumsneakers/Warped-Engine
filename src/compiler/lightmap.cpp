@@ -1943,6 +1943,226 @@ static void StabilizeEdgeTexels(LightmapPage& page,
     }
 }
 
+struct StitchedSourceFaceCanvas {
+    float minU = 0.0f;
+    float minV = 0.0f;
+    float luxelSize = 0.0f;
+    int width = 0;
+    int height = 0;
+    std::vector<uint8_t> valid;
+    std::vector<float> pixelsR;
+    std::vector<float> pixelsG;
+    std::vector<float> pixelsB;
+};
+
+static bool RectLocalPixelToStitchedIndex(const FaceRect& rect,
+                                          float stitchedMinU,
+                                          float stitchedMinV,
+                                          int stitchedWidth,
+                                          int stitchedHeight,
+                                          int localX,
+                                          int localY,
+                                          int* outX,
+                                          int* outY)
+{
+    if (!outX || !outY) {
+        return false;
+    }
+
+    const float globalUCenter = rect.gpu.minU + ((float)(localX - LM_PAD) + 0.5f) * rect.gpu.luxelSize;
+    const float globalVCenter = rect.gpu.minV + ((float)(localY - LM_PAD) + 0.5f) * rect.gpu.luxelSize;
+    int stitchedX = 0;
+    int stitchedY = 0;
+    if (!LocalInteriorIndexFromGlobalCenter(stitchedMinU, rect.gpu.luxelSize, stitchedWidth, globalUCenter, &stitchedX) ||
+        !LocalInteriorIndexFromGlobalCenter(stitchedMinV, rect.gpu.luxelSize, stitchedHeight, globalVCenter, &stitchedY)) {
+        return false;
+    }
+
+    *outX = stitchedX;
+    *outY = stitchedY;
+    return true;
+}
+
+static std::unordered_map<uint32_t, std::vector<size_t>> GroupRectsBySourcePoly(const std::vector<FaceRect>& rects) {
+    std::unordered_map<uint32_t, std::vector<size_t>> rectsBySourcePoly;
+    rectsBySourcePoly.reserve(rects.size());
+    for (size_t i = 0; i < rects.size(); ++i) {
+        rectsBySourcePoly[rects[i].sourcePolyIndex].push_back(i);
+    }
+    return rectsBySourcePoly;
+}
+
+static bool BuildStitchedSourceFaceCanvas(const std::vector<FaceRect>& rects,
+                                          const std::vector<LightmapPage>& pages,
+                                          const std::vector<std::vector<uint8_t>>& validMasks,
+                                          const std::vector<size_t>& rectGroup,
+                                          StitchedSourceFaceCanvas* outCanvas)
+{
+    if (!outCanvas || rectGroup.empty()) {
+        return false;
+    }
+
+    const FaceRect& firstRect = rects[rectGroup.front()];
+    float minU = firstRect.gpu.minU;
+    float minV = firstRect.gpu.minV;
+    float maxU = firstRect.maxU;
+    float maxV = firstRect.maxV;
+    const float luxelSize = std::max(0.125f, firstRect.gpu.luxelSize);
+    for (size_t rectIndex : rectGroup) {
+        const FaceRect& rect = rects[rectIndex];
+        minU = std::min(minU, rect.gpu.minU);
+        minV = std::min(minV, rect.gpu.minV);
+        maxU = std::max(maxU, rect.maxU);
+        maxV = std::max(maxV, rect.maxV);
+    }
+
+    const int stitchedWidth = ComputeInteriorLuxelSpan(maxU - minU, luxelSize);
+    const int stitchedHeight = ComputeInteriorLuxelSpan(maxV - minV, luxelSize);
+    if (stitchedWidth <= 0 || stitchedHeight <= 0) {
+        return false;
+    }
+
+    const size_t pixelCount = (size_t)stitchedWidth * (size_t)stitchedHeight;
+    outCanvas->minU = minU;
+    outCanvas->minV = minV;
+    outCanvas->luxelSize = luxelSize;
+    outCanvas->width = stitchedWidth;
+    outCanvas->height = stitchedHeight;
+    outCanvas->valid.assign(pixelCount, 0);
+    outCanvas->pixelsR.assign(pixelCount, 0.0f);
+    outCanvas->pixelsG.assign(pixelCount, 0.0f);
+    outCanvas->pixelsB.assign(pixelCount, 0.0f);
+
+    std::vector<uint16_t> sampleCounts(pixelCount, 0);
+    for (size_t rectIndex : rectGroup) {
+        const FaceRect& rect = rects[rectIndex];
+        if (rect.page >= pages.size() || rect.page >= validMasks.size()) {
+            continue;
+        }
+
+        const LightmapPage& page = pages[rect.page];
+        const std::vector<uint8_t>& valid = validMasks[rect.page];
+        const size_t pagePixelCount = (size_t)page.width * (size_t)page.height;
+        if (page.pixels.size() < pagePixelCount * 4 || valid.size() < pagePixelCount) {
+            continue;
+        }
+
+        for (int ly = 0; ly < rect.gpu.h; ++ly) {
+            for (int lx = 0; lx < rect.gpu.w; ++lx) {
+                const int pageX = rect.gpu.x + lx;
+                const int pageY = rect.gpu.y + ly;
+                if (pageX < 0 || pageY < 0 || pageX >= page.width || pageY >= page.height) {
+                    continue;
+                }
+
+                const size_t pagePixelIndex = (size_t)pageY * (size_t)page.width + (size_t)pageX;
+                if (!valid[pagePixelIndex]) {
+                    continue;
+                }
+
+                int stitchedX = 0;
+                int stitchedY = 0;
+                if (!RectLocalPixelToStitchedIndex(rect,
+                                                   minU,
+                                                   minV,
+                                                   stitchedWidth,
+                                                   stitchedHeight,
+                                                   lx,
+                                                   ly,
+                                                   &stitchedX,
+                                                   &stitchedY)) {
+                    continue;
+                }
+
+                const size_t stitchedIndex = (size_t)stitchedY * (size_t)stitchedWidth + (size_t)stitchedX;
+                outCanvas->pixelsR[stitchedIndex] += page.pixels[pagePixelIndex * 4 + 0];
+                outCanvas->pixelsG[stitchedIndex] += page.pixels[pagePixelIndex * 4 + 1];
+                outCanvas->pixelsB[stitchedIndex] += page.pixels[pagePixelIndex * 4 + 2];
+                sampleCounts[stitchedIndex] += 1;
+            }
+        }
+    }
+
+    bool anyValid = false;
+    for (size_t i = 0; i < pixelCount; ++i) {
+        if (sampleCounts[i] == 0) {
+            continue;
+        }
+        const float invCount = 1.0f / (float)sampleCounts[i];
+        outCanvas->pixelsR[i] *= invCount;
+        outCanvas->pixelsG[i] *= invCount;
+        outCanvas->pixelsB[i] *= invCount;
+        outCanvas->valid[i] = 1;
+        anyValid = true;
+    }
+    return anyValid;
+}
+
+static void WriteStitchedSourceFaceCanvas(const StitchedSourceFaceCanvas& canvas,
+                                          const std::vector<FaceRect>& rects,
+                                          const std::vector<std::vector<uint8_t>>& validMasks,
+                                          const std::vector<size_t>& rectGroup,
+                                          std::vector<LightmapPage>& pages)
+{
+    if (canvas.width <= 0 || canvas.height <= 0) {
+        return;
+    }
+
+    const size_t stitchedPixelCount = (size_t)canvas.width * (size_t)canvas.height;
+    for (size_t rectIndex : rectGroup) {
+        const FaceRect& rect = rects[rectIndex];
+        if (rect.page >= pages.size() || rect.page >= validMasks.size()) {
+            continue;
+        }
+
+        LightmapPage& page = pages[rect.page];
+        const std::vector<uint8_t>& valid = validMasks[rect.page];
+        const size_t pagePixelCount = (size_t)page.width * (size_t)page.height;
+        if (page.pixels.size() < pagePixelCount * 4 || valid.size() < pagePixelCount) {
+            continue;
+        }
+
+        for (int ly = 0; ly < rect.gpu.h; ++ly) {
+            for (int lx = 0; lx < rect.gpu.w; ++lx) {
+                const int pageX = rect.gpu.x + lx;
+                const int pageY = rect.gpu.y + ly;
+                if (pageX < 0 || pageY < 0 || pageX >= page.width || pageY >= page.height) {
+                    continue;
+                }
+
+                const size_t pagePixelIndex = (size_t)pageY * (size_t)page.width + (size_t)pageX;
+                if (!valid[pagePixelIndex]) {
+                    continue;
+                }
+
+                int stitchedX = 0;
+                int stitchedY = 0;
+                if (!RectLocalPixelToStitchedIndex(rect,
+                                                   canvas.minU,
+                                                   canvas.minV,
+                                                   canvas.width,
+                                                   canvas.height,
+                                                   lx,
+                                                   ly,
+                                                   &stitchedX,
+                                                   &stitchedY)) {
+                    continue;
+                }
+
+                const size_t stitchedIndex = (size_t)stitchedY * (size_t)canvas.width + (size_t)stitchedX;
+                if (stitchedIndex >= stitchedPixelCount || !canvas.valid[stitchedIndex]) {
+                    continue;
+                }
+
+                page.pixels[pagePixelIndex * 4 + 0] = (uint8_t)std::clamp(canvas.pixelsR[stitchedIndex] + 0.5f, 0.0f, 255.0f);
+                page.pixels[pagePixelIndex * 4 + 1] = (uint8_t)std::clamp(canvas.pixelsG[stitchedIndex] + 0.5f, 0.0f, 255.0f);
+                page.pixels[pagePixelIndex * 4 + 2] = (uint8_t)std::clamp(canvas.pixelsB[stitchedIndex] + 0.5f, 0.0f, 255.0f);
+                page.pixels[pagePixelIndex * 4 + 3] = 255;
+            }
+        }
+    }
+}
+
 static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
                             const std::vector<FaceRect>& rects,
                             const std::vector<std::vector<uint8_t>>& validMasks,
@@ -1963,64 +2183,48 @@ static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
         for (int i = 0; i <= radius; ++i) kernel[i] /= sum;
     }
 
-    // Build per-pixel face ID map for each page so the blur stays within each face rect
-    const uint32_t NO_FACE = UINT32_MAX;
-    std::vector<std::vector<uint32_t>> pageFaceIDs(pages.size());
-    for (uint32_t pageIndex = 0; pageIndex < pages.size(); ++pageIndex) {
-        const int W = pages[pageIndex].width;
-        const int H = pages[pageIndex].height;
-        pageFaceIDs[pageIndex].assign((size_t)W * H, NO_FACE);
-    }
-    for (uint32_t ri = 0; ri < rects.size(); ++ri) {
-        const FaceRect& r = rects[ri];
-        const int rx = r.gpu.x;
-        const int ry = r.gpu.y;
-        const int rw = r.gpu.w;
-        const int rh = r.gpu.h;
-        const uint32_t pi = r.page;
-        if (pi >= pages.size()) continue;
-        const int W = pages[pi].width;
-        auto& faceIDs = pageFaceIDs[pi];
-        for (int ly = 0; ly < rh; ++ly) {
-            for (int lx = 0; lx < rw; ++lx) {
-                const size_t idx = (size_t)(ry + ly) * W + (rx + lx);
-                faceIDs[idx] = ri;
-            }
+    const auto rectsBySourcePoly = GroupRectsBySourcePoly(rects);
+    for (const auto& [sourcePolyIndex, rectGroup] : rectsBySourcePoly) {
+        (void)sourcePolyIndex;
+        StitchedSourceFaceCanvas canvas;
+        if (!BuildStitchedSourceFaceCanvas(rects, pages, validMasks, rectGroup, &canvas)) {
+            continue;
         }
-    }
 
-    for (uint32_t pageIndex = 0; pageIndex < pages.size(); ++pageIndex) {
-        LightmapPage& page = pages[pageIndex];
-        const std::vector<uint32_t>& faceIDs = pageFaceIDs[pageIndex];
-        const std::vector<uint8_t>& valid = validMasks[pageIndex];
-        const int W = page.width;
-        const int H = page.height;
-        const size_t pixelCount = (size_t)W * H;
-
-        // Temp buffer for intermediate horizontal pass (float RGB)
+        const int W = canvas.width;
+        const int H = canvas.height;
+        const size_t pixelCount = (size_t)W * (size_t)H;
         std::vector<float> tempR(pixelCount, 0.0f);
         std::vector<float> tempG(pixelCount, 0.0f);
         std::vector<float> tempB(pixelCount, 0.0f);
 
-        // Horizontal pass — only blend within same face rect AND valid pixels
+        // Blur in stitched source-face space so split bake patches filter as
+        // one continuous lightmap surface while still respecting polygon
+        // coverage via the stitched valid mask.
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
-                const size_t idx = (size_t)y * W + x;
-                if (!valid[idx]) continue;
-                const uint32_t myFace = faceIDs[idx];
-                if (myFace == NO_FACE) continue;
+                const size_t idx = (size_t)y * (size_t)W + (size_t)x;
+                if (!canvas.valid[idx]) {
+                    continue;
+                }
 
-                float sumR = 0.0f, sumG = 0.0f, sumB = 0.0f;
+                float sumR = 0.0f;
+                float sumG = 0.0f;
+                float sumB = 0.0f;
                 float wTotal = 0.0f;
                 for (int k = -radius; k <= radius; ++k) {
                     const int nx = x + k;
-                    if (nx < 0 || nx >= W) continue;
-                    const size_t ni = (size_t)y * W + nx;
-                    if (!valid[ni] || faceIDs[ni] != myFace) continue;
+                    if (nx < 0 || nx >= W) {
+                        continue;
+                    }
+                    const size_t ni = (size_t)y * (size_t)W + (size_t)nx;
+                    if (!canvas.valid[ni]) {
+                        continue;
+                    }
                     const float w = kernel[abs(k)];
-                    sumR += w * page.pixels[ni * 4 + 0];
-                    sumG += w * page.pixels[ni * 4 + 1];
-                    sumB += w * page.pixels[ni * 4 + 2];
+                    sumR += w * canvas.pixelsR[ni];
+                    sumG += w * canvas.pixelsG[ni];
+                    sumB += w * canvas.pixelsB[ni];
                     wTotal += w;
                 }
                 if (wTotal > 0.0f) {
@@ -2031,21 +2235,26 @@ static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
             }
         }
 
-        // Vertical pass — only blend within same face rect AND valid pixels
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
-                const size_t idx = (size_t)y * W + x;
-                if (!valid[idx]) continue;
-                const uint32_t myFace = faceIDs[idx];
-                if (myFace == NO_FACE) continue;
+                const size_t idx = (size_t)y * (size_t)W + (size_t)x;
+                if (!canvas.valid[idx]) {
+                    continue;
+                }
 
-                float sumR = 0.0f, sumG = 0.0f, sumB = 0.0f;
+                float sumR = 0.0f;
+                float sumG = 0.0f;
+                float sumB = 0.0f;
                 float wTotal = 0.0f;
                 for (int k = -radius; k <= radius; ++k) {
                     const int ny = y + k;
-                    if (ny < 0 || ny >= H) continue;
-                    const size_t ni = (size_t)ny * W + x;
-                    if (!valid[ni] || faceIDs[ni] != myFace) continue;
+                    if (ny < 0 || ny >= H) {
+                        continue;
+                    }
+                    const size_t ni = (size_t)ny * (size_t)W + (size_t)x;
+                    if (!canvas.valid[ni]) {
+                        continue;
+                    }
                     const float w = kernel[abs(k)];
                     sumR += w * tempR[ni];
                     sumG += w * tempG[ni];
@@ -2053,12 +2262,14 @@ static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
                     wTotal += w;
                 }
                 if (wTotal > 0.0f) {
-                    page.pixels[idx * 4 + 0] = (uint8_t)std::min(255.0f, sumR / wTotal + 0.5f);
-                    page.pixels[idx * 4 + 1] = (uint8_t)std::min(255.0f, sumG / wTotal + 0.5f);
-                    page.pixels[idx * 4 + 2] = (uint8_t)std::min(255.0f, sumB / wTotal + 0.5f);
+                    canvas.pixelsR[idx] = sumR / wTotal;
+                    canvas.pixelsG[idx] = sumG / wTotal;
+                    canvas.pixelsB[idx] = sumB / wTotal;
                 }
             }
         }
+
+        WriteStitchedSourceFaceCanvas(canvas, rects, validMasks, rectGroup, pages);
     }
 }
 
@@ -2533,6 +2744,18 @@ static Vector3 OffsetSamplePointOffSurface(const Vector3& planePoint, const Vect
     return Vector3Add(planePoint, Vector3Scale(Vector3Normalize(faceNormal), SURFACE_SAMPLE_OFFSET));
 }
 
+static Vector3 BuildFaceLocalShadowRayOrigin(const Vector3& planePoint,
+                                             const Vector3& faceNormal,
+                                             const Vector3& dir)
+{
+    const Vector3 rayNormal = (Vector3LengthSq(faceNormal) > 1e-8f)
+        ? Vector3Normalize(faceNormal)
+        : Vector3Zero();
+    return Vector3Add(
+        Vector3Add(planePoint, Vector3Scale(rayNormal, SHADOW_BIAS)),
+        Vector3Scale(dir, SHADOW_BIAS));
+}
+
 static float ComputeDirtAttenuation(float occlusionRatio, float dirtScale, float dirtGain) {
     const float scaled = std::clamp(occlusionRatio * std::max(0.0f, dirtScale), 0.0f, 1.0f);
     const float gained = powf(scaled, std::max(0.01f, dirtGain));
@@ -2789,6 +3012,8 @@ static bool SkyDomeUsesDirt(const LightBakeSettings& settings) {
 }
 
 static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
+                                          const Vector3& planePoint,
+                                          const Vector3& faceNormal,
                                           const Vector3& samplePoint,
                                           const Vector3& sampleNormal,
                                           float nearHitT,
@@ -2818,7 +3043,7 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
     for (int i = 0; i < sampleCount; ++i) {
         if (upperPerSample > 0.0f) {
             const Vector3 dir = EricwSkyDomeDirection(true, i, upperRotation);
-            const Vector3 ro = Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS));
+            const Vector3 ro = BuildFaceLocalShadowRayOrigin(planePoint, faceNormal, dir);
             if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1)) {
                 const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
                 const float scale = upperPerSample * incidence * dirtScale;
@@ -2827,7 +3052,7 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
         }
         if (lowerPerSample > 0.0f) {
             const Vector3 dir = EricwSkyDomeDirection(false, i, lowerRotation);
-            const Vector3 ro = Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS));
+            const Vector3 ro = BuildFaceLocalShadowRayOrigin(planePoint, faceNormal, dir);
             if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1)) {
                 const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
                 const float scale = lowerPerSample * incidence * dirtScale;
@@ -2896,12 +3121,19 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                         }
                         const Vector3 planePoint = ComputeLuxelPlanePoint(r, ju, jv);
                         const RepairedSamplePoint repairedSample = RepairSamplePoint(r, repairPolys, repairSolids, planePoint, r.gpu.luxelSize);
-                        Vector3 sampleNormal = EvaluatePhongNormal(sourcePhongs, repairedSample.sourcePolyIndex, repairedSample.planePoint, r.gpu.luxelSize);
+                        Vector3 sampleNormal = EvaluatePhongNormal(sourcePhongs, r.sourcePolyIndex, planePoint, r.gpu.luxelSize);
                         if (Vector3LengthSq(sampleNormal) <= 1e-8f) {
                             sampleNormal = r.gpu.normal;
                         }
-                        const Vector3 samplePoint = repairedSample.samplePoint;
-                        const float nearHitT = OCCLUSION_NEAR_TMIN;
+                        const Vector3 faceSamplePoint = OffsetSamplePointOffSurface(planePoint, r.gpu.normal);
+                        const bool faceSampleInsideSolid = PointInsideAnySolid(repairSolids, faceSamplePoint, SOLID_REPAIR_EPSILON);
+                        const Vector3 samplePoint = faceSampleInsideSolid ? repairedSample.samplePoint : faceSamplePoint;
+                        const float edgeDistLuxels = MinDistToPolyEdge2D(r.poly2d, ju, jv);
+                        const float edgeFactor = std::clamp(
+                            1.0f - edgeDistLuxels / EDGE_SEAM_GUARD_LUXELS,
+                            0.0f,
+                            1.0f);
+                        const float nearHitT = OCCLUSION_NEAR_TMIN + EDGE_SEAM_TMIN_BOOST * edgeFactor;
 
                         float cr = settings.ambientColor.x;
                         float cg = settings.ambientColor.y;
@@ -2925,24 +3157,17 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 dir = Vector3Normalize(L.parallelDirection);
                                 dist = std::max(1.0f, L.intensity);
                             } else {
-                                const Vector3 toL = Vector3Subtract(L.position, samplePoint);
+                                const Vector3 toL = Vector3Subtract(L.position, planePoint);
                                 dist = Vector3Length(toL);
                                 if (dist > L.intensity || dist < 1e-3f) continue;
                                 dir = Vector3Scale(toL, 1.f / dist);
                                 att = EvaluateLightAttenuation(L, dist);
                                 if (att <= 0.0f) continue;
                             }
-                            // Bias the ray origin off the source surface using `samplePoint`
-                            // (already pushed `SURFACE_SAMPLE_OFFSET` along the surface normal by
-                            // `OffsetSamplePointOffSurface`), not the bare `planePoint`. Using
-                            // planePoint here was the cause of the corner shadow-edge bleed bug:
-                            // adding only `dir * SHADOW_BIAS` leaves ro essentially on the source
-                            // surface, which lets a ray from a luxel near a face/face intersection
-                            // graze the adjacent face's near-corner triangles inside `nearHitT`.
-                            // Every other ray trace in this file (dirt, sky upper, sky lower) and
-                            // its mirror in lightmap_bake.glsl already uses the off-surface
-                            // samplePoint — this brings the direct-light path into line.
-                            const Vector3 ro = Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS));
+                            // Keep visibility rays on the owning face. Using the repaired
+                            // off-surface sample here can let direct light and skylight
+                            // peek around adjacent corners.
+                            const Vector3 ro = BuildFaceLocalShadowRayOrigin(planePoint, r.gpu.normal, dir);
                             float emit = 1.0f;
                             if (L.directional) {
                                 const Vector3 lightToSurface = Vector3Scale(dir, -1.0f);
@@ -2964,7 +3189,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             cb += L.color.z * contrib;
                         }
                         const Vector3 skyContrib = ComputeSkyDomeContribution(
-                            occ, samplePoint, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
+                            occ, planePoint, r.gpu.normal, samplePoint, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
                         cr += skyContrib.x;
                         cg += skyContrib.y;
                         cb += skyContrib.z;
@@ -2993,14 +3218,12 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
 // ---------------------------------------------------------------------------
 //  Post-process box-filter "soften" pass for `_soften`.
 //
-//  For each valid interior luxel in each rect, replace its value with the
-//  average of the (2n+1) x (2n+1) neighbourhood centred on it. The kernel is
-//  clipped at invalid (uncovered) luxels and at rect boundaries (via the
-//  per-pixel faceID map), so the softening stays within a single face — it
-//  never bleeds across the rect edge into the next face's luxels, and never
-//  averages with the still-black padding luxels that DilatePage will fill in
-//  later. Reads from a snapshot of page.pixels so the filter doesn't feed
-//  into itself as it sweeps.
+//  For each valid luxel in a stitched source-face canvas, replace its value
+//  with the average of the (2n+1) x (2n+1) neighbourhood centred on it. The
+//  kernel is clipped at invalid (uncovered) luxels, so the softening crosses
+//  split bake-patch seams for the same source face without bleeding into
+//  unrelated atlas rects or the still-black padding luxels that DilatePage
+//  will fill in later.
 // ---------------------------------------------------------------------------
 static void ApplyLightmapSoften(std::vector<LightmapPage>& pages,
                                 const std::vector<FaceRect>& rects,
@@ -3009,67 +3232,61 @@ static void ApplyLightmapSoften(std::vector<LightmapPage>& pages,
     if (soften <= 0) return;
     const int n = std::min(4, soften);  // kernel radius, 1..4
 
-    const uint32_t NO_FACE = UINT32_MAX;
-    std::vector<std::vector<uint32_t>> pageFaceIDs(pages.size());
-    for (uint32_t pageIndex = 0; pageIndex < pages.size(); ++pageIndex) {
-        const int W = pages[pageIndex].width;
-        const int H = pages[pageIndex].height;
-        pageFaceIDs[pageIndex].assign((size_t)W * H, NO_FACE);
-    }
-    for (uint32_t ri = 0; ri < rects.size(); ++ri) {
-        const FaceRect& r = rects[ri];
-        const uint32_t pi = r.page;
-        if (pi >= pages.size()) continue;
-        const int W = pages[pi].width;
-        auto& faceIDs = pageFaceIDs[pi];
-        for (int ly = 0; ly < r.gpu.h; ++ly) {
-            for (int lx = 0; lx < r.gpu.w; ++lx) {
-                const size_t idx = (size_t)(r.gpu.y + ly) * W + (r.gpu.x + lx);
-                faceIDs[idx] = ri;
-            }
+    const auto rectsBySourcePoly = GroupRectsBySourcePoly(rects);
+    for (const auto& [sourcePolyIndex, rectGroup] : rectsBySourcePoly) {
+        (void)sourcePolyIndex;
+        StitchedSourceFaceCanvas canvas;
+        if (!BuildStitchedSourceFaceCanvas(rects, pages, validMasks, rectGroup, &canvas)) {
+            continue;
         }
-    }
 
-    for (uint32_t pageIndex = 0; pageIndex < pages.size(); ++pageIndex) {
-        LightmapPage& page = pages[pageIndex];
-        if (pageIndex >= validMasks.size()) continue;
-        const std::vector<uint32_t>& faceIDs = pageFaceIDs[pageIndex];
-        const std::vector<uint8_t>& valid = validMasks[pageIndex];
-        const int W = page.width;
-        const int H = page.height;
-
-        // Snapshot so reads don't see the running filter output.
-        std::vector<uint8_t> src = page.pixels;
+        const int W = canvas.width;
+        const int H = canvas.height;
+        std::vector<float> srcR = canvas.pixelsR;
+        std::vector<float> srcG = canvas.pixelsG;
+        std::vector<float> srcB = canvas.pixelsB;
 
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
-                const size_t idx = (size_t)y * W + x;
-                if (idx >= valid.size() || !valid[idx]) continue;
-                const uint32_t myFace = faceIDs[idx];
-                if (myFace == NO_FACE) continue;
+                const size_t idx = (size_t)y * (size_t)W + (size_t)x;
+                if (!canvas.valid[idx]) {
+                    continue;
+                }
 
-                int sumR = 0, sumG = 0, sumB = 0, count = 0;
+                float sumR = 0.0f;
+                float sumG = 0.0f;
+                float sumB = 0.0f;
+                int count = 0;
                 for (int oy = -n; oy <= n; ++oy) {
                     const int ny = y + oy;
-                    if (ny < 0 || ny >= H) continue;
+                    if (ny < 0 || ny >= H) {
+                        continue;
+                    }
                     for (int ox = -n; ox <= n; ++ox) {
                         const int nx = x + ox;
-                        if (nx < 0 || nx >= W) continue;
-                        const size_t ni = (size_t)ny * W + nx;
-                        if (ni >= valid.size() || !valid[ni] || faceIDs[ni] != myFace) continue;
-                        sumR += src[ni * 4 + 0];
-                        sumG += src[ni * 4 + 1];
-                        sumB += src[ni * 4 + 2];
+                        if (nx < 0 || nx >= W) {
+                            continue;
+                        }
+                        const size_t ni = (size_t)ny * (size_t)W + (size_t)nx;
+                        if (!canvas.valid[ni]) {
+                            continue;
+                        }
+                        sumR += srcR[ni];
+                        sumG += srcG[ni];
+                        sumB += srcB[ni];
                         ++count;
                     }
                 }
                 if (count > 0) {
-                    page.pixels[idx * 4 + 0] = (uint8_t)(sumR / count);
-                    page.pixels[idx * 4 + 1] = (uint8_t)(sumG / count);
-                    page.pixels[idx * 4 + 2] = (uint8_t)(sumB / count);
+                    const float invCount = 1.0f / (float)count;
+                    canvas.pixelsR[idx] = sumR * invCount;
+                    canvas.pixelsG[idx] = sumG * invCount;
+                    canvas.pixelsB[idx] = sumB * invCount;
                 }
             }
         }
+
+        WriteStitchedSourceFaceCanvas(canvas, rects, validMasks, rectGroup, pages);
     }
 }
 
@@ -3334,16 +3551,10 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         fflush(stdout);
         ApplyLightmapAA(atlas.pages, rects, baseValidMasks, settings.lmAAScale);
 
-        // Re-weld sibling patch seams AFTER the AA blur. ApplyLightmapAA's
-        // per-rect faceID mask prevents the gaussian kernel from crossing rect
-        // boundaries, and at rect edges it uses a truncated-and-renormalized
-        // kernel that biases edge luxels toward their in-rect neighbors —
-        // pulling them away from the values the earlier WeldSiblingPatchSeams
-        // passes had equalised with the sibling rect's matching edge. Without
-        // this final re-weld, the dark seam lines that intersect shadow edges
-        // visibly reappear whenever _lm_AA_scale > 0. The re-weld is cheap
-        // (only touches 1 luxel per sibling pair) and shipping it here, before
-        // DilatePage, ensures the welded values are what the runtime sees.
+        // The stitched-face AA pass now filters across split patch seams for a
+        // source face directly, but keeping the final seam weld here still
+        // helps clamp any residual quantization mismatch between independently
+        // baked sibling patches before DilatePage propagates the edge values.
         const size_t postAASeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks, luxelSize);
         if (postAASeamWelded > 0) {
             printf("[Lightmap] welded %zu post-AA seam-adjacent luxel pairs across split patches.\n", postAASeamWelded);
@@ -3353,7 +3564,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
 
     // Post-process box-filter softening from the worldspawn `_soften` key. Runs
     // after AA so the gaussian and the box filter compose cleanly, and re-welds
-    // sibling seams afterwards for the same reason ApplyLightmapAA does.
+    // sibling seams afterwards for the same residual quantization guard.
     if (settings.soften > 0) {
         printf("[Lightmap] applying _soften post-process (n=%d, %dx%d window)\n",
                settings.soften, settings.soften * 2 + 1, settings.soften * 2 + 1);

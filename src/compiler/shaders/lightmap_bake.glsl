@@ -188,6 +188,12 @@ vec3 safe_normalize(vec3 v, vec3 fallback) {
     return v * inversesqrt(len_sq);
 }
 
+vec3 build_face_local_shadow_ray_origin(vec3 plane_point, vec3 face_normal, vec3 dir) {
+    return plane_point
+        + safe_normalize(face_normal, vec3(0.0, 1.0, 0.0)) * shadow_bias
+        + dir * shadow_bias;
+}
+
 void face_basis(vec3 n, out vec3 u, out vec3 v) {
     vec3 ref = (abs(n.y) < 0.9) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     u = safe_normalize(cross(n, ref), vec3(1.0, 0.0, 0.0));
@@ -876,7 +882,7 @@ vec3 ericw_skydome_direction(bool upper_hemisphere, int sample_index, float rota
                           upper_hemisphere ? vec3(0.0, 1.0, 0.0) : vec3(0.0, -1.0, 0.0));
 }
 
-vec3 compute_skydome_lighting(vec3 sample_point, vec3 sample_normal, float near_hit_t, float dirt_occlusion) {
+vec3 compute_skydome_lighting(vec3 plane_point, vec3 sample_point, vec3 sample_normal, float near_hit_t, float dirt_occlusion) {
     vec3 result = vec3(0.0);
     float upper_per_sample = (sunlight2_intensity > 0.0) ? (sunlight2_intensity / (300.0 * float(SKYDOME_SAMPLE_COUNT))) : 0.0;
     float lower_per_sample = (sunlight3_intensity > 0.0) ? (sunlight3_intensity / (300.0 * float(SKYDOME_SAMPLE_COUNT))) : 0.0;
@@ -895,7 +901,7 @@ vec3 compute_skydome_lighting(vec3 sample_point, vec3 sample_normal, float near_
     for (int i = 0; i < SKYDOME_SAMPLE_COUNT; ++i) {
         if (upper_per_sample > 0.0) {
             vec3 dir = ericw_skydome_direction(true, i, upper_rotation);
-            vec3 ro = sample_point + dir * shadow_bias;
+            vec3 ro = build_face_local_shadow_ray_origin(plane_point, normal, dir);
             if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1)) {
                 float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
                 result += sunlight2_color * (upper_per_sample * incidence * dirt);
@@ -903,7 +909,7 @@ vec3 compute_skydome_lighting(vec3 sample_point, vec3 sample_normal, float near_
         }
         if (lower_per_sample > 0.0) {
             vec3 dir = ericw_skydome_direction(false, i, lower_rotation);
-            vec3 ro = sample_point + dir * shadow_bias;
+            vec3 ro = build_face_local_shadow_ray_origin(plane_point, normal, dir);
             if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1)) {
                 float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
                 result += sunlight3_color * (lower_per_sample * incidence * dirt);
@@ -969,9 +975,13 @@ void main() {
             }
             vec3 plane_point = origin + axis_u * (ju * luxel_size) + axis_v * (jv * luxel_size);
             repaired_sample repaired = repair_sample_point(plane_point);
-            vec3 sample_normal = evaluate_phong_normal(repaired.plane_point);
-            vec3 sample_point = repaired.sample_point;
-            float near_hit_t = shadow_bias;
+            vec3 sample_normal = evaluate_phong_normal(plane_point);
+            vec3 face_sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * SURFACE_SAMPLE_OFFSET;
+            bool face_sample_inside_solid = point_inside_any_solid(face_sample_point);
+            vec3 sample_point = face_sample_inside_solid ? repaired.sample_point : face_sample_point;
+            float edge_dist_luxels = min_dist_to_poly_edge_2d(ju, jv);
+            float edge_factor = clamp(1.0 - edge_dist_luxels / EDGE_SEAM_GUARD_LUXELS, 0.0, 1.0);
+            float near_hit_t = shadow_bias + (shadow_bias * EDGE_SEAM_TMIN_SCALE) * edge_factor;
 
             vec3 sample_rgb = ambient_color;
             bool uses_dirt = skylight_dirt != 0;
@@ -991,7 +1001,7 @@ void main() {
                     dir = safe_normalize(light.parallel_direction, vec3(0.0, 1.0, 0.0));
                     dist = max(1.0, light.intensity);
                 } else {
-                    vec3 to_light = light.position - sample_point;
+                    vec3 to_light = light.position - plane_point;
                     dist = length(to_light);
                     if ((dist > light.intensity) || (dist < 1e-3)) {
                         continue;
@@ -1002,13 +1012,10 @@ void main() {
                         continue;
                     }
                 }
-                // Use the off-surface sample_point as the ray origin (already pushed
-                // SURFACE_SAMPLE_OFFSET along the surface normal). Using repaired.plane_point
-                // here was the corner shadow-edge bleed bug: it left the ray origin on the
-                // source surface, so a luxel sitting right by a face/face intersection could
-                // graze the adjacent face inside near_hit_t. Every other ray trace in this
-                // shader (dirt, sky upper, sky lower) already uses sample_point.
-                vec3 ro = sample_point + dir * shadow_bias;
+                // Keep visibility rays on the owning face. Using the repaired
+                // off-surface sample here can let light peek around adjacent
+                // corners.
+                vec3 ro = build_face_local_shadow_ray_origin(plane_point, normal, dir);
                 float emit = 1.0;
                 if (light.directional != 0) {
                     emit = dot(light.emission_normal, -dir);
@@ -1033,7 +1040,7 @@ void main() {
                     : 1.0;
                 sample_rgb += light.color * (emit * spotlight * incidence * attenuation * dirt);
             }
-            sample_rgb += compute_skydome_lighting(sample_point, sample_normal, near_hit_t, dirt_occlusion);
+            sample_rgb += compute_skydome_lighting(plane_point, sample_point, sample_normal, near_hit_t, dirt_occlusion);
             accum += sample_rgb;
             used_samples += 1;
         }
