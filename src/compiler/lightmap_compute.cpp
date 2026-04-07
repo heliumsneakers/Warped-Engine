@@ -50,7 +50,7 @@ using GpuSolidPlane = warped_lightmap_bake_solid_plane_t;
 using GpuRepairSourcePoly = warped_lightmap_bake_repair_source_poly_t;
 using GpuRepairSourceNeighbor = warped_lightmap_bake_repair_source_neighbor_t;
 using GpuFaceParams = warped_lightmap_bake_cs_face_params_t;
-using GpuPackedPixel = warped_lightmap_bake_packed_pixel_t;
+using GpuBakedPixel = warped_lightmap_bake_baked_pixel_t;
 
 const char* BackendName(sg_backend backend) {
     switch (backend) {
@@ -376,12 +376,12 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          float skyTraceDistance,
                          int atlasWidth,
                          int atlasHeight,
-                         std::vector<uint8_t>& outPixels,
+                         std::vector<float>& outPixels,
                          std::string* error)
 {
     const size_t pixelCount = (size_t) atlasWidth * (size_t) atlasHeight;
-    std::vector<GpuPackedPixel> packedPixels(pixelCount);
-    outPixels.assign(pixelCount * 4, 0u);
+    std::vector<GpuBakedPixel> bakedPixels(pixelCount);
+    outPixels.assign(pixelCount * 4, 0.0f);
 
     std::vector<GpuPointLight> gpuLights(std::max<size_t>(1, lights.size()));
     for (size_t i = 0; i < lights.size(); ++i) {
@@ -592,10 +592,10 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     repairSourceNeighborDesc.label = "lightmap-repair-source-neighbors";
     repairSourceNeighborBuffer = sg_make_buffer(&repairSourceNeighborDesc);
 
-    outputDesc.size = packedPixels.size() * sizeof(GpuPackedPixel);
+    outputDesc.size = bakedPixels.size() * sizeof(GpuBakedPixel);
     outputDesc.usage.storage_buffer = true;
     outputDesc.usage.immutable = true;
-    outputDesc.data = ByteRange(packedPixels);
+    outputDesc.data = ByteRange(bakedPixels);
     outputDesc.label = "lightmap-output";
     outputBuffer = sg_make_buffer(&outputDesc);
     if ((sg_query_buffer_state(lightsBuffer) != SG_RESOURCESTATE_VALID) ||
@@ -777,18 +777,17 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     printf("[Lightmap] compute pass committed, reading back buffer\n");
     fflush(stdout);
 
-    if (!LightmapComputePlatform_ReadbackBuffer(outputBuffer, packedPixels.size() * sizeof(GpuPackedPixel), packedPixels.data(), error)) {
+    if (!LightmapComputePlatform_ReadbackBuffer(outputBuffer, bakedPixels.size() * sizeof(GpuBakedPixel), bakedPixels.data(), error)) {
         goto cleanup;
     }
     printf("[Lightmap] compute readback complete\n");
     fflush(stdout);
 
-    for (size_t i = 0; i < packedPixels.size(); ++i) {
-        const uint32_t packed = packedPixels[i].value;
-        outPixels[i * 4 + 0] = (uint8_t) (packed & 0xFFu);
-        outPixels[i * 4 + 1] = (uint8_t) ((packed >> 8u) & 0xFFu);
-        outPixels[i * 4 + 2] = (uint8_t) ((packed >> 16u) & 0xFFu);
-        outPixels[i * 4 + 3] = (uint8_t) ((packed >> 24u) & 0xFFu);
+    for (size_t i = 0; i < bakedPixels.size(); ++i) {
+        outPixels[i * 4 + 0] = bakedPixels[i].value[0];
+        outPixels[i * 4 + 1] = bakedPixels[i].value[1];
+        outPixels[i * 4 + 2] = bakedPixels[i].value[2];
+        outPixels[i * 4 + 3] = bakedPixels[i].value[3];
     }
 
     printf("[Lightmap] compute bake succeeded on backend %s (%zu rects).\n",

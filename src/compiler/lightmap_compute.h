@@ -88,5 +88,5 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          float skyTraceDistance,
                          int atlasWidth,
                          int atlasHeight,
-                         std::vector<uint8_t>& outPixels,
+                         std::vector<float>& outPixels,
                          std::string* error);

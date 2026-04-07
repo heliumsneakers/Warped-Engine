@@ -26,6 +26,7 @@ static constexpr float DIRECT_SHADOW_ORIGIN_BIAS = SHADOW_BIAS * 0.25f;
 static constexpr float SOLID_REPAIR_EPSILON = 0.05f;
 static constexpr float SAMPLE_REPAIR_JITTER = 0.5f;
 static constexpr float RAY_EPS            = 1e-4f;
+static constexpr float DARK_LUXEL_THRESHOLD = 8.0f / 255.0f;
 static constexpr float OCCLUSION_NEAR_TMIN = SHADOW_BIAS;
 static constexpr float EDGE_SEAM_GUARD_LUXELS = 0.75f;
 static constexpr float EDGE_SEAM_TMIN_BOOST   = SHADOW_BIAS * 3.0f;
@@ -1577,12 +1578,12 @@ static void AverageLuxelPair(LightmapPage& aPage, int ax, int ay,
     }
 
     for (int c = 0; c < 3; ++c) {
-        const int avg = ((int)aPage.pixels[aOff + c] + (int)bPage.pixels[bOff + c] + 1) / 2;
-        aPage.pixels[aOff + c] = (uint8_t)avg;
-        bPage.pixels[bOff + c] = (uint8_t)avg;
+        const float avg = (aPage.pixels[aOff + c] + bPage.pixels[bOff + c]) * 0.5f;
+        aPage.pixels[aOff + c] = avg;
+        bPage.pixels[bOff + c] = avg;
     }
-    aPage.pixels[aOff + 3] = 255;
-    bPage.pixels[bOff + 3] = 255;
+    aPage.pixels[aOff + 3] = 1.0f;
+    bPage.pixels[bOff + 3] = 1.0f;
 }
 
 static size_t WeldVerticalSiblingSeam(const FaceRect& left,
@@ -1903,7 +1904,7 @@ static void StabilizeEdgeTexels(LightmapPage& page,
     for (int pass = 0; pass < STABILIZE_EDGE_PASSES; ++pass) {
         bool changed = false;
         std::vector<uint8_t> nextStable = stable;
-        std::vector<uint8_t> nextPixels = page.pixels;
+        std::vector<float> nextPixels = page.pixels;
 
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
@@ -1912,7 +1913,8 @@ static void StabilizeEdgeTexels(LightmapPage& page,
                     continue;
                 }
 
-                int sr = 0, sg = 0, sb = 0, n = 0;
+                float sr = 0.0f, sg = 0.0f, sb = 0.0f;
+                int n = 0;
                 for (int oy = -1; oy <= 1; ++oy) {
                     for (int ox = -1; ox <= 1; ++ox) {
                         if (ox == 0 && oy == 0) {
@@ -1935,10 +1937,10 @@ static void StabilizeEdgeTexels(LightmapPage& page,
                 }
 
                 if (n > 0) {
-                    nextPixels[idx * 4 + 0] = (uint8_t)(sr / n);
-                    nextPixels[idx * 4 + 1] = (uint8_t)(sg / n);
-                    nextPixels[idx * 4 + 2] = (uint8_t)(sb / n);
-                    nextPixels[idx * 4 + 3] = 255;
+                    nextPixels[idx * 4 + 0] = sr / (float)n;
+                    nextPixels[idx * 4 + 1] = sg / (float)n;
+                    nextPixels[idx * 4 + 2] = sb / (float)n;
+                    nextPixels[idx * 4 + 3] = 1.0f;
                     nextStable[idx] = 1;
                     changed = true;
                 }
@@ -2164,10 +2166,10 @@ static void WriteStitchedSourceFaceCanvas(const StitchedSourceFaceCanvas& canvas
                     continue;
                 }
 
-                page.pixels[pagePixelIndex * 4 + 0] = (uint8_t)std::clamp(canvas.pixelsR[stitchedIndex] + 0.5f, 0.0f, 255.0f);
-                page.pixels[pagePixelIndex * 4 + 1] = (uint8_t)std::clamp(canvas.pixelsG[stitchedIndex] + 0.5f, 0.0f, 255.0f);
-                page.pixels[pagePixelIndex * 4 + 2] = (uint8_t)std::clamp(canvas.pixelsB[stitchedIndex] + 0.5f, 0.0f, 255.0f);
-                page.pixels[pagePixelIndex * 4 + 3] = 255;
+                page.pixels[pagePixelIndex * 4 + 0] = std::max(0.0f, canvas.pixelsR[stitchedIndex]);
+                page.pixels[pagePixelIndex * 4 + 1] = std::max(0.0f, canvas.pixelsG[stitchedIndex]);
+                page.pixels[pagePixelIndex * 4 + 2] = std::max(0.0f, canvas.pixelsB[stitchedIndex]);
+                page.pixels[pagePixelIndex * 4 + 3] = 1.0f;
             }
         }
     }
@@ -2292,7 +2294,8 @@ static void DilatePage(LightmapPage& page, std::vector<uint8_t>& valid) {
             for (int x = 0; x < W; ++x) {
                 const size_t idx = (size_t)y * W + x;
                 if (valid[idx]) continue;
-                int sr = 0, sg = 0, sb = 0, n = 0;
+                float sr = 0.0f, sg = 0.0f, sb = 0.0f;
+                int n = 0;
                 const int dx[4] = {-1, 1, 0, 0};
                 const int dy[4] = {0, 0, -1, 1};
                 for (int k = 0; k < 4; ++k) {
@@ -2307,10 +2310,10 @@ static void DilatePage(LightmapPage& page, std::vector<uint8_t>& valid) {
                     ++n;
                 }
                 if (n) {
-                    page.pixels[idx * 4 + 0] = (uint8_t)(sr / n);
-                    page.pixels[idx * 4 + 1] = (uint8_t)(sg / n);
-                    page.pixels[idx * 4 + 2] = (uint8_t)(sb / n);
-                    page.pixels[idx * 4 + 3] = 255;
+                    page.pixels[idx * 4 + 0] = sr / (float)n;
+                    page.pixels[idx * 4 + 1] = sg / (float)n;
+                    page.pixels[idx * 4 + 2] = sb / (float)n;
+                    page.pixels[idx * 4 + 3] = 1.0f;
                     nextValid[idx] = 1;
                 }
             }
@@ -2343,10 +2346,12 @@ static DarkLuxelStats GatherDarkLuxelStats(const LightmapPage& page,
             continue;
         }
         ++stats.validCount;
-        const uint8_t r = page.pixels[i * 4 + 0];
-        const uint8_t g = page.pixels[i * 4 + 1];
-        const uint8_t b = page.pixels[i * 4 + 2];
-        const bool dark = r < 8 && g < 8 && b < 8;
+        const float r = page.pixels[i * 4 + 0];
+        const float g = page.pixels[i * 4 + 1];
+        const float b = page.pixels[i * 4 + 2];
+        const bool dark = r < DARK_LUXEL_THRESHOLD &&
+                          g < DARK_LUXEL_THRESHOLD &&
+                          b < DARK_LUXEL_THRESHOLD;
         if (dark) {
             ++stats.darkValidCount;
         }
@@ -2650,9 +2655,9 @@ static Vector3 AverageRectLighting(const LightmapPage& page,
             }
             const size_t off = pixelIndex * 4;
             const Vector3 sample = {
-                page.pixels[off + 0] / 255.0f,
-                page.pixels[off + 1] / 255.0f,
-                page.pixels[off + 2] / 255.0f
+                page.pixels[off + 0],
+                page.pixels[off + 1],
+                page.pixels[off + 2]
             };
             validAccum = Vector3Add(validAccum, sample);
             ++validCount;
@@ -2727,7 +2732,7 @@ static LightmapPage MakeBlankPageLike(const LightmapPage& src) {
     LightmapPage page;
     page.width = src.width;
     page.height = src.height;
-    page.pixels.assign((size_t)page.width * (size_t)page.height * 4, 0);
+    page.pixels.assign((size_t)page.width * (size_t)page.height * 4, 0.0f);
     return page;
 }
 
@@ -2736,10 +2741,10 @@ static void AddPagePixels(LightmapPage& dst, const LightmapPage& src) {
         return;
     }
     for (size_t i = 0; i + 3 < dst.pixels.size(); i += 4) {
-        dst.pixels[i + 0] = (uint8_t)std::min(255, (int)dst.pixels[i + 0] + (int)src.pixels[i + 0]);
-        dst.pixels[i + 1] = (uint8_t)std::min(255, (int)dst.pixels[i + 1] + (int)src.pixels[i + 1]);
-        dst.pixels[i + 2] = (uint8_t)std::min(255, (int)dst.pixels[i + 2] + (int)src.pixels[i + 2]);
-        dst.pixels[i + 3] = 255;
+        dst.pixels[i + 0] += src.pixels[i + 0];
+        dst.pixels[i + 1] += src.pixels[i + 1];
+        dst.pixels[i + 2] += src.pixels[i + 2];
+        dst.pixels[i + 3] = 1.0f;
     }
 }
 
@@ -3210,11 +3215,10 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                     ab *= invSamples;
                 }
                 const size_t off = ((size_t)(r.gpu.y + ly) * W + (r.gpu.x + lx)) * 4;
-                auto C = [](float v) { return (uint8_t)std::min(255, (int)(v * 255.f)); };
-                page.pixels[off + 0] = C(ar);
-                page.pixels[off + 1] = C(ag);
-                page.pixels[off + 2] = C(ab);
-                page.pixels[off + 3] = 255;
+                page.pixels[off + 0] = std::max(0.0f, ar);
+                page.pixels[off + 1] = std::max(0.0f, ag);
+                page.pixels[off + 2] = std::max(0.0f, ab);
+                page.pixels[off + 3] = 1.0f;
             }
         }
     }
@@ -3338,7 +3342,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
     for (size_t i = 0; i < layouts.size(); ++i) {
         atlas.pages[i].width = LIGHTMAP_PAGE_SIZE;
         atlas.pages[i].height = layouts[i].usedHeight;
-        atlas.pages[i].pixels.assign((size_t)atlas.pages[i].width * (size_t)atlas.pages[i].height * 4, 0);
+        atlas.pages[i].pixels.assign((size_t)atlas.pages[i].width * (size_t)atlas.pages[i].height * 4, 0.0f);
     }
 
     FillPatchUVs(patches, rects, atlas.pages, atlas);

@@ -6,7 +6,13 @@
 #include <cstdint>
 
 #define WBSP_MAGIC    0x50534257u   // 'WBSP' little-endian
-#define WBSP_VERSION  3u
+#define WBSP_VERSION  4u
+#define WBSP_VERSION_LIGHTMAP_RGBA8 3u
+
+enum BSPLightmapPageFormat : uint32_t {
+    BSP_LIGHTMAP_FORMAT_RGBA8_UNORM = 0u,
+    BSP_LIGHTMAP_FORMAT_RGBA16F     = 1u,
+};
 
 enum {
     LUMP_TEXTURES = 0,   // BSPTexture[]
@@ -16,7 +22,7 @@ enum {
     LUMP_HULLS,          // BSPHull[]
     LUMP_HULL_PTS,       // BSPVec3[]
     LUMP_ENTITIES,       // char[]  (key/value text, \0-terminated)
-    LUMP_LIGHTMAP,       // BSPLightmapLumpHeader + BSPLightmapPageHeader[] + rgba8 page data
+    LUMP_LIGHTMAP,       // BSPLightmapLumpHeader + BSPLightmapPageHeader[] + format-specific page data
     LUMP_BSP_TREE,       // BSPTreeHeader
     LUMP_BSP_PLANES,     // BSPPlane[]
     LUMP_BSP_FACES,      // BSPFace[]
@@ -80,6 +86,7 @@ struct BSPLightmapPageHeader {
     uint32_t width;
     uint32_t height;
     uint32_t byteLength;
+    uint32_t format;
 };
 
 struct BSPTreeHeader {

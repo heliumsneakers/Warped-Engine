@@ -9,6 +9,7 @@
 struct BSPDataLightmapPage {
     int                  width = 0;
     int                  height = 0;
+    uint32_t             format = BSP_LIGHTMAP_FORMAT_RGBA8_UNORM;
     std::vector<uint8_t> pixels;
 };
 

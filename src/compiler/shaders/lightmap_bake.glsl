@@ -126,8 +126,8 @@ struct occluder_tri {
     int source_poly_index;
 };
 
-struct packed_pixel {
-    uint value;
+struct baked_pixel {
+    vec4 value;
 };
 
 layout(binding=0) readonly buffer cs_lights {
@@ -155,7 +155,7 @@ layout(binding=5) readonly buffer cs_repair_source_neighbors {
 };
 
 layout(binding=6) buffer cs_output {
-    packed_pixel pixels[];
+    baked_pixel pixels[];
 };
 
 layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
@@ -441,11 +441,6 @@ bool point_inside_any_solid(vec3 point) {
         }
     }
     return false;
-}
-
-uint pack_rgba8(vec4 color) {
-    uvec4 c = uvec4(clamp(color, 0.0, 1.0) * 255.0);
-    return (c.x) | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
 }
 
 float evaluate_light_attenuation(point_light light, float dist) {
@@ -1055,7 +1050,7 @@ void main() {
     }
     ivec2 atlas_xy = ivec2(rect_x + local_xy.x, rect_y + local_xy.y);
     uint out_index = uint(atlas_xy.y * atlas_width + atlas_xy.x);
-    pixels[out_index].value = pack_rgba8(vec4(accum, 1.0));
+    pixels[out_index].value = vec4(max(accum, vec3(0.0)), 1.0);
 }
 @end
 

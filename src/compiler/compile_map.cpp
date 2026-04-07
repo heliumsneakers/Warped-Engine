@@ -16,6 +16,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -78,6 +79,55 @@ struct LumpWriter {
         fwrite(&hdr, sizeof(hdr), 1, f);
     }
 };
+
+static uint16_t Float32ToHalfBits(float value)
+{
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+
+    const uint32_t sign = (bits >> 16u) & 0x8000u;
+    const uint32_t absBits = bits & 0x7FFFFFFFu;
+
+    if (absBits >= 0x7F800000u) {
+        const uint32_t mantissa = absBits & 0x007FFFFFu;
+        if (mantissa != 0u) {
+            return (uint16_t)(sign | 0x7C00u | std::max<uint32_t>(1u, mantissa >> 13u));
+        }
+        return (uint16_t)(sign | 0x7C00u);
+    }
+
+    if (absBits > 0x477FEFFFu) {
+        return (uint16_t)(sign | 0x7BFFu);
+    }
+
+    if (absBits < 0x38800000u) {
+        if (absBits < 0x33000000u) {
+            return (uint16_t)sign;
+        }
+
+        uint32_t mantissa = (absBits & 0x007FFFFFu) | 0x00800000u;
+        const uint32_t exp = absBits >> 23u;
+        const uint32_t shift = 126u - exp;
+        mantissa = (mantissa + (1u << (shift - 1u))) >> shift;
+        return (uint16_t)(sign | mantissa);
+    }
+
+    uint32_t rounded = absBits + 0x00001000u;
+    if (rounded >= 0x47800000u) {
+        return (uint16_t)(sign | 0x7BFFu);
+    }
+    return (uint16_t)(sign | ((rounded - 0x38000000u) >> 13u));
+}
+
+static std::vector<uint8_t> EncodeLightmapPageRGBA16F(const LightmapPage& page)
+{
+    std::vector<uint8_t> encoded(page.pixels.size() * sizeof(uint16_t), 0);
+    for (size_t i = 0; i < page.pixels.size(); ++i) {
+        const uint16_t half = Float32ToHalfBits(std::max(0.0f, page.pixels[i]));
+        memcpy(encoded.data() + i * sizeof(uint16_t), &half, sizeof(half));
+    }
+    return encoded;
+}
 
 // --------------------------------------------------------------------------
 int main(int argc, char** argv)
@@ -210,9 +260,12 @@ int main(int argc, char** argv)
     entText += '\0';
 
     // ----- lightmap lump ---------------------------------------------------
+    std::vector<std::vector<uint8_t>> encodedLightmapPages;
+    encodedLightmapPages.reserve(lm.pages.size());
     size_t lmLumpSize = sizeof(BSPLightmapLumpHeader) + lm.pages.size() * sizeof(BSPLightmapPageHeader);
     for (const LightmapPage& page : lm.pages) {
-        lmLumpSize += page.pixels.size();
+        encodedLightmapPages.push_back(EncodeLightmapPageRGBA16F(page));
+        lmLumpSize += encodedLightmapPages.back().size();
     }
     std::vector<uint8_t> lmLump(lmLumpSize);
     uint8_t* lmWrite = lmLump.data();
@@ -221,20 +274,22 @@ int main(int argc, char** argv)
     memcpy(lmWrite, &lmHeader, sizeof(lmHeader));
     lmWrite += sizeof(lmHeader);
 
-    for (const LightmapPage& page : lm.pages) {
+    for (size_t pageIndex = 0; pageIndex < lm.pages.size(); ++pageIndex) {
+        const LightmapPage& page = lm.pages[pageIndex];
         BSPLightmapPageHeader pageHeader{
             (uint32_t)page.width,
             (uint32_t)page.height,
-            (uint32_t)page.pixels.size()
+            (uint32_t)encodedLightmapPages[pageIndex].size(),
+            BSP_LIGHTMAP_FORMAT_RGBA16F
         };
         memcpy(lmWrite, &pageHeader, sizeof(pageHeader));
         lmWrite += sizeof(pageHeader);
     }
 
-    for (const LightmapPage& page : lm.pages) {
-        if (!page.pixels.empty()) {
-            memcpy(lmWrite, page.pixels.data(), page.pixels.size());
-            lmWrite += page.pixels.size();
+    for (const std::vector<uint8_t>& encodedPage : encodedLightmapPages) {
+        if (!encodedPage.empty()) {
+            memcpy(lmWrite, encodedPage.data(), encodedPage.size());
+            lmWrite += encodedPage.size();
         }
     }
 

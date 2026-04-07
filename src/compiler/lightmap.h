@@ -7,7 +7,7 @@
 struct LightmapPage {
     int                  width  = 0;
     int                  height = 0;
-    std::vector<uint8_t> pixels; // RGBA8, width*height*4
+    std::vector<float>   pixels; // linear RGBA, width*height*4
 };
 
 // Renderable surface patch used for lightmapped geometry emission. A single

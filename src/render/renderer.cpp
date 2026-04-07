@@ -66,6 +66,14 @@ static const char* RendererResourceStateName(sg_resource_state state) {
     }
 }
 
+static sg_pixel_format Renderer_LightmapPixelFormat(uint32_t format) {
+    switch (format) {
+        case BSP_LIGHTMAP_FORMAT_RGBA8_UNORM: return SG_PIXELFORMAT_RGBA8;
+        case BSP_LIGHTMAP_FORMAT_RGBA16F:     return SG_PIXELFORMAT_RGBA16F;
+        default:                              return SG_PIXELFORMAT_NONE;
+    }
+}
+
 static void Renderer_LogTextureState(const char* label, const TextureEntry& entry) {
     printf("[Renderer] %s image=%s view=%s size=%dx%d\n",
            label,
@@ -475,10 +483,27 @@ MapModel Renderer_UploadBSP(const BSPData& bsp, TextureManager& texMgr) {
         if (page.width <= 0 || page.height <= 0 || page.pixels.empty()) {
             continue;
         }
+        const sg_pixel_format pixelFormat = Renderer_LightmapPixelFormat(page.format);
+        if (pixelFormat == SG_PIXELFORMAT_NONE) {
+            printf("[Renderer] Skipping lightmap page with unsupported format %u.\n", page.format);
+            continue;
+        }
+        const sg_pixelformat_info pixelInfo = sg_query_pixelformat(pixelFormat);
+        if (!pixelInfo.sample) {
+            printf("[Renderer] Skipping lightmap page format %u on backend %s because it is not sampleable.\n",
+                   page.format, RendererBackendName(sg_query_backend()));
+            continue;
+        }
+        const size_t expectedBytes = (size_t)page.width * (size_t)page.height * pixelInfo.bytes_per_pixel;
+        if (page.pixels.size() != expectedBytes) {
+            printf("[Renderer] Skipping malformed lightmap page: format=%u size=%zu expected=%zu.\n",
+                   page.format, page.pixels.size(), expectedBytes);
+            continue;
+        }
         sg_image_desc id = {};
         id.width = page.width;
         id.height = page.height;
-        id.pixel_format = SG_PIXELFORMAT_RGBA8;
+        id.pixel_format = pixelFormat;
         id.data.mip_levels[0] = { page.pixels.data(), page.pixels.size() };
         id.label = "lightmap-page";
         sg_image image = sg_make_image(&id);

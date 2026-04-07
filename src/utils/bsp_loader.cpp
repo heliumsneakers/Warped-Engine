@@ -9,6 +9,7 @@
 namespace {
 
 static constexpr uint32_t kLegacyBspVersion = 2u;
+static constexpr uint32_t kRgba8LightmapBspVersion = WBSP_VERSION_LIGHTMAP_RGBA8;
 static constexpr size_t kLegacyLumpCount = 8;
 
 #pragma pack(push, 1)
@@ -16,6 +17,12 @@ struct BSPHeaderV2Compat {
     uint32_t magic;
     uint32_t version;
     BSPLump  lumps[kLegacyLumpCount];
+};
+
+struct BSPLightmapPageHeaderV3Compat {
+    uint32_t width;
+    uint32_t height;
+    uint32_t byteLength;
 };
 #pragma pack(pop)
 
@@ -32,7 +39,7 @@ static bool ReadHeader(FILE* f, BSPHeader* out) {
     }
 
     fseek(f, 0, SEEK_SET);
-    if (version == WBSP_VERSION) {
+    if (version == WBSP_VERSION || version == kRgba8LightmapBspVersion) {
         return fread(out, sizeof(*out), 1, f) == 1;
     }
     if (version == kLegacyBspVersion) {
@@ -142,26 +149,46 @@ bool LoadBSP(const char* path, BSPData& out)
             BSPLightmapLumpHeader lh{};
             fread(&lh, sizeof(lh), 1, f);
 
-            std::vector<BSPLightmapPageHeader> pageHeaders(lh.pageCount);
-            if (!pageHeaders.empty()) {
-                fread(pageHeaders.data(), sizeof(BSPLightmapPageHeader), pageHeaders.size(), f);
-            }
+            if (hdr.version >= WBSP_VERSION) {
+                std::vector<BSPLightmapPageHeader> pageHeaders(lh.pageCount);
+                if (!pageHeaders.empty()) {
+                    fread(pageHeaders.data(), sizeof(BSPLightmapPageHeader), pageHeaders.size(), f);
+                }
 
-            out.lightmapPages.resize(lh.pageCount);
-            for (uint32_t i = 0; i < lh.pageCount; ++i) {
-                BSPDataLightmapPage& page = out.lightmapPages[i];
-                page.width = (int)pageHeaders[i].width;
-                page.height = (int)pageHeaders[i].height;
-                page.pixels.resize(pageHeaders[i].byteLength);
-                if (!page.pixels.empty()) {
-                    fread(page.pixels.data(), 1, page.pixels.size(), f);
+                out.lightmapPages.resize(lh.pageCount);
+                for (uint32_t i = 0; i < lh.pageCount; ++i) {
+                    BSPDataLightmapPage& page = out.lightmapPages[i];
+                    page.width = (int)pageHeaders[i].width;
+                    page.height = (int)pageHeaders[i].height;
+                    page.format = pageHeaders[i].format;
+                    page.pixels.resize(pageHeaders[i].byteLength);
+                    if (!page.pixels.empty()) {
+                        fread(page.pixels.data(), 1, page.pixels.size(), f);
+                    }
+                }
+            } else {
+                std::vector<BSPLightmapPageHeaderV3Compat> pageHeaders(lh.pageCount);
+                if (!pageHeaders.empty()) {
+                    fread(pageHeaders.data(), sizeof(BSPLightmapPageHeaderV3Compat), pageHeaders.size(), f);
+                }
+
+                out.lightmapPages.resize(lh.pageCount);
+                for (uint32_t i = 0; i < lh.pageCount; ++i) {
+                    BSPDataLightmapPage& page = out.lightmapPages[i];
+                    page.width = (int)pageHeaders[i].width;
+                    page.height = (int)pageHeaders[i].height;
+                    page.format = BSP_LIGHTMAP_FORMAT_RGBA8_UNORM;
+                    page.pixels.resize(pageHeaders[i].byteLength);
+                    if (!page.pixels.empty()) {
+                        fread(page.pixels.data(), 1, page.pixels.size(), f);
+                    }
                 }
             }
         }
     }
 
     // ----- structural bsp -----------------------------------------------
-    if (hdr.version >= WBSP_VERSION) {
+    if (hdr.version >= WBSP_VERSION_LIGHTMAP_RGBA8) {
         const BSPLump& treeLump = hdr.lumps[LUMP_BSP_TREE];
         if (treeLump.length >= sizeof(BSPTreeHeader)) {
             fseek(f, treeLump.offset, SEEK_SET);
