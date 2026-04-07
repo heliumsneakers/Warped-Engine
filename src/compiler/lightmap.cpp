@@ -22,6 +22,7 @@ static constexpr int   LIGHTMAP_PAGE_SIZE = 2048;
 static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face luxel cap (interior only)
 static constexpr float SURFACE_SAMPLE_OFFSET = 0.125f;
 static constexpr float SHADOW_BIAS        = 0.03125f;
+static constexpr float DIRECT_SHADOW_ORIGIN_BIAS = SHADOW_BIAS * 0.25f;
 static constexpr float SOLID_REPAIR_EPSILON = 0.05f;
 static constexpr float SAMPLE_REPAIR_JITTER = 0.5f;
 static constexpr float RAY_EPS            = 1e-4f;
@@ -1049,6 +1050,7 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
             tr.c = p.verts[t + 1];
             tr.bounds = AABBInvalid();
             tr.occluderGroup = p.occluderGroup;
+            tr.sourcePolyIndex = (int)i;
             AABBExtend(&tr.bounds, tr.a);
             AABBExtend(&tr.bounds, tr.b);
             AABBExtend(&tr.bounds, tr.c);
@@ -1129,6 +1131,7 @@ static void BuildComputeRepairSourceGraph(const std::vector<RepairSourcePoly>& r
 static bool RayTriDistance(const Vector3& ro, const Vector3& rd,
                            const LightmapComputeOccluderTri& tr, float tmin, float tmax, float* outT = nullptr)
 {
+    const float baryEpsilon = RAY_EPS;
     Vector3 e1 = Vector3Subtract(tr.b, tr.a);
     Vector3 e2 = Vector3Subtract(tr.c, tr.a);
     Vector3 p  = Vector3CrossProduct(rd, e2);
@@ -1136,9 +1139,9 @@ static bool RayTriDistance(const Vector3& ro, const Vector3& rd,
     if (fabsf(det) < RAY_EPS) return false;
     float inv = 1.0f / det;
     Vector3 s = Vector3Subtract(ro, tr.a);
-    float u = Vector3DotProduct(s, p) * inv;      if (u < 0 || u > 1) return false;
+    float u = Vector3DotProduct(s, p) * inv;      if (u < -baryEpsilon || u > 1.0f + baryEpsilon) return false;
     Vector3 q = Vector3CrossProduct(s, e1);
-    float v = Vector3DotProduct(rd, q) * inv;     if (v < 0 || u + v > 1) return false;
+    float v = Vector3DotProduct(rd, q) * inv;     if (v < -baryEpsilon || u + v > 1.0f + baryEpsilon) return false;
     float t = Vector3DotProduct(e2, q) * inv;
     if (t <= tmin || t >= tmax) {
         return false;
@@ -1163,7 +1166,7 @@ static bool RayAABB(const Vector3& ro, const Vector3& inv_rd,
 }
 
 static bool Occluded(const OccluderSet& o, const Vector3& ro,
-                     const Vector3& rd, float minHitT, float dist, int ignoreOccluderGroup)
+                     const Vector3& rd, float minHitT, float dist, int ignoreOccluderGroup, int ignoreSourcePolyIndex = -1)
 {
     Vector3 inv = {
         1.0f / (fabsf(rd.x) > RAY_EPS ? rd.x : RAY_EPS),
@@ -1172,6 +1175,9 @@ static bool Occluded(const OccluderSet& o, const Vector3& ro,
     };
     for (const auto& tri : o.tris) {
         if ((ignoreOccluderGroup >= 0) && (tri.occluderGroup == ignoreOccluderGroup)) {
+            continue;
+        }
+        if ((ignoreSourcePolyIndex >= 0) && (tri.sourcePolyIndex == ignoreSourcePolyIndex)) {
             continue;
         }
         if (!RayAABB(ro, inv, tri.bounds, dist)) continue;
@@ -1185,7 +1191,8 @@ static float ClosestHitDistance(const OccluderSet& o,
                                 const Vector3& rd,
                                 float minHitT,
                                 float dist,
-                                int ignoreOccluderGroup)
+                                int ignoreOccluderGroup,
+                                int ignoreSourcePolyIndex = -1)
 {
     Vector3 inv = {
         1.0f / (fabsf(rd.x) > RAY_EPS ? rd.x : RAY_EPS),
@@ -1196,6 +1203,9 @@ static float ClosestHitDistance(const OccluderSet& o,
     float closest = dist;
     for (const auto& tri : o.tris) {
         if ((ignoreOccluderGroup >= 0) && (tri.occluderGroup == ignoreOccluderGroup)) {
+            continue;
+        }
+        if ((ignoreSourcePolyIndex >= 0) && (tri.sourcePolyIndex == ignoreSourcePolyIndex)) {
             continue;
         }
         if (!RayAABB(ro, inv, tri.bounds, closest)) {
@@ -2748,12 +2758,11 @@ static Vector3 BuildFaceLocalShadowRayOrigin(const Vector3& planePoint,
                                              const Vector3& faceNormal,
                                              const Vector3& dir)
 {
+    (void)dir;
     const Vector3 rayNormal = (Vector3LengthSq(faceNormal) > 1e-8f)
         ? Vector3Normalize(faceNormal)
         : Vector3Zero();
-    return Vector3Add(
-        Vector3Add(planePoint, Vector3Scale(rayNormal, SHADOW_BIAS)),
-        Vector3Scale(dir, SHADOW_BIAS));
+    return Vector3Add(planePoint, Vector3Scale(rayNormal, DIRECT_SHADOW_ORIGIN_BIAS));
 }
 
 static float ComputeDirtAttenuation(float occlusionRatio, float dirtScale, float dirtGain) {
@@ -3012,6 +3021,7 @@ static bool SkyDomeUsesDirt(const LightBakeSettings& settings) {
 }
 
 static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
+                                          uint32_t sourcePolyIndex,
                                           const Vector3& planePoint,
                                           const Vector3& faceNormal,
                                           const Vector3& samplePoint,
@@ -3044,7 +3054,7 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
         if (upperPerSample > 0.0f) {
             const Vector3 dir = EricwSkyDomeDirection(true, i, upperRotation);
             const Vector3 ro = BuildFaceLocalShadowRayOrigin(planePoint, faceNormal, dir);
-            if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1)) {
+            if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1, (int)sourcePolyIndex)) {
                 const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
                 const float scale = upperPerSample * incidence * dirtScale;
                 contrib = Vector3Add(contrib, Vector3Scale(settings.sunlight2Color, scale));
@@ -3053,7 +3063,7 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
         if (lowerPerSample > 0.0f) {
             const Vector3 dir = EricwSkyDomeDirection(false, i, lowerRotation);
             const Vector3 ro = BuildFaceLocalShadowRayOrigin(planePoint, faceNormal, dir);
-            if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1)) {
+            if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1, (int)sourcePolyIndex)) {
                 const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
                 const float scale = lowerPerSample * incidence * dirtScale;
                 contrib = Vector3Add(contrib, Vector3Scale(settings.sunlight3Color, scale));
@@ -3128,12 +3138,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                         const Vector3 faceSamplePoint = OffsetSamplePointOffSurface(planePoint, r.gpu.normal);
                         const bool faceSampleInsideSolid = PointInsideAnySolid(repairSolids, faceSamplePoint, SOLID_REPAIR_EPSILON);
                         const Vector3 samplePoint = faceSampleInsideSolid ? repairedSample.samplePoint : faceSamplePoint;
-                        const float edgeDistLuxels = MinDistToPolyEdge2D(r.poly2d, ju, jv);
-                        const float edgeFactor = std::clamp(
-                            1.0f - edgeDistLuxels / EDGE_SEAM_GUARD_LUXELS,
-                            0.0f,
-                            1.0f);
-                        const float nearHitT = OCCLUSION_NEAR_TMIN + EDGE_SEAM_TMIN_BOOST * edgeFactor;
+                        const float nearHitT = 0.0f;
 
                         float cr = settings.ambientColor.x;
                         float cg = settings.ambientColor.y;
@@ -3179,7 +3184,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             const float ndl = Vector3DotProduct(sampleNormal, dir);
                             const float incidence = EvaluateIncidenceScale(L, ndl);
                             if (incidence <= 0.0f) continue;
-                            if (Occluded(occ, ro, dir, nearHitT, std::max(0.0f, dist - (SHADOW_BIAS * 2.0f)), L.ignoreOccluderGroup)) continue;
+                            if (Occluded(occ, ro, dir, nearHitT, std::max(0.0f, dist - (SHADOW_BIAS * 2.0f)), L.ignoreOccluderGroup, (int)r.sourcePolyIndex)) continue;
                             const float dirt = LightUsesDirt(L, settings)
                                 ? ComputeDirtAttenuation(dirtOcclusion, EffectiveLightDirtScale(L, settings), EffectiveLightDirtGain(L, settings))
                                 : 1.0f;
@@ -3189,7 +3194,7 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                             cb += L.color.z * contrib;
                         }
                         const Vector3 skyContrib = ComputeSkyDomeContribution(
-                            occ, planePoint, r.gpu.normal, samplePoint, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
+                            occ, r.sourcePolyIndex, planePoint, r.gpu.normal, samplePoint, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
                         cr += skyContrib.x;
                         cg += skyContrib.y;
                         cb += skyContrib.z;

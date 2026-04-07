@@ -123,7 +123,7 @@ struct occluder_tri {
     vec3 bounds_min;
     int occluder_group;
     vec3 bounds_max;
-    float _pad4;
+    int source_poly_index;
 };
 
 struct packed_pixel {
@@ -190,8 +190,8 @@ vec3 safe_normalize(vec3 v, vec3 fallback) {
 
 vec3 build_face_local_shadow_ray_origin(vec3 plane_point, vec3 face_normal, vec3 dir) {
     return plane_point
-        + safe_normalize(face_normal, vec3(0.0, 1.0, 0.0)) * shadow_bias
-        + dir * shadow_bias;
+        + safe_normalize(face_normal, vec3(0.0, 1.0, 0.0)) * (shadow_bias * 0.25)
+        + dir * 0.0;
 }
 
 void face_basis(vec3 n, out vec3 u, out vec3 v) {
@@ -345,12 +345,12 @@ float ray_tri_t(vec3 ro, vec3 rd, occluder_tri tri) {
     float inv = 1.0 / det;
     vec3 s = ro - tri.a;
     float u = dot(s, p) * inv;
-    if ((u < 0.0) || (u > 1.0)) {
+    if ((u < -ray_eps) || (u > 1.0 + ray_eps)) {
         return -1.0;
     }
     vec3 q = cross(s, e1);
     float v = dot(rd, q) * inv;
-    if ((v < 0.0) || ((u + v) > 1.0)) {
+    if ((v < -ray_eps) || ((u + v) > 1.0 + ray_eps)) {
         return -1.0;
     }
     return dot(e2, q) * inv;
@@ -375,11 +375,14 @@ vec3 safe_inverse_dir(vec3 rd) {
     return 1.0 / denom;
 }
 
-bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group) {
+bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
     vec3 inv_rd = safe_inverse_dir(rd);
     for (int i = 0; i < tri_count; ++i) {
         occluder_tri tri = tris[i];
         if ((ignore_occluder_group >= 0) && (tri.occluder_group == ignore_occluder_group)) {
+            continue;
+        }
+        if ((ignore_source_poly_index >= 0) && (tri.source_poly_index == ignore_source_poly_index)) {
             continue;
         }
         if (!ray_aabb(ro, inv_rd, tri.bounds_min, tri.bounds_max, dist)) {
@@ -392,12 +395,15 @@ bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder
     return false;
 }
 
-float closest_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group) {
+float closest_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
     vec3 inv_rd = safe_inverse_dir(rd);
     float closest = dist;
     for (int i = 0; i < tri_count; ++i) {
         occluder_tri tri = tris[i];
         if ((ignore_occluder_group >= 0) && (tri.occluder_group == ignore_occluder_group)) {
+            continue;
+        }
+        if ((ignore_source_poly_index >= 0) && (tri.source_poly_index == ignore_source_poly_index)) {
             continue;
         }
         if (!ray_aabb(ro, inv_rd, tri.bounds_min, tri.bounds_max, closest)) {
@@ -902,7 +908,7 @@ vec3 compute_skydome_lighting(vec3 plane_point, vec3 sample_point, vec3 sample_n
         if (upper_per_sample > 0.0) {
             vec3 dir = ericw_skydome_direction(true, i, upper_rotation);
             vec3 ro = build_face_local_shadow_ray_origin(plane_point, normal, dir);
-            if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1)) {
+            if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1, repair_source_poly_index)) {
                 float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
                 result += sunlight2_color * (upper_per_sample * incidence * dirt);
             }
@@ -910,7 +916,7 @@ vec3 compute_skydome_lighting(vec3 plane_point, vec3 sample_point, vec3 sample_n
         if (lower_per_sample > 0.0) {
             vec3 dir = ericw_skydome_direction(false, i, lower_rotation);
             vec3 ro = build_face_local_shadow_ray_origin(plane_point, normal, dir);
-            if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1)) {
+            if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1, repair_source_poly_index)) {
                 float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
                 result += sunlight3_color * (lower_per_sample * incidence * dirt);
             }
@@ -944,7 +950,7 @@ float compute_dirt_occlusion_ratio(vec3 sample_point, vec3 sample_normal) {
     for (int i = 0; i < DIRT_RAY_COUNT; ++i) {
         vec3 local_dir = build_ericw_dirt_vector(i, seed);
         vec3 dir = safe_normalize(transform_to_tangent_space(sample_normal, tangent, bitangent, local_dir), sample_normal);
-        float hit_distance = closest_hit_distance(sample_point + dir * shadow_bias, dir, shadow_bias, max(1.0, dirt_depth), -1);
+        float hit_distance = closest_hit_distance(sample_point + dir * shadow_bias, dir, shadow_bias, max(1.0, dirt_depth), -1, -1);
         accumulated_distance += min(max(1.0, dirt_depth), hit_distance);
     }
     float avg_hit_distance = accumulated_distance / float(DIRT_RAY_COUNT);
@@ -979,9 +985,7 @@ void main() {
             vec3 face_sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * SURFACE_SAMPLE_OFFSET;
             bool face_sample_inside_solid = point_inside_any_solid(face_sample_point);
             vec3 sample_point = face_sample_inside_solid ? repaired.sample_point : face_sample_point;
-            float edge_dist_luxels = min_dist_to_poly_edge_2d(ju, jv);
-            float edge_factor = clamp(1.0 - edge_dist_luxels / EDGE_SEAM_GUARD_LUXELS, 0.0, 1.0);
-            float near_hit_t = shadow_bias + (shadow_bias * EDGE_SEAM_TMIN_SCALE) * edge_factor;
+            float near_hit_t = 0.0;
 
             vec3 sample_rgb = ambient_color;
             bool uses_dirt = skylight_dirt != 0;
@@ -1032,7 +1036,7 @@ void main() {
                 if (spotlight <= 0.0) {
                     continue;
                 }
-                if (occluded(ro, dir, near_hit_t, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group)) {
+                if (occluded(ro, dir, near_hit_t, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group, repair_source_poly_index)) {
                     continue;
                 }
                 float dirt = light_uses_dirt(light)

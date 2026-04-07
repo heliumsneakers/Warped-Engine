@@ -416,7 +416,7 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         CopyVec3(gpuOccluders[i].bounds_min, occluders[i].bounds.min);
         gpuOccluders[i].occluder_group = occluders[i].occluderGroup;
         CopyVec3(gpuOccluders[i].bounds_max, occluders[i].bounds.max);
-        gpuOccluders[i]._pad4 = 0.0f;
+        gpuOccluders[i].source_poly_index = occluders[i].sourcePolyIndex;
     }
 
     std::vector<GpuBrushSolid> gpuBrushSolids(std::max<size_t>(1, brushSolids.size()));

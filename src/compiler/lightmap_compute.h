@@ -61,6 +61,7 @@ struct LightmapComputeOccluderTri {
     Vector3 c{};
     AABB bounds{};
     int occluderGroup = -1;
+    int sourcePolyIndex = -1;
 };
 
 struct LightmapComputeBrushSolid {
