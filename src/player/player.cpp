@@ -10,6 +10,7 @@
 #include "../render/debug_draw.h"
 #include "../utils/parameters.h"
 #include "../physx/physics.h"
+#include "../entities/entities.h"
 
 #include "sokol_gfx.h"
 #include "sokol_debugtext.h"
@@ -736,6 +737,31 @@ void InitPlayer(Player *player, Vector3 center, Vector3 target, Vector3 up, floa
     cursorEnabled = false;
 }
 
+void RespawnPlayer(Player *player, JPH::PhysicsSystem *physicsSystem, Vector3 position, float yaw, float pitch)
+{
+    player->center = position;
+
+    velocity = Vector3Zero();
+    playerYaw = yaw;
+    playerPitch = pitch;
+    isGrounded = false;
+    gGroundNormal = JPH::Vec3::sZero();
+    wishDir = Vector3Zero();
+    wishVel = Vector3Zero();
+    wishSpeed = 0.0f;
+    g_velDbg = {};
+
+    player->yaw = yaw;
+    player->pitch = pitch;
+    player->camera.position = { player->center.x, player->center.y + eyeOffset, player->center.z };
+    UpdateCameraTarget(player);
+
+    ResolvePlayerPenetration(physicsSystem, player->center);
+    CategorizeGround(physicsSystem, player->center, true);
+    player->camera.position = { player->center.x, player->center.y + eyeOffset, player->center.z };
+    UpdateCameraTarget(player);
+}
+
 void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
 {
     ResolvePlayerPenetration(ps, player->center);
@@ -778,6 +804,21 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
         velocity.y -= GRAVITY * dt;
     }
 
+    const GameplayEntities::PlayerEffectResult playerEffects =
+        GameplayEntities::ApplyPlayerEffects(ps,
+                                             gPlayerShape.GetPtr(),
+                                             player->center,
+                                             GroundNormalVector(),
+                                             OnWalkableGround(),
+                                             dt,
+                                             velocity);
+    if (playerEffects.launchOffGround)
+    {
+        isGrounded = false;
+        gGroundNormal = JPH::Vec3::sZero();
+        jumped = true;
+    }
+
     bool landedOnWalkable = false;
 
     if (OnWalkableGround())
@@ -793,6 +834,13 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
     ResolvePlayerPenetration(ps, player->center);
     CategorizeGround(ps, player->center, landedOnWalkable || (wasGrounded && !jumped));
     PM_ApplyWalkableSlopeStop();
+
+    const GameplayEntities::TriggerTeleportResult teleportResult =
+        GameplayEntities::QueryPlayerTeleportTrigger(ps, gPlayerShape.GetPtr(), player->center, dt);
+    if (teleportResult.teleportPlayer)
+    {
+        RespawnPlayer(player, ps, teleportResult.position, teleportResult.yaw, teleportResult.pitch);
+    }
 
     DebugUpdateVelMetrics();
 

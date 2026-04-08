@@ -17,10 +17,13 @@ static CollisionType GetEntityCollisionType(const Entity &ent) {
            ct = CollisionType::STATIC;
             printf("\n WORLDSPAWN ENTITY \n");
         }
-        else if (classname.find("trigger_once") != std::string::npos) {
+        else if (classname == "trigger_once" || classname == "trigger_multiple") {
             ct = CollisionType::TRIGGER;
-            printf("\n TRIGGER_ONCE ENTITY \n");
-
+            printf("\n TRIGGER ENTITY \n");
+        }
+        else if (classname == "func_boost") {
+            ct = CollisionType::STATIC;
+            printf("\n FUNC_BOOST ENTITY \n");
         }
         else if (classname.find("func_physics") != std::string::npos) {
             ct = CollisionType::DYNAMIC;
@@ -140,7 +143,8 @@ std::vector<MeshCollisionData> ExtractCollisionData(const Map &map)
     std::vector<MeshCollisionData> result;
 
     // For each entity
-    for (auto &ent : map.entities) {
+    for (size_t entityIndex = 0; entityIndex < map.entities.size(); ++entityIndex) {
+        auto &ent = map.entities[entityIndex];
         // 1) Determine collision type from entity
         CollisionType ct = GetEntityCollisionType(ent);
 
@@ -154,6 +158,7 @@ std::vector<MeshCollisionData> ExtractCollisionData(const Map &map)
             // 3) Store mesh collision data with type and points
             MeshCollisionData mcd;
             mcd.collisionType = ct;
+            mcd.entityIndex   = (int)entityIndex;
             mcd.vertices      = std::move(corners);
 
             result.push_back(std::move(mcd));

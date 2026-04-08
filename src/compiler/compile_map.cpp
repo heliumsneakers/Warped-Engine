@@ -244,6 +244,7 @@ int main(int argc, char** argv)
         h.firstPoint    = (uint32_t)hullPts.size();
         h.pointCount    = (uint32_t)c.vertices.size();
         h.collisionType = (uint32_t)c.collisionType;
+        h.entityIndex   = c.entityIndex;
         for (auto& v : c.vertices) hullPts.push_back({v.x,v.y,v.z});
         hulls.push_back(h);
     }
@@ -251,7 +252,6 @@ int main(int argc, char** argv)
     // ----- entity text -----------------------------------------------------
     std::string entText;
     for (auto& e : map.entities) {
-        if (!e.brushes.empty()) continue;          // brush ents handled via geom/hulls
         entText += "{\n";
         for (auto& kv : e.properties)
             entText += "\""+kv.first+"\" \""+kv.second+"\"\n";

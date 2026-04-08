@@ -294,15 +294,16 @@ static bool LoadSelectedMap(const MapEntry& map) {
     }
 
     std::vector<PlayerStart> starts = GetPlayerStarts(bsp);
-    Vector3 spawn = starts.empty() ? (Vector3){0, 0, 0} : starts[0].position;
+    const PlayerStart start = starts.empty() ? PlayerStart{ (Vector3){0, 0, 0}, 0.0f, 0.0f } : starts[0];
+    Vector3 spawn = start.position;
 
     InitPlayer(&G.player, spawn, (Vector3){0, 0, 0}, (Vector3){0, 1, 0}, 90.0f);
     G.mapModel = Renderer_UploadBSP(bsp, G.texMgr);
 
-    BuildMapPhysics(bsp.hulls, G.bodyInterface);
+    BuildMapPhysics(bsp.hulls, bsp.entities, G.bodyInterface);
     SpawnDebugPhysObj(G.bodyInterface);
     InitJoltCharacter(&G.player, s_physics_system);
-    UpdateCameraTarget(&G.player);
+    RespawnPlayer(&G.player, s_physics_system, start.position, start.yaw, start.pitch);
 
     G.currentMapName = map.name;
     G.menuStatus.clear();

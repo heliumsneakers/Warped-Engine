@@ -10,6 +10,7 @@ namespace {
 
 static constexpr uint32_t kLegacyBspVersion = 2u;
 static constexpr uint32_t kRgba8LightmapBspVersion = WBSP_VERSION_LIGHTMAP_RGBA8;
+static constexpr uint32_t kLightmapFormatBspVersion = WBSP_VERSION_LIGHTMAP_FORMAT;
 static constexpr size_t kLegacyLumpCount = 8;
 
 #pragma pack(push, 1)
@@ -23,6 +24,12 @@ struct BSPLightmapPageHeaderV3Compat {
     uint32_t width;
     uint32_t height;
     uint32_t byteLength;
+};
+
+struct BSPHullV4Compat {
+    uint32_t firstPoint;
+    uint32_t pointCount;
+    uint32_t collisionType;
 };
 #pragma pack(pop)
 
@@ -39,7 +46,7 @@ static bool ReadHeader(FILE* f, BSPHeader* out) {
     }
 
     fseek(f, 0, SEEK_SET);
-    if (version == WBSP_VERSION || version == kRgba8LightmapBspVersion) {
+    if (version == WBSP_VERSION || version == kLightmapFormatBspVersion || version == kRgba8LightmapBspVersion) {
         return fread(out, sizeof(*out), 1, f) == 1;
     }
     if (version == kLegacyBspVersion) {
@@ -87,8 +94,22 @@ bool LoadBSP(const char* path, BSPData& out)
     auto verts    = ReadLump<BSPVertex> (f, hdr.lumps[LUMP_VERTICES]);
     auto idx      = ReadLump<uint32_t>  (f, hdr.lumps[LUMP_INDICES]);
     auto meshes   = ReadLump<BSPMesh>   (f, hdr.lumps[LUMP_MESHES]);
-    auto hulls    = ReadLump<BSPHull>   (f, hdr.lumps[LUMP_HULLS]);
     auto hullPts  = ReadLump<BSPVec3>   (f, hdr.lumps[LUMP_HULL_PTS]);
+    std::vector<BSPHull> hulls;
+    if (hdr.version >= WBSP_VERSION_HULL_ENTITY_REFS) {
+        hulls = ReadLump<BSPHull>(f, hdr.lumps[LUMP_HULLS]);
+    } else {
+        std::vector<BSPHullV4Compat> legacyHulls = ReadLump<BSPHullV4Compat>(f, hdr.lumps[LUMP_HULLS]);
+        hulls.reserve(legacyHulls.size());
+        for (const BSPHullV4Compat& legacyHull : legacyHulls) {
+            BSPHull hull{};
+            hull.firstPoint = legacyHull.firstPoint;
+            hull.pointCount = legacyHull.pointCount;
+            hull.collisionType = legacyHull.collisionType;
+            hull.entityIndex = -1;
+            hulls.push_back(hull);
+        }
+    }
 
     // ----- render buckets -------------------------------------------------
     out.buckets.reserve(meshes.size());
@@ -112,6 +133,7 @@ bool LoadBSP(const char* path, BSPData& out)
     for (auto& h : hulls) {
         MeshCollisionData mcd;
         mcd.collisionType = (CollisionType)h.collisionType;
+        mcd.entityIndex = h.entityIndex;
         mcd.vertices.reserve(h.pointCount);
         for (uint32_t i=0;i<h.pointCount;++i) {
             const BSPVec3& p = hullPts[h.firstPoint+i];
@@ -149,7 +171,7 @@ bool LoadBSP(const char* path, BSPData& out)
             BSPLightmapLumpHeader lh{};
             fread(&lh, sizeof(lh), 1, f);
 
-            if (hdr.version >= WBSP_VERSION) {
+            if (hdr.version >= kLightmapFormatBspVersion) {
                 std::vector<BSPLightmapPageHeader> pageHeaders(lh.pageCount);
                 if (!pageHeaders.empty()) {
                     fread(pageHeaders.data(), sizeof(BSPLightmapPageHeader), pageHeaders.size(), f);

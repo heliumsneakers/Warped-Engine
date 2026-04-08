@@ -14,7 +14,8 @@ enum class CollisionType {
 
 struct MeshCollisionData {
     std::vector<Vector3> vertices;
-    CollisionType collisionType;
+    CollisionType collisionType = CollisionType::UNKNOWN;
+    int entityIndex = -1;
 };
 
 std::vector<MeshCollisionData> ExtractCollisionData(const Map &map);

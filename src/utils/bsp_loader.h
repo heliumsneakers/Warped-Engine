@@ -16,7 +16,7 @@ struct BSPDataLightmapPage {
 struct BSPData {
     std::vector<MapMeshBucket>     buckets;    // per-texture, ready for upload
     std::vector<MeshCollisionData> hulls;
-    std::vector<Entity>            entities;   // point entities only
+    std::vector<Entity>            entities;   // point and brush entities, properties only
     std::vector<BSPDataLightmapPage> lightmapPages;
     BSPTreeHeader                  tree{};
     std::vector<BSPPlane>          planes;

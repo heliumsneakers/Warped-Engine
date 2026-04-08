@@ -21,7 +21,7 @@
 // meters per TB unit conversion
 static constexpr float TB_TO_WORLD = 1.0f / 32.0f;
 
-static Vector3 ConvertTBtoRaylibEntities(const Vector3& in);
+Vector3 ConvertTBPointEntityToWorld(const Vector3& in);
 
 /*
 ------------------------------------------------------------
@@ -331,8 +331,8 @@ Vector3 ConvertTBtoRaylib(const Vector3& in) {
     return out;
 }
 
-// Convert coordinates for entities not defined by brushes or the plane intersection logic.
-static Vector3 ConvertTBtoRaylibEntities(const Vector3& in) {
+// Convert coordinates for point entities authored directly in TrenchBroom.
+Vector3 ConvertTBPointEntityToWorld(const Vector3& in) {
     Vector3 out = {
          in.x,
          in.z,
@@ -603,7 +603,8 @@ static bool EntityClassStartsWith(const Entity& e, const char* prefix) {
 }
 
 static bool ShouldRenderBrushEntity(const Entity& entity, bool devMode) {
-    if ((EntityHasClass(entity, "trigger_once") || EntityHasClass(entity, "trigger_multiple")) && !devMode) {
+    if ((EntityHasClass(entity, "trigger_once") ||
+         EntityHasClass(entity, "trigger_multiple")) && !devMode) {
         return false;
     }
 
@@ -715,7 +716,37 @@ static Vector3 MangleToTBDirection(const Vector3& mangle) {
 }
 
 static Vector3 MangleToWorldLightDirection(const Vector3& mangle) {
-    return Vector3Normalize(ConvertTBtoRaylibEntities(MangleToTBDirection(mangle)));
+    return Vector3Normalize(ConvertTBPointEntityToWorld(MangleToTBDirection(mangle)));
+}
+
+static Vector3 PointEntityAnglesToTBDirection(const Vector3& angles) {
+    const float pitch = angles.x * DEG2RAD;
+    const float yaw = angles.y * DEG2RAD;
+    return Vector3Normalize({
+        cosf(pitch) * cosf(yaw),
+        cosf(pitch) * sinf(yaw),
+        sinf(pitch)
+    });
+}
+
+bool ParsePointEntityFacing(const Entity& entity, float& outYaw, float& outPitch) {
+    outYaw = 0.0f;
+    outPitch = 0.0f;
+
+    Vector3 angles{};
+    if (!ParseVec3Prop(entity, "angles", angles) && !ParseVec3Prop(entity, "mangle", angles)) {
+        return false;
+    }
+
+    const Vector3 directionWorld = ConvertTBPointEntityToWorld(PointEntityAnglesToTBDirection(angles));
+    if (Vector3LengthSq(directionWorld) <= 1.0e-6f) {
+        return false;
+    }
+
+    const Vector3 normalized = Vector3Normalize(directionWorld);
+    outYaw = atan2f(normalized.z, normalized.x) * RAD2DEG;
+    outPitch = asinf(std::clamp(normalized.y, -1.0f, 1.0f)) * RAD2DEG;
+    return true;
 }
 
 static bool FindEntityOriginByTargetname(const Map& map, const std::string& targetname, Vector3& outWorldOrigin) {
@@ -731,7 +762,7 @@ static bool FindEntityOriginByTargetname(const Map& map, const std::string& targ
         if (!ParseVec3Prop(entity, "origin", originTB)) {
             continue;
         }
-        outWorldOrigin = ConvertTBtoRaylibEntities(originTB);
+        outWorldOrigin = ConvertTBPointEntityToWorld(originTB);
         return true;
     }
     return false;
@@ -1055,7 +1086,7 @@ std::vector<PointLight> GetPointLights(const Map &map) {
             ParseFloatProp(e, "intensity", intensity);
 
             PointLight pl{};
-            pl.position = ConvertTBtoRaylibEntities(originTB);
+            pl.position = ConvertTBPointEntityToWorld(originTB);
             pl.color = Color255ToUnit(color255);
             pl.intensity = std::max(1.0f, intensity);
             pl.emissionNormal = { 0.0f, 0.0f, 0.0f };
@@ -1085,7 +1116,7 @@ std::vector<PointLight> GetPointLights(const Map &map) {
 
         Vector3 originTB{0, 0, 0};
         ParseVec3Prop(e, "origin", originTB);
-        const Vector3 origin = ConvertTBtoRaylibEntities(originTB);
+        const Vector3 origin = ConvertTBPointEntityToWorld(originTB);
 
         Vector3 color255{255, 255, 255};
         float brightness = 300.0f;
@@ -1266,7 +1297,7 @@ std::vector<SurfaceLightTemplate> GetSurfaceLightTemplates(const Map& map) {
 
         Vector3 originTB{};
         ParseVec3Prop(e, "origin", originTB);
-        const Vector3 origin = ConvertTBtoRaylibEntities(originTB);
+        const Vector3 origin = ConvertTBPointEntityToWorld(originTB);
         Vector3 lightDirection{};
         if (ParseLightDirection(map, e, origin, lightDirection)) {
             float outerAngle = 40.0f;
@@ -1298,14 +1329,15 @@ std::vector<PlayerStart> GetPlayerStarts(const Map &map) {
                             std::stof(coords[1]),
                             std::stof(coords[2])
                         };
-                        Vector3 posRL = ConvertTBtoRaylibEntities(posTB);
+                        Vector3 posRL = ConvertTBPointEntityToWorld(posTB);
 
                         PlayerStart ps;
                         ps.position = posRL;
+                        ParsePointEntityFacing(entity, ps.yaw, ps.pitch);
                         starts.push_back(ps);
 
-                        printf("PlayerStart TB:(%.1f, %.1f, %.1f)  RL:(%.1f, %.1f, %.1f)\n",
-                               posTB.x, posTB.y, posTB.z, posRL.x, posRL.y, posRL.z);
+                        printf("PlayerStart TB:(%.1f, %.1f, %.1f)  RL:(%.1f, %.1f, %.1f) yaw=%.1f pitch=%.1f\n",
+                               posTB.x, posTB.y, posTB.z, posRL.x, posRL.y, posRL.z, ps.yaw, ps.pitch);
                     } catch (...) {}
                 }
             }

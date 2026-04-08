@@ -10,6 +10,7 @@
 #include "Jolt/Physics/Body/BodyInterface.h"
 #include "Jolt/Physics/Collision/ObjectLayer.h"
 #include "collision_data.h"
+#include "../entities/entities.h"
 
 #include "Jolt/Jolt.h"
 
@@ -358,9 +359,13 @@ void SpawnDebugPhysObj(JPH::BodyInterface *bodyInterface) {
     printf("\n --TEST OBJECT SPAWNED-- \n");
 }
 
-void BuildMapPhysics(std::vector<MeshCollisionData> &meshCollisionData, JPH::BodyInterface *bodyInterface)
+void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
+                     const std::vector<Entity> &entities,
+                     JPH::BodyInterface *bodyInterface)
 {
     int count = 0;
+    GameplayEntities::Reset();
+    GameplayEntities::RegisterPointEntities(entities);
 
     for (auto &mcd : meshCollisionData) {
         // If NO_COLLIDE or something similar, we skip
@@ -438,6 +443,9 @@ void BuildMapPhysics(std::vector<MeshCollisionData> &meshCollisionData, JPH::Bod
 
         if (JPH::Body *body = bodyInterface->CreateBody(bcs)) {
             bodyInterface->AddBody(body->GetID(), JPH::EActivation::Activate);
+            if (mcd.entityIndex >= 0 && (size_t)mcd.entityIndex < entities.size()) {
+                GameplayEntities::RegisterBrushEntity(entities[(size_t)mcd.entityIndex], mcd.entityIndex, body->GetID());
+            }
             ++count;
         }
         else {
@@ -447,4 +455,3 @@ void BuildMapPhysics(std::vector<MeshCollisionData> &meshCollisionData, JPH::Bod
 
     printf("\n\n %d MAP COLLISIONS SUCCESSFULLY CREATED \n\n", count);
 }
-

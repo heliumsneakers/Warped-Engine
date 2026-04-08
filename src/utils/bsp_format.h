@@ -6,7 +6,9 @@
 #include <cstdint>
 
 #define WBSP_MAGIC    0x50534257u   // 'WBSP' little-endian
-#define WBSP_VERSION  4u
+#define WBSP_VERSION  5u
+#define WBSP_VERSION_LIGHTMAP_FORMAT 4u
+#define WBSP_VERSION_HULL_ENTITY_REFS 5u
 #define WBSP_VERSION_LIGHTMAP_RGBA8 3u
 
 enum BSPLightmapPageFormat : uint32_t {
@@ -76,6 +78,7 @@ struct BSPHull {
     uint32_t firstPoint;
     uint32_t pointCount;
     uint32_t collisionType;   // maps to enum CollisionType
+    int32_t  entityIndex;     // source Entity index in the entity lump, -1 if none / unavailable
 };
 
 struct BSPLightmapLumpHeader {

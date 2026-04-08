@@ -53,6 +53,8 @@ typedef struct Map {
 
 typedef struct PlayerStart {
     Vector3 position;
+    float   yaw = 0.0f;
+    float   pitch = 0.0f;
 } PlayerStart;
 
 enum PointLightAttenuationMode : uint8_t {
@@ -191,6 +193,8 @@ Vector2 ComputeFaceUV(const Vector3& vert,
 
 // Geometry helpers (reused by collision_data.cpp)
 Vector3 ConvertTBtoRaylib(const Vector3& in);
+Vector3 ConvertTBPointEntityToWorld(const Vector3& in);
+bool    ParsePointEntityFacing(const Entity& entity, float& outYaw, float& outPitch);
 Vector3 CalculateNormal(const Vector3& v1, const Vector3& v2, const Vector3& v3);
 void    RemoveDuplicatePoints(std::vector<Vector3>& points, float eps);
 bool    GetIntersection(const Plane& p1, const Plane& p2, const Plane& p3, Vector3& out);

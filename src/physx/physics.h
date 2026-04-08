@@ -49,7 +49,8 @@ void UpdatePhysicsSystem(float delta_time, JPH::BodyInterface *bodyInterface);
 
 void SpawnDebugPhysObj(JPH::BodyInterface *bodyInterface);
 
-void BuildMapPhysics(std::vector<MeshCollisionData> &meshCollisionData, JPH::BodyInterface *bodyInterface);
+void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
+                     const std::vector<Entity> &entities,
+                     JPH::BodyInterface *bodyInterface);
 
 void SpawnMinimalTest(JPH::BodyInterface &bodyInterface);
-
