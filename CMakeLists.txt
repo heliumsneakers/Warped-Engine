@@ -98,6 +98,7 @@ if(BUILD_MAP_COMPILER)
     add_executable(compile_map
         src/compiler/compile_map.cpp
         src/compiler/lightmap.cpp
+        src/compiler/lightmap_trace.cpp
         src/compiler/structural_bsp.cpp
         src/compiler/lightmap_compute.cpp
         src/compiler/sokol_compute_impl.c

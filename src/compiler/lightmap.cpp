@@ -6,10 +6,13 @@
 
 #include "lightmap.h"
 #include "lightmap_compute.h"
+#include "lightmap_trace.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <unordered_map>
@@ -20,25 +23,27 @@
 static constexpr int   LM_PAD             = 2;      // border luxels (filled by dilate)
 static constexpr int   LIGHTMAP_PAGE_SIZE = 2048;
 static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face luxel cap (interior only)
-static constexpr float SURFACE_SAMPLE_OFFSET = 0.125f;
 static constexpr float SHADOW_BIAS        = 0.03125f;
 static constexpr float DIRECT_SHADOW_ORIGIN_BIAS = SHADOW_BIAS * 0.25f;
 static constexpr float SOLID_REPAIR_EPSILON = 0.05f;
 static constexpr float SAMPLE_REPAIR_JITTER = 0.5f;
-static constexpr float RAY_EPS            = 1e-4f;
 static constexpr float DARK_LUXEL_THRESHOLD = 8.0f / 255.0f;
 static constexpr float OCCLUSION_NEAR_TMIN = SHADOW_BIAS;
 static constexpr float EDGE_SEAM_GUARD_LUXELS = 0.75f;
 static constexpr float EDGE_SEAM_TMIN_BOOST   = SHADOW_BIAS * 3.0f;
-// The current indirect pass approximates bounced light with per-patch emitters.
-// Keep it conservative so it lifts occluded regions without flattening direct
+// Indirect bounce is emitted from lit patch surfaces. Keep the first radiosity
+// pass conservative so it lifts occluded regions without flattening direct
 // shadow contrast into an overcast look.
 static constexpr float INDIRECT_BOUNCE_REFLECTANCE = 0.18f;
 static constexpr float INDIRECT_BOUNCE_EMITTER_THRESHOLD = 1.0f / 255.0f;
-static constexpr float INDIRECT_BOUNCE_RADIUS_BIAS = 32.0f;
-static constexpr float INDIRECT_BOUNCE_RADIUS_SCALE = 2.0f;
-static constexpr float INDIRECT_BOUNCE_RADIUS_MIN = 32.0f;
-static constexpr float INDIRECT_BOUNCE_RADIUS_MAX = 160.0f;
+static constexpr float INDIRECT_BOUNCE_SURFACE_OFFSET = 1.0f;
+static constexpr float DIRECT_SURFACE_HOTSPOT_CLAMP = 16.0f;
+static constexpr float INDIRECT_SURFACE_HOTSPOT_CLAMP = 128.0f;
+static constexpr float SURFACE_EMITTER_TRACE_THRESHOLD = 1.0f / 255.0f;
+static constexpr float SURFACE_EMITTER_CULL_THRESHOLD = 1.0f / 255.0f;
+static constexpr float SURFACE_EMITTER_CULL_RADIUS_MIN = 32.0f;
+static constexpr float SURFACE_EMITTER_CULL_RADIUS_MAX = 8192.0f;
+static constexpr float LIGHT_ANGLE_EPSILON = 0.01f;
 // Runtime super-sampling grid size set at the top of BakeLightmap from
 // settings.extraSamples (which parses the worldspawn `_extra_samples` key).
 // Valid values: 1 = off (1 sample per luxel), 2 = 2x2, 4 = 4x4 (historical
@@ -53,6 +58,12 @@ static constexpr int   ERICW_SUNSAMPLES   = 100;    // matches ericw-tools defau
 static constexpr int   DIRT_NUM_ANGLE_STEPS = 16;
 static constexpr int   DIRT_NUM_ELEVATION_STEPS = 3;
 static constexpr int   DIRT_RAY_COUNT = DIRT_NUM_ANGLE_STEPS * DIRT_NUM_ELEVATION_STEPS;
+
+static bool ForceLightmapCPUFromEnv()
+{
+    const char* value = std::getenv("WARPED_LIGHTMAP_FORCE_CPU");
+    return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
 
 // --------------------------------------------------------------------------
 //  Planar basis
@@ -72,6 +83,21 @@ struct LocalPolyVert {
 struct BakePatch {
     MapPolygon poly{};
     uint32_t sourcePolyIndex = 0;
+};
+
+struct SurfaceLightEmitter {
+    PointLight baseLight{};
+    Vector3 surfaceNormal{};
+    std::vector<Vector3> samplePoints;
+    AABB bounds{};
+    float sampleIntensityScale = 1.0f;
+    float attenuationScale = 1.0f;
+    float transportScale = 1.0f;
+    float hotspotClamp = DIRECT_SURFACE_HOTSPOT_CLAMP;
+    float surfaceArea = 0.0f;
+    int bounceDepth = 0;
+    uint8_t omnidirectional = 0;
+    uint8_t rescale = 0;
 };
 
 static int ComputeInteriorLuxelSpan(float extentWorld, float luxelSize) {
@@ -286,6 +312,112 @@ static void AppendDeviatedLights(const PointLight& baseLight,
         split.position = Vector3Add(baseLight.position, Vector3Scale(RandomPointInUnitSphere(seed), deviance));
         split.color = sampleColor;
         out.push_back(split);
+    }
+}
+
+static AABB ComputeBoundsFromPoints(const std::vector<Vector3>& points) {
+    AABB bounds = AABBInvalid();
+    for (const Vector3& point : points) {
+        AABBExtend(&bounds, point);
+    }
+    if (bounds.min.x > bounds.max.x || bounds.min.y > bounds.max.y || bounds.min.z > bounds.max.z) {
+        bounds.min = Vector3Zero();
+        bounds.max = Vector3Zero();
+    }
+    return bounds;
+}
+
+static Vector3 AveragePoints(const std::vector<Vector3>& points) {
+    if (points.empty()) {
+        return Vector3Zero();
+    }
+
+    Vector3 sum = Vector3Zero();
+    for (const Vector3& point : points) {
+        sum = Vector3Add(sum, point);
+    }
+    return Vector3Scale(sum, 1.0f / (float)points.size());
+}
+
+static float ComputeEmitterSampleIntensityScale(float surfaceArea,
+                                                size_t sampleCount)
+{
+    const float safeArea = std::max(1.0f, surfaceArea);
+    const float safeSampleCount = (float)std::max<size_t>(1, sampleCount);
+    return safeArea / safeSampleCount;
+}
+
+static float EstimateSurfaceEmitterCullRadius(const Vector3& color,
+                                              float surfaceArea,
+                                              float transportScale,
+                                              float attenuationScale,
+                                              float hotspotClamp)
+{
+    const float safeArea = std::max(1.0f, surfaceArea);
+    const float safeScale = std::max(0.0f, transportScale);
+    const float peakColor = std::max(color.x, std::max(color.y, color.z));
+    if (peakColor <= 1e-6f || safeScale <= 0.0f) {
+        return SURFACE_EMITTER_CULL_RADIUS_MIN;
+    }
+    if (attenuationScale <= 1e-6f) {
+        return SURFACE_EMITTER_CULL_RADIUS_MAX;
+    }
+
+    const float rawRadius = sqrtf((peakColor * safeArea * safeScale) /
+                                  std::max(1e-6f, SURFACE_EMITTER_CULL_THRESHOLD * attenuationScale * attenuationScale));
+    return std::clamp(std::max(rawRadius, hotspotClamp),
+                      SURFACE_EMITTER_CULL_RADIUS_MIN,
+                      SURFACE_EMITTER_CULL_RADIUS_MAX);
+}
+
+static float EvaluateSurfaceEmitterDistanceFalloff(const SurfaceLightEmitter& emitter,
+                                                   float dist)
+{
+    const float scaledDist = std::max(emitter.hotspotClamp,
+                                      std::max(0.01f, emitter.attenuationScale * dist));
+    return (emitter.transportScale * emitter.sampleIntensityScale) / (scaledDist * scaledDist);
+}
+
+static Vector3 GrayBounceColor() {
+    return {127.0f / 255.0f, 127.0f / 255.0f, 127.0f / 255.0f};
+}
+
+static Vector3 ComputeTextureBounceColor(const std::string& texture,
+                                         const std::unordered_map<std::string, Vector3>& textureBounceColors,
+                                         float bounceColorScale)
+{
+    const Vector3 gray = GrayBounceColor();
+    auto it = textureBounceColors.find(texture);
+    if (it == textureBounceColors.end()) {
+        return gray;
+    }
+    return LerpVec3(gray, it->second, std::clamp(bounceColorScale, 0.0f, 1.0f));
+}
+
+static void AppendDeviatedSurfaceEmitters(const SurfaceLightEmitter& baseEmitter,
+                                          float deviance,
+                                          int samples,
+                                          int seedSalt,
+                                          std::vector<SurfaceLightEmitter>& out)
+{
+    if (deviance <= 0.0f || samples <= 1) {
+        out.push_back(baseEmitter);
+        return;
+    }
+
+    const int safeSamples = std::max(1, samples);
+    const Vector3 sampleColor = Vector3Scale(baseEmitter.baseLight.color, 1.0f / (float)safeSamples);
+    uint32_t seed = HashLightSeed(baseEmitter.baseLight.position, seedSalt);
+    for (int i = 0; i < safeSamples; ++i) {
+        SurfaceLightEmitter split = baseEmitter;
+        const Vector3 jitter = Vector3Scale(RandomPointInUnitSphere(seed), deviance);
+        for (Vector3& samplePoint : split.samplePoints) {
+            samplePoint = Vector3Add(samplePoint, jitter);
+        }
+        split.baseLight.color = sampleColor;
+        split.baseLight.position = Vector3Add(baseEmitter.baseLight.position, jitter);
+        split.bounds = ComputeBoundsFromPoints(split.samplePoints);
+        out.push_back(std::move(split));
     }
 }
 
@@ -766,9 +898,7 @@ static std::vector<BakePatch> SubdivideLightmappedPolygons(const std::vector<Map
 // --------------------------------------------------------------------------
 //  Occluders
 // --------------------------------------------------------------------------
-struct OccluderSet {
-    std::vector<LightmapComputeOccluderTri> tris;
-};
+using OccluderSet = LightmapTraceScene;
 
 struct SurfaceVisibilityInfo {
     std::vector<uint8_t> hidden;
@@ -791,9 +921,38 @@ struct RepairedSamplePoint {
     Vector3 planePoint{};
     Vector3 samplePoint{};
     uint32_t sourcePolyIndex = 0;
+    Vector3 ownerNormal{};
+    Vector3 ownerAxisU{};
+    Vector3 ownerAxisV{};
 };
 
 static bool InsidePoly2D(const std::vector<Vector2>& poly, float px, float py);
+static float MinDistToPolyEdge2D(const std::vector<Vector2>& poly, float px, float py);
+static Vector3 OffsetPointAlongSurfaceNormal(const Vector3& planePoint,
+                                             const Vector3& faceNormal,
+                                             float offsetDistance);
+static bool TryRepairSampleCandidate(const std::vector<BrushSolid>& solids,
+                                     const Vector3& planePoint,
+                                     const Vector3& faceNormal,
+                                     float offsetDistance,
+                                     RepairedSamplePoint* ioSample);
+
+static void SetRepairedSampleOwnerContext(RepairedSamplePoint* sample,
+                                          uint32_t sourcePolyIndex,
+                                          const Vector3& planePoint,
+                                          const Vector3& ownerNormal,
+                                          const Vector3& ownerAxisU,
+                                          const Vector3& ownerAxisV)
+{
+    if (!sample) {
+        return;
+    }
+    sample->sourcePolyIndex = sourcePolyIndex;
+    sample->planePoint = planePoint;
+    sample->ownerNormal = ownerNormal;
+    sample->ownerAxisU = ownerAxisU;
+    sample->ownerAxisV = ownerAxisV;
+}
 
 static std::vector<BrushSolid> BuildBrushSolids(const std::vector<MapPolygon>& polys) {
     std::vector<BrushSolid> solids;
@@ -1033,9 +1192,108 @@ static std::vector<MapPolygon> FilterVisibleBakePolygons(const std::vector<MapPo
     return visible;
 }
 
+static bool IsLightBrushTextureName(const std::string& name);
+static bool PolygonUsesSurfaceLightTemplate(const MapPolygon& poly,
+                                            const std::vector<SurfaceLightTemplate>& surfaceLights);
+
+static uint32_t HashMaterialName(const std::string& name) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char ch : name) {
+        hash ^= (uint32_t)ch;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static std::string LowercaseTextureName(const std::string& texture) {
+    std::string lowered = texture;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+        return (char)std::tolower(ch);
+    });
+    return lowered;
+}
+
+static std::string TextureBaseNameLower(const std::string& texture) {
+    const std::string lowered = LowercaseTextureName(texture);
+    const size_t slash = lowered.find_last_of('/');
+    return (slash == std::string::npos) ? lowered : lowered.substr(slash + 1);
+}
+
+static bool TextureNameLooksLikeSky(const std::string& texture) {
+    if (texture.empty()) {
+        return false;
+    }
+    const std::string lowered = LowercaseTextureName(texture);
+    return lowered == "sky"
+        || lowered.rfind("sky_", 0) == 0
+        || lowered.find("/sky") != std::string::npos
+        || lowered.find("sky/") != std::string::npos;
+}
+
+static bool TextureNameLooksLikeNonShadowCaster(const std::string& texture) {
+    if (texture.empty()) {
+        return false;
+    }
+    const std::string lowered = LowercaseTextureName(texture);
+    if (!lowered.empty() && lowered[0] == '*') {
+        return true;
+    }
+
+    const std::string base = TextureBaseNameLower(texture);
+    return base == "skip"
+        || base == "hint"
+        || base == "clip"
+        || base == "playerclip"
+        || base == "monsterclip"
+        || base == "fullclip"
+        || base == "weapclip"
+        || base == "origin"
+        || base == "trigger"
+        || base == "nodraw"
+        || base == "caulk"
+        || base == "null"
+        || base == "water"
+        || base == "lava"
+        || base == "slime"
+        || base == "teleport"
+        || base == "areaportal";
+}
+
+static bool PolygonCastsShadowForLighting(const MapPolygon& poly) {
+    if (poly.occluderGroup >= 0) {
+        return false;
+    }
+    if (TextureNameLooksLikeSky(poly.texture)) {
+        return false;
+    }
+    if (TextureNameLooksLikeNonShadowCaster(poly.texture)) {
+        return false;
+    }
+    return true;
+}
+
+static bool PolygonCanEmitBounceForLighting(const MapPolygon& poly,
+                                            const std::vector<SurfaceLightTemplate>& surfaceLights)
+{
+    if (!PolygonCastsShadowForLighting(poly)) {
+        return false;
+    }
+    if (poly.noBounce != 0) {
+        return false;
+    }
+    if (IsLightBrushTextureName(poly.texture)) {
+        return false;
+    }
+    if (PolygonUsesSurfaceLightTemplate(poly, surfaceLights)) {
+        return false;
+    }
+    return true;
+}
+
 static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
     OccluderSet o;
     const SurfaceVisibilityInfo visibility = AnalyzeSurfaceVisibility(polys);
+    int nonShadowCasterCount = 0;
     for (size_t i = 0; i < polys.size(); ++i) {
         if (visibility.emitterOnly[i]) {
             continue;
@@ -1044,14 +1302,20 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
             continue;
         }
         const MapPolygon& p = polys[i];
+        if (!PolygonCastsShadowForLighting(p)) {
+            ++nonShadowCasterCount;
+            continue;
+        }
         for (size_t t = 1; t + 1 < p.verts.size(); ++t) {
-            LightmapComputeOccluderTri tr{};
+            LightmapTraceTri tr{};
             tr.a = p.verts[0];
             tr.b = p.verts[t];
             tr.c = p.verts[t + 1];
             tr.bounds = AABBInvalid();
             tr.occluderGroup = p.occluderGroup;
             tr.sourcePolyIndex = (int)i;
+            tr.flags = TextureNameLooksLikeSky(p.texture) ? LIGHTMAP_TRACE_TRI_SKY : LIGHTMAP_TRACE_TRI_NONE;
+            tr.materialId = (int)(HashMaterialName(p.texture) & 0x7fffffffu);
             AABBExtend(&tr.bounds, tr.a);
             AABBExtend(&tr.bounds, tr.b);
             AABBExtend(&tr.bounds, tr.c);
@@ -1063,6 +1327,9 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
     }
     if (visibility.emitterOnlyCount > 0) {
         printf("[Lightmap] skipped %d light brush faces from occluders.\n", visibility.emitterOnlyCount);
+    }
+    if (nonShadowCasterCount > 0) {
+        printf("[Lightmap] skipped %d non-shadow-casting utility faces from occluders.\n", nonShadowCasterCount);
     }
     return o;
 }
@@ -1129,95 +1396,77 @@ static void BuildComputeRepairSourceGraph(const std::vector<RepairSourcePoly>& r
     }
 }
 
-static bool RayTriDistance(const Vector3& ro, const Vector3& rd,
-                           const LightmapComputeOccluderTri& tr, float tmin, float tmax, float* outT = nullptr)
+static void BuildComputePhongGraph(const std::vector<PhongSourcePoly>& sourcePhongs,
+                                   std::vector<LightmapComputePhongSourcePoly>* outPolys,
+                                   std::vector<LightmapComputePhongNeighbor>* outNeighbors)
 {
-    const float baryEpsilon = RAY_EPS;
-    Vector3 e1 = Vector3Subtract(tr.b, tr.a);
-    Vector3 e2 = Vector3Subtract(tr.c, tr.a);
-    Vector3 p  = Vector3CrossProduct(rd, e2);
-    float det  = Vector3DotProduct(e1, p);
-    if (fabsf(det) < RAY_EPS) return false;
-    float inv = 1.0f / det;
-    Vector3 s = Vector3Subtract(ro, tr.a);
-    float u = Vector3DotProduct(s, p) * inv;      if (u < -baryEpsilon || u > 1.0f + baryEpsilon) return false;
-    Vector3 q = Vector3CrossProduct(s, e1);
-    float v = Vector3DotProduct(rd, q) * inv;     if (v < -baryEpsilon || u + v > 1.0f + baryEpsilon) return false;
-    float t = Vector3DotProduct(e2, q) * inv;
-    if (t <= tmin || t >= tmax) {
-        return false;
+    if (!outPolys || !outNeighbors) {
+        return;
     }
-    if (outT) {
-        *outT = t;
+
+    outPolys->clear();
+    outNeighbors->clear();
+    outPolys->reserve(sourcePhongs.size());
+    for (const PhongSourcePoly& sourcePoly : sourcePhongs) {
+        LightmapComputePhongSourcePoly gpuPoly{};
+        gpuPoly.normal = sourcePoly.normal;
+        gpuPoly.areaWeight = sourcePoly.areaWeight;
+        gpuPoly.enabled = sourcePoly.enabled ? 1 : 0;
+        gpuPoly.firstNeighbor = (int)outNeighbors->size();
+        gpuPoly.neighborCount = (int)sourcePoly.neighbors.size();
+        outPolys->push_back(gpuPoly);
+
+        for (const PhongNeighbor& neighbor : sourcePoly.neighbors) {
+            LightmapComputePhongNeighbor gpuNeighbor{};
+            gpuNeighbor.sourcePolyIndex = (int)neighbor.sourcePolyIndex;
+            gpuNeighbor.edgeA = neighbor.edgeA;
+            gpuNeighbor.edgeB = neighbor.edgeB;
+            gpuNeighbor.normal = neighbor.normal;
+            gpuNeighbor.areaWeight = neighbor.areaWeight;
+            outNeighbors->push_back(gpuNeighbor);
+        }
     }
-    return true;
 }
 
-static bool RayAABB(const Vector3& ro, const Vector3& inv_rd,
-                    const AABB& b, float tmax)
+static void BuildComputeSurfaceEmitterPayload(
+    const std::vector<SurfaceLightEmitter>& surfaceEmitters,
+    std::vector<LightmapComputeSurfaceEmitter>* outEmitters,
+    std::vector<LightmapComputeSurfaceEmitterSample>* outSamples)
 {
-    float t1, t2, tn = 0, tf = tmax;
-    t1 = (b.min.x - ro.x) * inv_rd.x; t2 = (b.max.x - ro.x) * inv_rd.x;
-    tn = std::max(tn, std::min(t1, t2)); tf = std::min(tf, std::max(t1, t2));
-    t1 = (b.min.y - ro.y) * inv_rd.y; t2 = (b.max.y - ro.y) * inv_rd.y;
-    tn = std::max(tn, std::min(t1, t2)); tf = std::min(tf, std::max(t1, t2));
-    t1 = (b.min.z - ro.z) * inv_rd.z; t2 = (b.max.z - ro.z) * inv_rd.z;
-    tn = std::max(tn, std::min(t1, t2)); tf = std::min(tf, std::max(t1, t2));
-    return tf >= tn;
-}
-
-static bool Occluded(const OccluderSet& o, const Vector3& ro,
-                     const Vector3& rd, float minHitT, float dist, int ignoreOccluderGroup, int ignoreSourcePolyIndex = -1)
-{
-    Vector3 inv = {
-        1.0f / (fabsf(rd.x) > RAY_EPS ? rd.x : RAY_EPS),
-        1.0f / (fabsf(rd.y) > RAY_EPS ? rd.y : RAY_EPS),
-        1.0f / (fabsf(rd.z) > RAY_EPS ? rd.z : RAY_EPS)
-    };
-    for (const auto& tri : o.tris) {
-        if ((ignoreOccluderGroup >= 0) && (tri.occluderGroup == ignoreOccluderGroup)) {
-            continue;
-        }
-        if ((ignoreSourcePolyIndex >= 0) && (tri.sourcePolyIndex == ignoreSourcePolyIndex)) {
-            continue;
-        }
-        if (!RayAABB(ro, inv, tri.bounds, dist)) continue;
-        if (RayTriDistance(ro, rd, tri, minHitT, dist)) return true;
+    if (!outEmitters || !outSamples) {
+        return;
     }
-    return false;
-}
 
-static float ClosestHitDistance(const OccluderSet& o,
-                                const Vector3& ro,
-                                const Vector3& rd,
-                                float minHitT,
-                                float dist,
-                                int ignoreOccluderGroup,
-                                int ignoreSourcePolyIndex = -1)
-{
-    Vector3 inv = {
-        1.0f / (fabsf(rd.x) > RAY_EPS ? rd.x : RAY_EPS),
-        1.0f / (fabsf(rd.y) > RAY_EPS ? rd.y : RAY_EPS),
-        1.0f / (fabsf(rd.z) > RAY_EPS ? rd.z : RAY_EPS)
-    };
+    outEmitters->clear();
+    outSamples->clear();
+    outEmitters->reserve(surfaceEmitters.size());
 
-    float closest = dist;
-    for (const auto& tri : o.tris) {
-        if ((ignoreOccluderGroup >= 0) && (tri.occluderGroup == ignoreOccluderGroup)) {
-            continue;
-        }
-        if ((ignoreSourcePolyIndex >= 0) && (tri.sourcePolyIndex == ignoreSourcePolyIndex)) {
-            continue;
-        }
-        if (!RayAABB(ro, inv, tri.bounds, closest)) {
-            continue;
-        }
-        float hitT = 0.0f;
-        if (RayTriDistance(ro, rd, tri, minHitT, closest, &hitT)) {
-            closest = hitT;
+    size_t totalSampleCount = 0;
+    for (const SurfaceLightEmitter& emitter : surfaceEmitters) {
+        totalSampleCount += emitter.samplePoints.size();
+    }
+    outSamples->reserve(totalSampleCount);
+
+    for (const SurfaceLightEmitter& emitter : surfaceEmitters) {
+        LightmapComputeSurfaceEmitter gpuEmitter{};
+        gpuEmitter.baseLight = emitter.baseLight;
+        gpuEmitter.surfaceNormal = emitter.surfaceNormal;
+        gpuEmitter.sampleIntensityScale = emitter.sampleIntensityScale;
+        gpuEmitter.attenuationScale = emitter.attenuationScale;
+        gpuEmitter.transportScale = emitter.transportScale;
+        gpuEmitter.hotspotClamp = emitter.hotspotClamp;
+        gpuEmitter.firstSamplePoint = (int)outSamples->size();
+        gpuEmitter.samplePointCount = (int)emitter.samplePoints.size();
+        gpuEmitter.omnidirectional = emitter.omnidirectional;
+        gpuEmitter.rescale = emitter.rescale;
+        outEmitters->push_back(gpuEmitter);
+
+        for (const Vector3& samplePoint : emitter.samplePoints) {
+            LightmapComputeSurfaceEmitterSample gpuSample{};
+            gpuSample.point = samplePoint;
+            outSamples->push_back(gpuSample);
         }
     }
-    return closest;
 }
 
 // --------------------------------------------------------------------------
@@ -1379,6 +1628,7 @@ struct FaceRect {
     std::vector<Vector2> poly2d;
     AABB bounds{};
     std::vector<uint32_t> lightIndices;
+    std::vector<uint32_t> surfaceEmitterIndices;
     uint32_t page = 0;
     uint32_t sourcePolyIndex = 0;
     float maxU = 0.0f;
@@ -1386,6 +1636,49 @@ struct FaceRect {
     bool computeCompatible = true;
     std::string computeFallbackReason;
 };
+
+static void BuildComputeRectSurfaceEmitterDispatchData(
+    const std::vector<FaceRect>& rects,
+    const std::vector<size_t>& rectIndices,
+    std::vector<LightmapComputeRectSurfaceEmitterRange>* outRanges,
+    std::vector<uint32_t>* outFlattenedEmitterIndices,
+    const std::vector<std::vector<uint32_t>>* emitterIndicesByRect = nullptr)
+{
+    if (!outRanges || !outFlattenedEmitterIndices) {
+        return;
+    }
+
+    outRanges->clear();
+    outFlattenedEmitterIndices->clear();
+    outRanges->reserve(rectIndices.size());
+
+    size_t totalEmitterRefs = 0;
+    for (size_t rectIndex : rectIndices) {
+        if (rectIndex >= rects.size()) {
+            continue;
+        }
+        const std::vector<uint32_t>& emitterIndices = emitterIndicesByRect
+            ? (*emitterIndicesByRect)[rectIndex]
+            : rects[rectIndex].surfaceEmitterIndices;
+        totalEmitterRefs += emitterIndices.size();
+    }
+    outFlattenedEmitterIndices->reserve(totalEmitterRefs);
+
+    for (size_t rectIndex : rectIndices) {
+        LightmapComputeRectSurfaceEmitterRange range{};
+        range.firstEmitterIndex = (int)outFlattenedEmitterIndices->size();
+        if (rectIndex < rects.size()) {
+            const std::vector<uint32_t>& emitterIndices = emitterIndicesByRect
+                ? (*emitterIndicesByRect)[rectIndex]
+                : rects[rectIndex].surfaceEmitterIndices;
+            range.emitterCount = (int)emitterIndices.size();
+            outFlattenedEmitterIndices->insert(outFlattenedEmitterIndices->end(),
+                                               emitterIndices.begin(),
+                                               emitterIndices.end());
+        }
+        outRanges->push_back(range);
+    }
+}
 
 struct LightmapPageLayout {
     int cursorX = 0;
@@ -1406,6 +1699,22 @@ static float DistSqPointAABB(const Vector3& p, const AABB& bounds) {
     float dz = 0.0f;
     if (p.z < bounds.min.z) dz = bounds.min.z - p.z;
     else if (p.z > bounds.max.z) dz = p.z - bounds.max.z;
+
+    return dx * dx + dy * dy + dz * dz;
+}
+
+static float DistSqAABBAABB(const AABB& a, const AABB& b) {
+    float dx = 0.0f;
+    if (a.max.x < b.min.x) dx = b.min.x - a.max.x;
+    else if (b.max.x < a.min.x) dx = a.min.x - b.max.x;
+
+    float dy = 0.0f;
+    if (a.max.y < b.min.y) dy = b.min.y - a.max.y;
+    else if (b.max.y < a.min.y) dy = a.min.y - b.max.y;
+
+    float dz = 0.0f;
+    if (a.max.z < b.min.z) dz = b.min.z - a.max.z;
+    else if (b.max.z < a.min.z) dz = a.min.z - b.max.z;
 
     return dx * dx + dy * dy + dz * dz;
 }
@@ -1874,6 +2183,39 @@ static std::vector<uint8_t> CoverageToValidMask(const std::vector<uint8_t>& cove
     return valid;
 }
 
+static std::vector<uint8_t> BuildStrictInteriorMask(const std::vector<FaceRect>& rects,
+                                                    uint32_t pageIndex,
+                                                    int W,
+                                                    int H)
+{
+    std::vector<uint8_t> strictInterior((size_t)W * (size_t)H, 0);
+    for (const FaceRect& rect : rects) {
+        if (rect.page != pageIndex) {
+            continue;
+        }
+        for (int ly = 0; ly < rect.gpu.h; ++ly) {
+            for (int lx = 0; lx < rect.gpu.w; ++lx) {
+                const float cu = (float)(lx - LM_PAD) + 0.5f;
+                const float cv = (float)(ly - LM_PAD) + 0.5f;
+                if (!InsidePoly2D(rect.poly2d, cu, cv)) {
+                    continue;
+                }
+                if (MinDistToPolyEdge2D(rect.poly2d, cu, cv) < EDGE_SEAM_GUARD_LUXELS) {
+                    continue;
+                }
+
+                const int pageX = rect.gpu.x + lx;
+                const int pageY = rect.gpu.y + ly;
+                if (pageX < 0 || pageY < 0 || pageX >= W || pageY >= H) {
+                    continue;
+                }
+                strictInterior[(size_t)pageY * (size_t)W + (size_t)pageX] = 1;
+            }
+        }
+    }
+    return strictInterior;
+}
+
 static void StabilizeEdgeTexels(LightmapPage& page,
                                 const std::vector<uint8_t>& coverage)
 {
@@ -1967,9 +2309,88 @@ struct StitchedSourceFaceCanvas {
     std::vector<float> pixelsB;
 };
 
+struct OversampledRectBuffer {
+    int width = 0;
+    int height = 0;
+    std::vector<uint8_t> opaque;
+    std::vector<float> pixelsR;
+    std::vector<float> pixelsG;
+    std::vector<float> pixelsB;
+};
+
+static bool GlobalCenterToStitchedIndex(float stitchedMinU,
+                                        float stitchedMinV,
+                                        float stitchedLuxelSize,
+                                        int stitchedWidth,
+                                        int stitchedHeight,
+                                        float globalUCenter,
+                                        float globalVCenter,
+                                        int* outX,
+                                        int* outY)
+{
+    if (!outX || !outY) {
+        return false;
+    }
+
+    int stitchedX = 0;
+    int stitchedY = 0;
+    if (!LocalInteriorIndexFromGlobalCenter(stitchedMinU, stitchedLuxelSize, stitchedWidth, globalUCenter, &stitchedX) ||
+        !LocalInteriorIndexFromGlobalCenter(stitchedMinV, stitchedLuxelSize, stitchedHeight, globalVCenter, &stitchedY)) {
+        return false;
+    }
+
+    *outX = stitchedX;
+    *outY = stitchedY;
+    return true;
+}
+
+static bool InitializeStitchedSourceFaceCanvas(const std::vector<FaceRect>& rects,
+                                               const std::vector<size_t>& rectGroup,
+                                               int sampleScale,
+                                               StitchedSourceFaceCanvas* outCanvas)
+{
+    if (!outCanvas || rectGroup.empty()) {
+        return false;
+    }
+
+    const FaceRect& firstRect = rects[rectGroup.front()];
+    float minU = firstRect.gpu.minU;
+    float minV = firstRect.gpu.minV;
+    float maxU = firstRect.maxU;
+    float maxV = firstRect.maxV;
+    const float baseLuxelSize = std::max(0.125f, firstRect.gpu.luxelSize);
+    for (size_t rectIndex : rectGroup) {
+        const FaceRect& rect = rects[rectIndex];
+        minU = std::min(minU, rect.gpu.minU);
+        minV = std::min(minV, rect.gpu.minV);
+        maxU = std::max(maxU, rect.maxU);
+        maxV = std::max(maxV, rect.maxV);
+    }
+
+    const int safeSampleScale = std::max(1, sampleScale);
+    const int stitchedWidth = ComputeInteriorLuxelSpan(maxU - minU, baseLuxelSize) * safeSampleScale;
+    const int stitchedHeight = ComputeInteriorLuxelSpan(maxV - minV, baseLuxelSize) * safeSampleScale;
+    if (stitchedWidth <= 0 || stitchedHeight <= 0) {
+        return false;
+    }
+
+    const size_t pixelCount = (size_t)stitchedWidth * (size_t)stitchedHeight;
+    outCanvas->minU = minU;
+    outCanvas->minV = minV;
+    outCanvas->luxelSize = baseLuxelSize / (float)safeSampleScale;
+    outCanvas->width = stitchedWidth;
+    outCanvas->height = stitchedHeight;
+    outCanvas->valid.assign(pixelCount, 0);
+    outCanvas->pixelsR.assign(pixelCount, 0.0f);
+    outCanvas->pixelsG.assign(pixelCount, 0.0f);
+    outCanvas->pixelsB.assign(pixelCount, 0.0f);
+    return true;
+}
+
 static bool RectLocalPixelToStitchedIndex(const FaceRect& rect,
                                           float stitchedMinU,
                                           float stitchedMinV,
+                                          float stitchedLuxelSize,
                                           int stitchedWidth,
                                           int stitchedHeight,
                                           int localX,
@@ -1983,16 +2404,47 @@ static bool RectLocalPixelToStitchedIndex(const FaceRect& rect,
 
     const float globalUCenter = rect.gpu.minU + ((float)(localX - LM_PAD) + 0.5f) * rect.gpu.luxelSize;
     const float globalVCenter = rect.gpu.minV + ((float)(localY - LM_PAD) + 0.5f) * rect.gpu.luxelSize;
-    int stitchedX = 0;
-    int stitchedY = 0;
-    if (!LocalInteriorIndexFromGlobalCenter(stitchedMinU, rect.gpu.luxelSize, stitchedWidth, globalUCenter, &stitchedX) ||
-        !LocalInteriorIndexFromGlobalCenter(stitchedMinV, rect.gpu.luxelSize, stitchedHeight, globalVCenter, &stitchedY)) {
+    return GlobalCenterToStitchedIndex(stitchedMinU,
+                                       stitchedMinV,
+                                       stitchedLuxelSize,
+                                       stitchedWidth,
+                                       stitchedHeight,
+                                       globalUCenter,
+                                       globalVCenter,
+                                       outX,
+                                       outY);
+}
+
+static bool RectLocalSubsampleToStitchedIndex(const FaceRect& rect,
+                                              float stitchedMinU,
+                                              float stitchedMinV,
+                                              float stitchedLuxelSize,
+                                              int stitchedWidth,
+                                              int stitchedHeight,
+                                              int localX,
+                                              int localY,
+                                              int subX,
+                                              int subY,
+                                              int sampleScale,
+                                              int* outX,
+                                              int* outY)
+{
+    if (!outX || !outY || sampleScale <= 0) {
         return false;
     }
 
-    *outX = stitchedX;
-    *outY = stitchedY;
-    return true;
+    const float invScale = 1.0f / (float)sampleScale;
+    const float globalUCenter = rect.gpu.minU + ((float)(localX - LM_PAD) + ((float)subX + 0.5f) * invScale) * rect.gpu.luxelSize;
+    const float globalVCenter = rect.gpu.minV + ((float)(localY - LM_PAD) + ((float)subY + 0.5f) * invScale) * rect.gpu.luxelSize;
+    return GlobalCenterToStitchedIndex(stitchedMinU,
+                                       stitchedMinV,
+                                       stitchedLuxelSize,
+                                       stitchedWidth,
+                                       stitchedHeight,
+                                       globalUCenter,
+                                       globalVCenter,
+                                       outX,
+                                       outY);
 }
 
 static std::unordered_map<uint32_t, std::vector<size_t>> GroupRectsBySourcePoly(const std::vector<FaceRect>& rects) {
@@ -2010,41 +2462,11 @@ static bool BuildStitchedSourceFaceCanvas(const std::vector<FaceRect>& rects,
                                           const std::vector<size_t>& rectGroup,
                                           StitchedSourceFaceCanvas* outCanvas)
 {
-    if (!outCanvas || rectGroup.empty()) {
+    if (!InitializeStitchedSourceFaceCanvas(rects, rectGroup, 1, outCanvas)) {
         return false;
     }
 
-    const FaceRect& firstRect = rects[rectGroup.front()];
-    float minU = firstRect.gpu.minU;
-    float minV = firstRect.gpu.minV;
-    float maxU = firstRect.maxU;
-    float maxV = firstRect.maxV;
-    const float luxelSize = std::max(0.125f, firstRect.gpu.luxelSize);
-    for (size_t rectIndex : rectGroup) {
-        const FaceRect& rect = rects[rectIndex];
-        minU = std::min(minU, rect.gpu.minU);
-        minV = std::min(minV, rect.gpu.minV);
-        maxU = std::max(maxU, rect.maxU);
-        maxV = std::max(maxV, rect.maxV);
-    }
-
-    const int stitchedWidth = ComputeInteriorLuxelSpan(maxU - minU, luxelSize);
-    const int stitchedHeight = ComputeInteriorLuxelSpan(maxV - minV, luxelSize);
-    if (stitchedWidth <= 0 || stitchedHeight <= 0) {
-        return false;
-    }
-
-    const size_t pixelCount = (size_t)stitchedWidth * (size_t)stitchedHeight;
-    outCanvas->minU = minU;
-    outCanvas->minV = minV;
-    outCanvas->luxelSize = luxelSize;
-    outCanvas->width = stitchedWidth;
-    outCanvas->height = stitchedHeight;
-    outCanvas->valid.assign(pixelCount, 0);
-    outCanvas->pixelsR.assign(pixelCount, 0.0f);
-    outCanvas->pixelsG.assign(pixelCount, 0.0f);
-    outCanvas->pixelsB.assign(pixelCount, 0.0f);
-
+    const size_t pixelCount = (size_t)outCanvas->width * (size_t)outCanvas->height;
     std::vector<uint16_t> sampleCounts(pixelCount, 0);
     for (size_t rectIndex : rectGroup) {
         const FaceRect& rect = rects[rectIndex];
@@ -2075,10 +2497,11 @@ static bool BuildStitchedSourceFaceCanvas(const std::vector<FaceRect>& rects,
                 int stitchedX = 0;
                 int stitchedY = 0;
                 if (!RectLocalPixelToStitchedIndex(rect,
-                                                   minU,
-                                                   minV,
-                                                   stitchedWidth,
-                                                   stitchedHeight,
+                                                   outCanvas->minU,
+                                                   outCanvas->minV,
+                                                   outCanvas->luxelSize,
+                                                   outCanvas->width,
+                                                   outCanvas->height,
                                                    lx,
                                                    ly,
                                                    &stitchedX,
@@ -2086,7 +2509,7 @@ static bool BuildStitchedSourceFaceCanvas(const std::vector<FaceRect>& rects,
                     continue;
                 }
 
-                const size_t stitchedIndex = (size_t)stitchedY * (size_t)stitchedWidth + (size_t)stitchedX;
+                const size_t stitchedIndex = (size_t)stitchedY * (size_t)outCanvas->width + (size_t)stitchedX;
                 outCanvas->pixelsR[stitchedIndex] += page.pixels[pagePixelIndex * 4 + 0];
                 outCanvas->pixelsG[stitchedIndex] += page.pixels[pagePixelIndex * 4 + 1];
                 outCanvas->pixelsB[stitchedIndex] += page.pixels[pagePixelIndex * 4 + 2];
@@ -2152,6 +2575,7 @@ static void WriteStitchedSourceFaceCanvas(const StitchedSourceFaceCanvas& canvas
                 if (!RectLocalPixelToStitchedIndex(rect,
                                                    canvas.minU,
                                                    canvas.minV,
+                                                   canvas.luxelSize,
                                                    canvas.width,
                                                    canvas.height,
                                                    lx,
@@ -2171,6 +2595,82 @@ static void WriteStitchedSourceFaceCanvas(const StitchedSourceFaceCanvas& canvas
                 page.pixels[pagePixelIndex * 4 + 2] = std::max(0.0f, canvas.pixelsB[stitchedIndex]);
                 page.pixels[pagePixelIndex * 4 + 3] = 1.0f;
             }
+        }
+    }
+}
+
+static void FloodFillTransparentCanvas(int width,
+                                       int height,
+                                       std::vector<uint8_t>& opaque,
+                                       std::vector<float>& pixelsR,
+                                       std::vector<float>& pixelsG,
+                                       std::vector<float>& pixelsB)
+{
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    const size_t pixelCount = (size_t)width * (size_t)height;
+    while (true) {
+        int unhandledPixels = 0;
+        bool changed = false;
+        std::vector<uint8_t> nextOpaque = opaque;
+        std::vector<float> nextR = pixelsR;
+        std::vector<float> nextG = pixelsG;
+        std::vector<float> nextB = pixelsB;
+
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t idx = (size_t)y * (size_t)width + (size_t)x;
+                if (opaque[idx]) {
+                    continue;
+                }
+
+                int opaqueNeighbors = 0;
+                float sumR = 0.0f;
+                float sumG = 0.0f;
+                float sumB = 0.0f;
+                for (int oy = -1; oy <= 1; ++oy) {
+                    for (int ox = -1; ox <= 1; ++ox) {
+                        if (ox == 0 && oy == 0) {
+                            continue;
+                        }
+                        const int nx = x + ox;
+                        const int ny = y + oy;
+                        if (nx < 0 || ny < 0 || nx >= width || ny >= height) {
+                            continue;
+                        }
+                        const size_t ni = (size_t)ny * (size_t)width + (size_t)nx;
+                        if (!opaque[ni]) {
+                            continue;
+                        }
+                        sumR += pixelsR[ni];
+                        sumG += pixelsG[ni];
+                        sumB += pixelsB[ni];
+                        ++opaqueNeighbors;
+                    }
+                }
+
+                if (opaqueNeighbors > 0) {
+                    const float invNeighborCount = 1.0f / (float)opaqueNeighbors;
+                    nextR[idx] = sumR * invNeighborCount;
+                    nextG[idx] = sumG * invNeighborCount;
+                    nextB[idx] = sumB * invNeighborCount;
+                    nextOpaque[idx] = 1;
+                    changed = true;
+                } else {
+                    ++unhandledPixels;
+                }
+            }
+        }
+
+        opaque.swap(nextOpaque);
+        pixelsR.swap(nextR);
+        pixelsG.swap(nextG);
+        pixelsB.swap(nextB);
+
+        if (!changed || unhandledPixels == 0 || unhandledPixels == (int)pixelCount) {
+            break;
         }
     }
 }
@@ -2327,15 +2827,22 @@ struct DarkLuxelStats {
     size_t darkValidCount = 0;
     size_t fullCoverageCount = 0;
     size_t darkFullCoverageCount = 0;
+    size_t strictInteriorCount = 0;
+    size_t darkStrictInteriorCount = 0;
 };
 
 static DarkLuxelStats GatherDarkLuxelStats(const LightmapPage& page,
                                            const std::vector<uint8_t>& valid,
-                                           const std::vector<uint8_t>& coverage)
+                                           const std::vector<uint8_t>& coverage,
+                                           const std::vector<uint8_t>& strictInterior)
 {
     const size_t pixelCount = (size_t)page.width * (size_t)page.height;
     DarkLuxelStats stats;
-    if (valid.size() < pixelCount || coverage.size() < pixelCount || page.pixels.size() < pixelCount * 4) {
+    if (valid.size() < pixelCount ||
+        coverage.size() < pixelCount ||
+        strictInterior.size() < pixelCount ||
+        page.pixels.size() < pixelCount * 4)
+    {
         stats.darkValidCount = 1;
         return stats;
     }
@@ -2361,6 +2868,12 @@ static DarkLuxelStats GatherDarkLuxelStats(const LightmapPage& page,
                 ++stats.darkFullCoverageCount;
             }
         }
+        if (strictInterior[i]) {
+            ++stats.strictInteriorCount;
+            if (dark) {
+                ++stats.darkStrictInteriorCount;
+            }
+        }
     }
     return stats;
 }
@@ -2371,8 +2884,15 @@ static bool HasInvalidDarkValidLuxels(const DarkLuxelStats& stats)
         return false;
     }
 
-    // Full-coverage interior luxels are the reliable signal for a broken GPU bake.
-    if (stats.fullCoverageCount > 0) {
+    // A strict interior mask avoids false positives from aa=1 boundary samples,
+    // where CPU and GPU inside-polygon tests can disagree by one pixel.
+    if (stats.strictInteriorCount > 0) {
+        return stats.darkStrictInteriorCount > 0;
+    }
+
+    // Full-coverage luxels are only a strong fallback signal once super-sampling
+    // is enabled; with aa=1 every valid luxel is "full coverage".
+    if (g_aaGrid > 1 && stats.fullCoverageCount > 0) {
         return stats.darkFullCoverageCount > 0;
     }
 
@@ -2404,6 +2924,38 @@ static std::vector<std::vector<uint32_t>> BuildRectLightIndices(const std::vecto
     return lightIndices;
 }
 
+static std::vector<std::vector<uint32_t>> BuildSurfaceEmitterIndicesByRect(const std::vector<FaceRect>& rects,
+                                                                           const std::vector<SurfaceLightEmitter>& surfaceEmitters)
+{
+    std::vector<std::vector<uint32_t>> emitterIndices(rects.size());
+    for (size_t rectIndex = 0; rectIndex < rects.size(); ++rectIndex) {
+        const FaceRect& rect = rects[rectIndex];
+        std::vector<uint32_t>& rectEmitterIndices = emitterIndices[rectIndex];
+        rectEmitterIndices.reserve(surfaceEmitters.size());
+        for (uint32_t emitterIndex = 0; emitterIndex < surfaceEmitters.size(); ++emitterIndex) {
+            const SurfaceLightEmitter& emitter = surfaceEmitters[emitterIndex];
+            if (IsParallelLight(emitter.baseLight)) {
+                rectEmitterIndices.push_back(emitterIndex);
+                continue;
+            }
+            const float radiusSq = emitter.baseLight.intensity * emitter.baseLight.intensity;
+            if (DistSqAABBAABB(rect.bounds, emitter.bounds) <= radiusSq) {
+                rectEmitterIndices.push_back(emitterIndex);
+            }
+        }
+    }
+    return emitterIndices;
+}
+
+static void BuildRectSurfaceEmitterIndices(std::vector<FaceRect>& rects,
+                                           const std::vector<SurfaceLightEmitter>& surfaceEmitters)
+{
+    const std::vector<std::vector<uint32_t>> emitterIndices = BuildSurfaceEmitterIndicesByRect(rects, surfaceEmitters);
+    for (size_t rectIndex = 0; rectIndex < rects.size(); ++rectIndex) {
+        rects[rectIndex].surfaceEmitterIndices = emitterIndices[rectIndex];
+    }
+}
+
 static std::vector<PointLight> GatherPageLights(const std::vector<FaceRect>& rects,
                                                 uint32_t pageIndex,
                                                 const std::vector<PointLight>& lights,
@@ -2432,6 +2984,38 @@ static std::vector<PointLight> GatherPageLights(const std::vector<FaceRect>& rec
         }
     }
     return pageLights;
+}
+
+static size_t CountPageSurfaceEmitters(const std::vector<FaceRect>& rects,
+                                       uint32_t pageIndex,
+                                       size_t emitterCount,
+                                       const std::vector<std::vector<uint32_t>>* emitterIndicesByRect = nullptr)
+{
+    if (emitterCount == 0) {
+        return 0;
+    }
+
+    std::vector<uint8_t> used(emitterCount, 0);
+    for (size_t rectIndex = 0; rectIndex < rects.size(); ++rectIndex) {
+        const FaceRect& rect = rects[rectIndex];
+        if (rect.page != pageIndex) {
+            continue;
+        }
+        const std::vector<uint32_t>& rectEmitterIndices = emitterIndicesByRect
+            ? (*emitterIndicesByRect)[rectIndex]
+            : rect.surfaceEmitterIndices;
+        for (uint32_t emitterIndex : rectEmitterIndices) {
+            if (emitterIndex < used.size()) {
+                used[emitterIndex] = 1;
+            }
+        }
+    }
+
+    size_t count = 0;
+    for (uint8_t flag : used) {
+        count += (flag != 0);
+    }
+    return count;
 }
 
 static AABB ComputeMapBounds(const std::vector<MapPolygon>& polys) {
@@ -2505,6 +3089,7 @@ static PointLight BuildDirectionalSunLight(const Vector3& toLightDirection,
                                            const Vector3& color,
                                            float angleScale,
                                            int dirtOverride,
+                                           bool requireSkyVisibility,
                                            const Vector3& mapCenter,
                                            float sunDistance)
 {
@@ -2515,26 +3100,23 @@ static PointLight BuildDirectionalSunLight(const Vector3& toLightDirection,
     light.intensity = std::max(1.0f, sunDistance * 2.0f);
     light.parallelDirection = dir;
     light.parallel = 1;
+    light.requiresSkyVisibility = requireSkyVisibility ? 1 : 0;
     light.attenuationMode = POINT_LIGHT_ATTEN_NONE;
     light.angleScale = angleScale;
     light.dirt = (int8_t)dirtOverride;
     return light;
 }
 
-static std::vector<Vector3> GenerateSurfaceEmitterSamples(const MapPolygon& poly,
-                                                          float sampleSpacing,
-                                                          float offsetAlongNormal)
+static std::vector<Vector3> GenerateSurfaceEmitterPlanePoints(const MapPolygon& poly,
+                                                              float sampleSpacing)
 {
     Vector3 axisU{};
     Vector3 axisV{};
     FaceBasis(poly.normal, axisU, axisV);
 
     float minU = 1e30f, maxU = -1e30f, minV = 1e30f, maxV = -1e30f;
-    std::vector<Vector2> poly2d;
-    poly2d.reserve(poly.verts.size());
-    const Vector3 anchor = poly.verts[0];
-    const float anchorU = Vector3DotProduct(anchor, axisU);
-    const float anchorV = Vector3DotProduct(anchor, axisV);
+    std::vector<LocalPolyVert> localPoly;
+    localPoly.reserve(poly.verts.size());
     for (const Vector3& vert : poly.verts) {
         const float u = Vector3DotProduct(vert, axisU);
         const float v = Vector3DotProduct(vert, axisV);
@@ -2542,10 +3124,10 @@ static std::vector<Vector3> GenerateSurfaceEmitterSamples(const MapPolygon& poly
         maxU = std::max(maxU, u);
         minV = std::min(minV, v);
         maxV = std::max(maxV, v);
-        poly2d.push_back({u, v});
+        localPoly.push_back({vert, u, v});
     }
 
-    const float safeSpacing = std::max(16.0f, sampleSpacing);
+    const float safeSpacing = std::max(1.0f, sampleSpacing);
     const float extentU = std::max(0.0f, maxU - minU);
     const float extentV = std::max(0.0f, maxV - minV);
     const int samplesU = std::max(1, std::min(32, (int)ceilf(extentU / safeSpacing)));
@@ -2553,35 +3135,72 @@ static std::vector<Vector3> GenerateSurfaceEmitterSamples(const MapPolygon& poly
     const float stepU = (samplesU > 0) ? (extentU / (float)samplesU) : 0.0f;
     const float stepV = (samplesV > 0) ? (extentV / (float)samplesV) : 0.0f;
 
-    std::vector<Vector3> samples;
-    samples.reserve((size_t)samplesU * (size_t)samplesV);
+    std::vector<Vector3> planePoints;
+    planePoints.reserve((size_t)samplesU * (size_t)samplesV);
     for (int y = 0; y < samplesV; ++y) {
+        const float clipMinV = minV + (float)y * stepV;
+        const float clipMaxV = (y + 1 == samplesV) ? maxV : (clipMinV + stepV);
         for (int x = 0; x < samplesU; ++x) {
-            const float u = minU + ((float)x + 0.5f) * stepU;
-            const float v = minV + ((float)y + 0.5f) * stepV;
-            if (!InsidePoly2D(poly2d, u, v)) {
+            const float clipMinU = minU + (float)x * stepU;
+            const float clipMaxU = (x + 1 == samplesU) ? maxU : (clipMinU + stepU);
+            std::vector<LocalPolyVert> clipped = ClipToRect(localPoly, clipMinU, clipMaxU, clipMinV, clipMaxV);
+            if (clipped.size() < 3 || fabsf(SignedArea2D(clipped)) < 1e-4f) {
                 continue;
             }
-            Vector3 p = anchor;
-            p = Vector3Add(p, Vector3Scale(axisU, u - anchorU));
-            p = Vector3Add(p, Vector3Scale(axisV, v - anchorV));
-            p = Vector3Add(p, Vector3Scale(poly.normal, offsetAlongNormal));
-            samples.push_back(p);
+
+            std::vector<Vector3> clippedVerts;
+            clippedVerts.reserve(clipped.size());
+            for (const LocalPolyVert& vert : clipped) {
+                clippedVerts.push_back(vert.world);
+            }
+            planePoints.push_back(PolygonCentroid(clippedVerts));
         }
     }
 
-    if (samples.empty()) {
-        samples.push_back(Vector3Add(PolygonCentroid(poly.verts), Vector3Scale(poly.normal, offsetAlongNormal)));
+    if (planePoints.empty()) {
+        planePoints.push_back(PolygonCentroid(poly.verts));
+    }
+    return planePoints;
+}
+
+static std::vector<Vector3> GenerateFixedSurfaceEmitterSamples(const MapPolygon& poly,
+                                                               float sampleSpacing,
+                                                               float offsetAlongNormal,
+                                                               const std::vector<BrushSolid>& solids,
+                                                               size_t* outAdjustedCount = nullptr,
+                                                               size_t* outCulledCount = nullptr)
+{
+    if (outAdjustedCount) {
+        *outAdjustedCount = 0;
+    }
+    if (outCulledCount) {
+        *outCulledCount = 0;
+    }
+
+    const std::vector<Vector3> planePoints = GenerateSurfaceEmitterPlanePoints(poly, sampleSpacing);
+    std::vector<Vector3> samples;
+    samples.reserve(planePoints.size());
+    for (const Vector3& planePoint : planePoints) {
+        RepairedSamplePoint candidate{};
+        const Vector3 idealSamplePoint = OffsetPointAlongSurfaceNormal(planePoint, poly.normal, offsetAlongNormal);
+        if (TryRepairSampleCandidate(solids, planePoint, poly.normal, offsetAlongNormal, &candidate)) {
+            if (outAdjustedCount &&
+                Vector3LengthSq(Vector3Subtract(candidate.samplePoint, idealSamplePoint)) > 1e-6f)
+            {
+                ++(*outAdjustedCount);
+            }
+            samples.push_back(candidate.samplePoint);
+        } else if (outCulledCount) {
+            ++(*outCulledCount);
+        }
     }
     return samples;
 }
 
-static std::vector<PointLight> BuildExpandedLights(const std::vector<MapPolygon>& polys,
-                                                   const std::vector<PointLight>& explicitLights,
-                                                   const std::vector<SurfaceLightTemplate>& surfaceLights,
-                                                   const LightBakeSettings& settings,
-                                                   const Vector3& mapCenter,
-                                                   float sunDistance)
+static std::vector<PointLight> BuildDirectPointLights(const std::vector<PointLight>& explicitLights,
+                                                      const LightBakeSettings& settings,
+                                                      const Vector3& mapCenter,
+                                                      float sunDistance)
 {
     std::vector<PointLight> lights = explicitLights;
 
@@ -2589,13 +3208,29 @@ static std::vector<PointLight> BuildExpandedLights(const std::vector<MapPolygon>
         const int sunSamples = (settings.sunlightPenumbra > 0.1f) ? ERICW_SUNSAMPLES : 1;
         const Vector3 sampleColor = Vector3Scale(settings.sunlightColor, settings.sunlightIntensity / (300.0f * (float)sunSamples));
         const int dirtOverride = (settings.sunlightDirt == -2) ? settings.dirt : settings.sunlightDirt;
+        const bool requireSkyVisibility = settings.sunlightNoSky == 0;
         for (int i = 0; i < sunSamples; ++i) {
             const Vector3 toLight = SampleConeDirection(settings.sunlightDirection, settings.sunlightPenumbra, i, sunSamples);
-            lights.push_back(BuildDirectionalSunLight(toLight, sampleColor, settings.sunlightAngleScale, dirtOverride, mapCenter, sunDistance));
+            lights.push_back(BuildDirectionalSunLight(toLight, sampleColor, settings.sunlightAngleScale, dirtOverride, requireSkyVisibility, mapCenter, sunDistance));
         }
     }
 
-    int surfaceTemplateMatches = 0;
+    return lights;
+}
+
+static std::vector<SurfaceLightEmitter> BuildSurfaceEmitters(const std::vector<MapPolygon>& polys,
+                                                             const std::vector<SurfaceLightTemplate>& surfaceLights,
+                                                             const std::vector<BrushSolid>& solids,
+                                                             const LightBakeSettings& settings)
+{
+    std::vector<SurfaceLightEmitter> emitters;
+    if (surfaceLights.empty() || settings.surfLightScale <= 0.0f) {
+        return emitters;
+    }
+    int matchedSurfaceCount = 0;
+    size_t adjustedSampleCount = 0;
+    size_t culledSampleCount = 0;
+    const float sampleSpacing = std::max(1.0f, settings.surfLightSubdivision);
     for (const SurfaceLightTemplate& templ : surfaceLights) {
         for (const MapPolygon& poly : polys) {
             if (poly.texture != templ.texture) {
@@ -2605,31 +3240,81 @@ static std::vector<PointLight> BuildExpandedLights(const std::vector<MapPolygon>
                 continue;
             }
 
-            const std::vector<Vector3> samples = GenerateSurfaceEmitterSamples(poly, 128.0f, std::max(0.0f, templ.surfaceOffset));
-            for (const Vector3& samplePos : samples) {
-                PointLight emitted = templ.light;
-                emitted.position = samplePos;
-                if (templ.surfaceSpotlight) {
-                    emitted.spotDirection = poly.normal;
-                    if (emitted.spotOuterCos <= -1.5f) {
-                        emitted.spotOuterCos = cosf(20.0f * DEG2RAD);
-                        emitted.spotInnerCos = emitted.spotOuterCos;
-                    }
-                }
-                AppendDeviatedLights(emitted, templ.deviance, templ.devianceSamples, ++surfaceTemplateMatches, lights);
+            SurfaceLightEmitter emitter{};
+            emitter.baseLight = templ.light;
+            emitter.surfaceNormal = poly.normal;
+            size_t emitterAdjustedSamples = 0;
+            size_t emitterCulledSamples = 0;
+            emitter.samplePoints = GenerateFixedSurfaceEmitterSamples(
+                poly,
+                sampleSpacing,
+                std::max(0.0f, templ.surfaceOffset),
+                solids,
+                &emitterAdjustedSamples,
+                &emitterCulledSamples);
+            adjustedSampleCount += emitterAdjustedSamples;
+            culledSampleCount += emitterCulledSamples;
+            if (emitter.samplePoints.empty()) {
+                continue;
             }
+            emitter.baseLight.position = AveragePoints(emitter.samplePoints);
+            emitter.surfaceArea = std::max(1.0f, PolygonArea(poly.verts));
+            emitter.sampleIntensityScale = ComputeEmitterSampleIntensityScale(
+                emitter.surfaceArea,
+                emitter.samplePoints.size());
+            emitter.transportScale = settings.surfLightScale;
+            emitter.attenuationScale = (poly.surfLightAttenuation >= 0.0f)
+                ? poly.surfLightAttenuation
+                : settings.surfLightAttenuation;
+            emitter.hotspotClamp = DIRECT_SURFACE_HOTSPOT_CLAMP;
+            emitter.rescale = (poly.surfLightRescale >= 0) ? (uint8_t)poly.surfLightRescale : 1u;
+            emitter.baseLight.intensity = EstimateSurfaceEmitterCullRadius(
+                emitter.baseLight.color,
+                emitter.surfaceArea,
+                emitter.transportScale,
+                emitter.attenuationScale,
+                emitter.hotspotClamp);
+            if (templ.surfaceSpotlight) {
+                emitter.baseLight.spotDirection = poly.normal;
+                if (emitter.baseLight.spotOuterCos <= -1.5f) {
+                    emitter.baseLight.spotOuterCos = cosf(20.0f * DEG2RAD);
+                    emitter.baseLight.spotInnerCos = emitter.baseLight.spotOuterCos;
+                }
+            }
+            emitter.bounds = ComputeBoundsFromPoints(emitter.samplePoints);
+            AppendDeviatedSurfaceEmitters(emitter, templ.deviance, templ.devianceSamples, ++matchedSurfaceCount, emitters);
         }
     }
 
     if (!surfaceLights.empty()) {
-        printf("[Lightmap] expanded %zu surface-light templates into %zu total lights.\n", surfaceLights.size(), lights.size());
+        size_t totalSurfaceSamples = 0;
+        for (const SurfaceLightEmitter& emitter : emitters) {
+            totalSurfaceSamples += emitter.samplePoints.size();
+        }
+        printf("[Lightmap] built %zu grouped surface emitters (%zu samples, %zu adjusted, %zu culled) from %zu surface-light templates.\n",
+               emitters.size(), totalSurfaceSamples, adjustedSampleCount, culledSampleCount, surfaceLights.size());
         fflush(stdout);
     }
-    return lights;
+    return emitters;
 }
 
 static bool IsLightBrushTextureName(const std::string& name) {
     return name.rfind("__light_brush_", 0) == 0;
+}
+
+static bool PolygonUsesSurfaceLightTemplate(const MapPolygon& poly,
+                                            const std::vector<SurfaceLightTemplate>& surfaceLights)
+{
+    for (const SurfaceLightTemplate& templ : surfaceLights) {
+        if (poly.texture != templ.texture) {
+            continue;
+        }
+        if (templ.surfaceLightGroup != 0 && poly.surfaceLightGroup != templ.surfaceLightGroup) {
+            continue;
+        }
+        return true;
+    }
+    return false;
 }
 
 static Vector3 AverageRectLighting(const LightmapPage& page,
@@ -2680,53 +3365,141 @@ static Vector3 AverageRectLighting(const LightmapPage& page,
     return avg;
 }
 
-static std::vector<PointLight> BuildIndirectBounceLights(const std::vector<BakePatch>& patches,
-                                                         const std::vector<FaceRect>& rects,
-                                                         const std::vector<LightmapPage>& pages,
-                                                         const std::vector<std::vector<uint8_t>>& coverageMasks,
-                                                         const Vector3& ambientColor,
-                                                         float bounceScale)
+static Vector3 AverageStitchedSourceFaceLighting(const StitchedSourceFaceCanvas& canvas,
+                                                 const Vector3& ambientColor)
 {
-    std::vector<PointLight> bounceLights;
-    const float emittedScale = INDIRECT_BOUNCE_REFLECTANCE * bounceScale;
-    if (emittedScale <= 0.0f) {
-        return bounceLights;
+    if (canvas.width <= 0 || canvas.height <= 0) {
+        return Vector3Zero();
     }
-    bounceLights.reserve(patches.size());
-    for (size_t i = 0; i < patches.size(); ++i) {
-        const BakePatch& patch = patches[i];
-        const FaceRect& rect = rects[i];
-        if (rect.page >= pages.size() || rect.page >= coverageMasks.size()) {
+
+    const size_t pixelCount = (size_t)canvas.width * (size_t)canvas.height;
+    Vector3 accum = Vector3Zero();
+    size_t validCount = 0;
+    for (size_t i = 0; i < pixelCount; ++i) {
+        if (!canvas.valid[i]) {
             continue;
         }
-        if (IsLightBrushTextureName(patch.poly.texture)) {
+        accum.x += canvas.pixelsR[i];
+        accum.y += canvas.pixelsG[i];
+        accum.z += canvas.pixelsB[i];
+        ++validCount;
+    }
+
+    if (validCount == 0) {
+        return Vector3Zero();
+    }
+
+    const float invCount = 1.0f / (float)validCount;
+    Vector3 avg = {
+        accum.x * invCount,
+        accum.y * invCount,
+        accum.z * invCount
+    };
+    avg.x = std::max(0.0f, avg.x - ambientColor.x);
+    avg.y = std::max(0.0f, avg.y - ambientColor.y);
+    avg.z = std::max(0.0f, avg.z - ambientColor.z);
+    return avg;
+}
+
+static std::vector<SurfaceLightEmitter> BuildIndirectBounceEmitters(const std::vector<MapPolygon>& sourcePolys,
+                                                                    const std::vector<FaceRect>& rects,
+                                                                    const std::vector<LightmapPage>& pages,
+                                                                    const std::vector<std::vector<uint8_t>>& coverageMasks,
+                                                                    const std::vector<SurfaceLightTemplate>& surfaceLights,
+                                                                    const std::unordered_map<std::string, Vector3>& textureBounceColors,
+                                                                    const Vector3& ambientColor,
+                                                                    const std::vector<BrushSolid>& solids,
+                                                                    const LightBakeSettings& settings,
+                                                                    int bounceDepth)
+{
+    std::vector<SurfaceLightEmitter> bounceEmitters;
+    const float emittedScale = INDIRECT_BOUNCE_REFLECTANCE;
+    const float bounceTransportScale = std::max(0.0f, settings.bounceScale * 0.5f);
+    if (emittedScale <= 0.0f || bounceTransportScale <= 0.0f) {
+        return bounceEmitters;
+    }
+    const float sampleSpacing = std::max(1.0f, settings.bounceLightSubdivision);
+    const auto rectsBySourcePoly = GroupRectsBySourcePoly(rects);
+    bounceEmitters.reserve(rectsBySourcePoly.size());
+    size_t adjustedSampleCount = 0;
+    size_t culledSampleCount = 0;
+    for (const auto& [sourcePolyIndex, rectGroup] : rectsBySourcePoly) {
+        if (sourcePolyIndex >= sourcePolys.size()) {
+            continue;
+        }
+        const MapPolygon& sourcePoly = sourcePolys[sourcePolyIndex];
+        if (!PolygonCanEmitBounceForLighting(sourcePoly, surfaceLights)) {
+            continue;
+        }
+        if (rectGroup.empty()) {
             continue;
         }
 
-        const Vector3 avgDirect = AverageRectLighting(pages[rect.page], rect, coverageMasks[rect.page], ambientColor);
+        StitchedSourceFaceCanvas canvas;
+        if (!BuildStitchedSourceFaceCanvas(rects, pages, coverageMasks, rectGroup, &canvas)) {
+            continue;
+        }
+
+        const Vector3 avgDirect = AverageStitchedSourceFaceLighting(canvas, ambientColor);
         const float maxChannel = std::max(avgDirect.x, std::max(avgDirect.y, avgDirect.z));
-        if (maxChannel * emittedScale < INDIRECT_BOUNCE_EMITTER_THRESHOLD) {
+        if (maxChannel * emittedScale * bounceTransportScale < INDIRECT_BOUNCE_EMITTER_THRESHOLD) {
             continue;
         }
 
-        const float area = std::max(1.0f, PolygonArea(patch.poly.verts));
-        const float radius = std::clamp(
-            INDIRECT_BOUNCE_RADIUS_BIAS + sqrtf(area) * INDIRECT_BOUNCE_RADIUS_SCALE,
-            INDIRECT_BOUNCE_RADIUS_MIN,
-            INDIRECT_BOUNCE_RADIUS_MAX);
-
-        PointLight bounce{};
-        bounce.position = Vector3Add(PolygonCentroid(patch.poly.verts), Vector3Scale(patch.poly.normal, 1.0f));
-        bounce.color = Vector3Scale(avgDirect, emittedScale);
-        bounce.intensity = radius;
-        bounce.emissionNormal = patch.poly.normal;
-        bounce.directional = 1;
-        bounce.ignoreOccluderGroup = -1;
-        bounce.attenuationMode = POINT_LIGHT_ATTEN_QUADRATIC;
-        bounce.dirt = -1;
-        bounceLights.push_back(bounce);
+        const float area = std::max(1.0f, PolygonArea(sourcePoly.verts));
+        const Vector3 textureBounceColor = ComputeTextureBounceColor(
+            sourcePoly.texture, textureBounceColors, settings.bounceColorScale);
+        size_t emitterAdjustedSamples = 0;
+        size_t emitterCulledSamples = 0;
+        const std::vector<Vector3> samplePoints = GenerateFixedSurfaceEmitterSamples(
+            sourcePoly,
+            sampleSpacing,
+            INDIRECT_BOUNCE_SURFACE_OFFSET,
+            solids,
+            &emitterAdjustedSamples,
+            &emitterCulledSamples);
+        adjustedSampleCount += emitterAdjustedSamples;
+        culledSampleCount += emitterCulledSamples;
+        if (samplePoints.empty()) {
+            continue;
+        }
+        SurfaceLightEmitter bounce{};
+        bounce.baseLight.position = AveragePoints(samplePoints);
+        bounce.baseLight.color = {
+            avgDirect.x * textureBounceColor.x * emittedScale,
+            avgDirect.y * textureBounceColor.y * emittedScale,
+            avgDirect.z * textureBounceColor.z * emittedScale
+        };
+        bounce.baseLight.emissionNormal = sourcePoly.normal;
+        bounce.baseLight.directional = 1;
+        bounce.baseLight.ignoreOccluderGroup = -1;
+        bounce.baseLight.attenuationMode = POINT_LIGHT_ATTEN_QUADRATIC;
+        bounce.baseLight.dirt = -1;
+        bounce.surfaceNormal = sourcePoly.normal;
+        bounce.samplePoints = samplePoints;
+        bounce.bounds = ComputeBoundsFromPoints(bounce.samplePoints);
+        bounce.sampleIntensityScale = ComputeEmitterSampleIntensityScale(
+            area,
+            bounce.samplePoints.size());
+        bounce.transportScale = bounceTransportScale;
+        bounce.attenuationScale = 1.0f;
+        bounce.hotspotClamp = INDIRECT_SURFACE_HOTSPOT_CLAMP;
+        bounce.baseLight.intensity = EstimateSurfaceEmitterCullRadius(
+            bounce.baseLight.color,
+            area,
+            bounce.transportScale,
+            bounce.attenuationScale,
+            bounce.hotspotClamp);
+        bounce.surfaceArea = area;
+        bounce.bounceDepth = bounceDepth;
+        bounceEmitters.push_back(std::move(bounce));
     }
-    return bounceLights;
+    if (adjustedSampleCount > 0 || culledSampleCount > 0) {
+        printf("[Lightmap] bounce pass %d emitter samples: %zu adjusted, %zu culled.\n",
+               bounceDepth, adjustedSampleCount, culledSampleCount);
+        fflush(stdout);
+    }
+    return bounceEmitters;
 }
 
 static LightmapPage MakeBlankPageLike(const LightmapPage& src) {
@@ -2749,6 +3522,77 @@ static void AddPagePixels(LightmapPage& dst, const LightmapPage& src) {
     }
 }
 
+static float EffectiveOutputRangeScale(const LightBakeSettings& settings)
+{
+    return std::max(0.0f, settings.rangeScale) / 0.5f;
+}
+
+static float EffectiveOutputGamma(const LightBakeSettings& settings)
+{
+    return std::max(0.01f, settings.lightmapGamma);
+}
+
+static void ApplyLightmapOutputConditioning(std::vector<LightmapPage>& pages,
+                                            const std::vector<std::vector<uint8_t>>& validMasks,
+                                            const LightBakeSettings& settings)
+{
+    const float rangeScale = EffectiveOutputRangeScale(settings);
+    const float maxLight = std::max(0.0f, settings.maxLight);
+    const float lightmapGamma = EffectiveOutputGamma(settings);
+    const bool clampMaxLight = maxLight > 0.0f;
+    const bool scaleRange = fabsf(rangeScale - 1.0f) > 1e-6f;
+    const bool applyGamma = fabsf(lightmapGamma - 1.0f) > 1e-6f;
+    if (!clampMaxLight && !scaleRange && !applyGamma) {
+        return;
+    }
+
+    for (size_t pageIndex = 0; pageIndex < pages.size() && pageIndex < validMasks.size(); ++pageIndex) {
+        LightmapPage& page = pages[pageIndex];
+        const std::vector<uint8_t>& valid = validMasks[pageIndex];
+        const size_t pixelCount = (size_t)page.width * (size_t)page.height;
+        if (page.pixels.size() < pixelCount * 4 || valid.size() < pixelCount) {
+            continue;
+        }
+
+        for (size_t pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex) {
+            if (!valid[pixelIndex]) {
+                continue;
+            }
+
+            float r = std::max(0.0f, page.pixels[pixelIndex * 4 + 0]);
+            float g = std::max(0.0f, page.pixels[pixelIndex * 4 + 1]);
+            float b = std::max(0.0f, page.pixels[pixelIndex * 4 + 2]);
+
+            if (clampMaxLight) {
+                const float peak = std::max(r, std::max(g, b));
+                if (peak > maxLight && peak > 1e-6f) {
+                    const float scale = maxLight / peak;
+                    r *= scale;
+                    g *= scale;
+                    b *= scale;
+                }
+            }
+
+            if (scaleRange) {
+                r *= rangeScale;
+                g *= rangeScale;
+                b *= rangeScale;
+            }
+
+            if (applyGamma) {
+                r = powf(std::max(0.0f, r), 1.0f / lightmapGamma);
+                g = powf(std::max(0.0f, g), 1.0f / lightmapGamma);
+                b = powf(std::max(0.0f, b), 1.0f / lightmapGamma);
+            }
+
+            page.pixels[pixelIndex * 4 + 0] = std::max(0.0f, r);
+            page.pixels[pixelIndex * 4 + 1] = std::max(0.0f, g);
+            page.pixels[pixelIndex * 4 + 2] = std::max(0.0f, b);
+            page.pixels[pixelIndex * 4 + 3] = 1.0f;
+        }
+    }
+}
+
 static Vector3 ComputeLuxelPlanePoint(const FaceRect& rect, float ju, float jv) {
     return Vector3Add(
         rect.gpu.origin,
@@ -2756,19 +3600,57 @@ static Vector3 ComputeLuxelPlanePoint(const FaceRect& rect, float ju, float jv) 
                    Vector3Scale(rect.gpu.axisV, jv * rect.gpu.luxelSize)));
 }
 
-static Vector3 OffsetSamplePointOffSurface(const Vector3& planePoint, const Vector3& faceNormal) {
-    return Vector3Add(planePoint, Vector3Scale(Vector3Normalize(faceNormal), SURFACE_SAMPLE_OFFSET));
+static Vector3 OffsetPointAlongSurfaceNormal(const Vector3& planePoint,
+                                             const Vector3& faceNormal,
+                                             float offsetDistance)
+{
+    return Vector3Add(planePoint,
+                      Vector3Scale(Vector3Normalize(faceNormal), offsetDistance));
+}
+
+static Vector3 OffsetSamplePointOffSurface(const Vector3& planePoint,
+                                           const Vector3& faceNormal,
+                                           float offsetDistance) {
+    return OffsetPointAlongSurfaceNormal(planePoint, faceNormal, offsetDistance);
 }
 
 static Vector3 BuildFaceLocalShadowRayOrigin(const Vector3& planePoint,
                                              const Vector3& faceNormal,
                                              const Vector3& dir)
 {
-    (void)dir;
     const Vector3 rayNormal = (Vector3LengthSq(faceNormal) > 1e-8f)
         ? Vector3Normalize(faceNormal)
         : Vector3Zero();
-    return Vector3Add(planePoint, Vector3Scale(rayNormal, DIRECT_SHADOW_ORIGIN_BIAS));
+    return Vector3Add(
+        Vector3Add(planePoint, Vector3Scale(rayNormal, SHADOW_BIAS)),
+        Vector3Scale(dir, SHADOW_BIAS));
+}
+
+static Vector3 BuildSampleShadowRayOrigin(const Vector3& samplePoint,
+                                          const Vector3& sampleNormal,
+                                          const Vector3& dir)
+{
+    Vector3 biasDir = dir;
+    if (Vector3LengthSq(biasDir) <= 1e-8f) {
+        biasDir = sampleNormal;
+    }
+    if (Vector3LengthSq(biasDir) <= 1e-8f) {
+        return samplePoint;
+    }
+    return Vector3Add(samplePoint,
+                      Vector3Scale(Vector3Normalize(biasDir), DIRECT_SHADOW_ORIGIN_BIAS));
+}
+
+static float ComputeEdgeAwareNearHitT(const std::vector<Vector2>& poly2d,
+                                      float ju,
+                                      float jv)
+{
+    const float edgeDistLuxels = MinDistToPolyEdge2D(poly2d, ju, jv);
+    const float edgeFactor = std::clamp(
+        1.0f - edgeDistLuxels / EDGE_SEAM_GUARD_LUXELS,
+        0.0f,
+        1.0f);
+    return OCCLUSION_NEAR_TMIN + EDGE_SEAM_TMIN_BOOST * edgeFactor;
 }
 
 static float ComputeDirtAttenuation(float occlusionRatio, float dirtScale, float dirtGain) {
@@ -2793,13 +3675,16 @@ static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
     for (int i = 0; i < DIRT_RAY_COUNT; ++i) {
         const Vector3 localDir = BuildEricwDirtVector(settings, i, seed);
         const Vector3 dir = Vector3Normalize(TransformToTangentSpace(normal, tangent, bitangent, localDir));
-        const float hitDistance = ClosestHitDistance(
+        const float hitDistance = LightmapTraceClosestHitDistance(
             occ,
             Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS)),
             dir,
-            OCCLUSION_NEAR_TMIN,
-            depth,
-            -1);
+            LightmapTraceQuery{
+                OCCLUSION_NEAR_TMIN,
+                depth,
+                -1,
+                -1
+            });
         accumulatedDistance += std::min(depth, hitDistance);
     }
     const float avgHitDistance = accumulatedDistance / (float)DIRT_RAY_COUNT;
@@ -2809,6 +3694,7 @@ static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
 static bool TryRepairSampleCandidate(const std::vector<BrushSolid>& solids,
                                      const Vector3& planePoint,
                                      const Vector3& faceNormal,
+                                     float offsetDistance,
                                      RepairedSamplePoint* ioSample)
 {
     if (!ioSample) {
@@ -2816,7 +3702,7 @@ static bool TryRepairSampleCandidate(const std::vector<BrushSolid>& solids,
     }
 
     ioSample->planePoint = planePoint;
-    ioSample->samplePoint = OffsetSamplePointOffSurface(planePoint, faceNormal);
+    ioSample->samplePoint = OffsetPointAlongSurfaceNormal(planePoint, faceNormal, offsetDistance);
     if (!PointInsideAnySolid(solids, ioSample->samplePoint, SOLID_REPAIR_EPSILON)) {
         return true;
     }
@@ -2841,6 +3727,44 @@ static bool TryRepairSampleCandidate(const std::vector<BrushSolid>& solids,
     return false;
 }
 
+static void FaceBasisFromNormal(const Vector3& normal, Vector3* axisU, Vector3* axisV) {
+    if (!axisU || !axisV) {
+        return;
+    }
+    FaceBasis(normal, *axisU, *axisV);
+}
+
+static void InitializeRepairOwnerFromSourcePoly(const std::vector<RepairSourcePoly>& repairPolys,
+                                                uint32_t sourcePolyIndex,
+                                                const Vector3& planePoint,
+                                                const Vector3& fallbackNormal,
+                                                RepairedSamplePoint* sample)
+{
+    if (!sample) {
+        return;
+    }
+    if (sourcePolyIndex < repairPolys.size() && Vector3LengthSq(repairPolys[sourcePolyIndex].normal) > 1e-8f) {
+        const RepairSourcePoly& poly = repairPolys[sourcePolyIndex];
+        SetRepairedSampleOwnerContext(sample,
+                                      sourcePolyIndex,
+                                      planePoint,
+                                      poly.normal,
+                                      poly.axisU,
+                                      poly.axisV);
+        return;
+    }
+
+    Vector3 axisU{};
+    Vector3 axisV{};
+    FaceBasisFromNormal(fallbackNormal, &axisU, &axisV);
+    SetRepairedSampleOwnerContext(sample,
+                                  sourcePolyIndex,
+                                  planePoint,
+                                  fallbackNormal,
+                                  axisU,
+                                  axisV);
+}
+
 static bool SourcePolyVisited(const std::vector<uint32_t>& visitedPath, uint32_t sourcePolyIndex) {
     return std::find(visitedPath.begin(), visitedPath.end(), sourcePolyIndex) != visitedPath.end();
 }
@@ -2850,6 +3774,7 @@ static bool TryRecursiveRepairWalk(const std::vector<RepairSourcePoly>& repairPo
                                    uint32_t sourcePolyIndex,
                                    const Vector3& seedPoint,
                                    float luxelSize,
+                                   float sampleOffset,
                                    int depth,
                                    std::vector<uint32_t>& visitedPath,
                                    RepairedSamplePoint* outSample)
@@ -2868,12 +3793,17 @@ static bool TryRecursiveRepairWalk(const std::vector<RepairSourcePoly>& repairPo
         Vector3DotProduct(projected, poly.axisU),
         Vector3DotProduct(projected, poly.axisV)
     };
-    const Vector3 faceSeedPoint = OffsetSamplePointOffSurface(projected, poly.normal);
+    const Vector3 faceSeedPoint = OffsetSamplePointOffSurface(projected, poly.normal, sampleOffset);
     const bool insideFace = InsidePoly2D(poly.poly2d, projectedUv.x, projectedUv.y);
     if (insideFace) {
         RepairedSamplePoint candidate{};
-        candidate.sourcePolyIndex = sourcePolyIndex;
-        if (TryRepairSampleCandidate(solids, projected, poly.normal, &candidate)) {
+        SetRepairedSampleOwnerContext(&candidate,
+                                      sourcePolyIndex,
+                                      projected,
+                                      poly.normal,
+                                      poly.axisU,
+                                      poly.axisV);
+        if (TryRepairSampleCandidate(solids, projected, poly.normal, sampleOffset, &candidate)) {
             *outSample = candidate;
             return true;
         }
@@ -2924,6 +3854,7 @@ static bool TryRecursiveRepairWalk(const std::vector<RepairSourcePoly>& repairPo
                                            candidate.sourcePolyIndex,
                                            faceSeedPoint,
                                            luxelSize,
+                                           sampleOffset,
                                            depth + 1,
                                            visitedPath,
                                            outSample))
@@ -2949,6 +3880,7 @@ static bool TryRecursiveRepairWalk(const std::vector<RepairSourcePoly>& repairPo
                                                neighbor.sourcePolyIndex,
                                                faceSeedPoint,
                                                luxelSize,
+                                               sampleOffset,
                                                depth + 1,
                                                visitedPath,
                                                outSample))
@@ -2968,8 +3900,13 @@ static bool TryRecursiveRepairWalk(const std::vector<RepairSourcePoly>& repairPo
                    Vector3Scale(poly.axisV, snappedUv.y - projectedUv.y)));
     if (Vector3LengthSq(Vector3Subtract(snappedPoint, projected)) <= (luxelSize * luxelSize)) {
         RepairedSamplePoint boundarySample{};
-        boundarySample.sourcePolyIndex = sourcePolyIndex;
-        if (TryRepairSampleCandidate(solids, snappedPoint, poly.normal, &boundarySample)) {
+        SetRepairedSampleOwnerContext(&boundarySample,
+                                      sourcePolyIndex,
+                                      snappedPoint,
+                                      poly.normal,
+                                      poly.axisU,
+                                      poly.axisV);
+        if (TryRepairSampleCandidate(solids, snappedPoint, poly.normal, sampleOffset, &boundarySample)) {
             *outSample = boundarySample;
             return true;
         }
@@ -2982,21 +3919,25 @@ static RepairedSamplePoint RepairSamplePoint(const FaceRect& rect,
                                              const std::vector<RepairSourcePoly>& repairPolys,
                                              const std::vector<BrushSolid>& solids,
                                              const Vector3& planePoint,
-                                             float luxelSize)
+                                             float luxelSize,
+                                             float sampleOffset)
 {
     RepairedSamplePoint repaired{};
-    repaired.sourcePolyIndex = rect.sourcePolyIndex;
-    repaired.planePoint = planePoint;
     const Vector3 baseNormal = (rect.sourcePolyIndex < repairPolys.size() &&
                                 Vector3LengthSq(repairPolys[rect.sourcePolyIndex].normal) > 1e-8f)
         ? repairPolys[rect.sourcePolyIndex].normal
         : rect.gpu.normal;
-    repaired.samplePoint = OffsetSamplePointOffSurface(planePoint, baseNormal);
+    InitializeRepairOwnerFromSourcePoly(repairPolys,
+                                        rect.sourcePolyIndex,
+                                        planePoint,
+                                        baseNormal,
+                                        &repaired);
+    repaired.samplePoint = OffsetSamplePointOffSurface(planePoint, baseNormal, sampleOffset);
     if (!PointInsideAnySolid(solids, repaired.samplePoint, SOLID_REPAIR_EPSILON)) {
         return repaired;
     }
 
-    if (TryRepairSampleCandidate(solids, planePoint, baseNormal, &repaired)) {
+    if (TryRepairSampleCandidate(solids, planePoint, baseNormal, sampleOffset, &repaired)) {
         return repaired;
     }
 
@@ -3010,6 +3951,7 @@ static RepairedSamplePoint RepairSamplePoint(const FaceRect& rect,
                                    rect.sourcePolyIndex,
                                    repaired.samplePoint,
                                    luxelSize,
+                                   sampleOffset,
                                    0,
                                    visitedPath,
                                    &recursivelyRepaired))
@@ -3028,8 +3970,8 @@ static bool SkyDomeUsesDirt(const LightBakeSettings& settings) {
 
 static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
                                           uint32_t sourcePolyIndex,
-                                          const Vector3& planePoint,
-                                          const Vector3& faceNormal,
+                                          const Vector3& visibilityPlanePoint,
+                                          const Vector3& visibilityFaceNormal,
                                           const Vector3& samplePoint,
                                           const Vector3& sampleNormal,
                                           float nearHitT,
@@ -3059,8 +4001,17 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
     for (int i = 0; i < sampleCount; ++i) {
         if (upperPerSample > 0.0f) {
             const Vector3 dir = EricwSkyDomeDirection(true, i, upperRotation);
-            const Vector3 ro = BuildFaceLocalShadowRayOrigin(planePoint, faceNormal, dir);
-            if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1, (int)sourcePolyIndex)) {
+            const Vector3 ro = BuildFaceLocalShadowRayOrigin(visibilityPlanePoint, visibilityFaceNormal, dir);
+            const LightmapTraceQuery skyQuery{
+                nearHitT,
+                skyTraceDistance,
+                -1,
+                (int)sourcePolyIndex
+            };
+            const bool visible = (settings.sunlightNoSky != 0)
+                ? !LightmapTraceOccluded(occ, ro, dir, skyQuery)
+                : (LightmapTraceClosestHit(occ, ro, dir, skyQuery).kind == LIGHTMAP_TRACE_HIT_SKY);
+            if (visible) {
                 const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
                 const float scale = upperPerSample * incidence * dirtScale;
                 contrib = Vector3Add(contrib, Vector3Scale(settings.sunlight2Color, scale));
@@ -3068,8 +4019,17 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
         }
         if (lowerPerSample > 0.0f) {
             const Vector3 dir = EricwSkyDomeDirection(false, i, lowerRotation);
-            const Vector3 ro = BuildFaceLocalShadowRayOrigin(planePoint, faceNormal, dir);
-            if (!Occluded(occ, ro, dir, nearHitT, skyTraceDistance, -1, (int)sourcePolyIndex)) {
+            const Vector3 ro = BuildFaceLocalShadowRayOrigin(visibilityPlanePoint, visibilityFaceNormal, dir);
+            const LightmapTraceQuery skyQuery{
+                nearHitT,
+                skyTraceDistance,
+                -1,
+                (int)sourcePolyIndex
+            };
+            const bool visible = (settings.sunlightNoSky != 0)
+                ? !LightmapTraceOccluded(occ, ro, dir, skyQuery)
+                : (LightmapTraceClosestHit(occ, ro, dir, skyQuery).kind == LIGHTMAP_TRACE_HIT_SKY);
+            if (visible) {
                 const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
                 const float scale = lowerPerSample * incidence * dirtScale;
                 contrib = Vector3Add(contrib, Vector3Scale(settings.sunlight3Color, scale));
@@ -3080,30 +4040,823 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
     return contrib;
 }
 
+static Vector3 ComputeDirectLightContribution(const PointLight& light,
+                                              const Vector3& lightPosition,
+                                              const OccluderSet& occ,
+                                              uint32_t ownerSourcePolyIndex,
+                                              const Vector3& visibilityPlanePoint,
+                                              const Vector3& visibilityFaceNormal,
+                                              const Vector3& samplePoint,
+                                              const Vector3& sampleNormal,
+                                              float nearHitT,
+                                              float dirtOcclusion,
+                                              const LightBakeSettings& settings)
+{
+    Vector3 dir{};
+    float dist = 0.0f;
+    float att = 1.0f;
+    if (IsParallelLight(light)) {
+        dir = Vector3Normalize(light.parallelDirection);
+        dist = std::max(1.0f, light.intensity);
+    } else {
+        const Vector3 toL = Vector3Subtract(lightPosition, visibilityPlanePoint);
+        dist = Vector3Length(toL);
+        if (dist > light.intensity || dist < 1e-3f) {
+            return Vector3Zero();
+        }
+        dir = Vector3Scale(toL, 1.0f / dist);
+        att = EvaluateLightAttenuation(light, dist);
+        if (att <= 0.0f) {
+            return Vector3Zero();
+        }
+    }
+
+    float emit = 1.0f;
+    if (light.directional) {
+        const Vector3 lightToSurface = Vector3Scale(dir, -1.0f);
+        emit = Vector3DotProduct(light.emissionNormal, lightToSurface);
+        if (emit <= 0.0f) {
+            return Vector3Zero();
+        }
+    }
+
+    const float spot = EvaluateSpotlightFactor(light, dir);
+    if (spot <= 0.0f) {
+        return Vector3Zero();
+    }
+
+    const float incidence = EvaluateIncidenceScale(light, Vector3DotProduct(sampleNormal, dir));
+    if (incidence <= 0.0f) {
+        return Vector3Zero();
+    }
+
+    const Vector3 ro = BuildFaceLocalShadowRayOrigin(visibilityPlanePoint, visibilityFaceNormal, dir);
+    const LightmapTraceQuery shadowQuery{
+        nearHitT,
+        std::max(0.0f, dist - (SHADOW_BIAS * 2.0f)),
+        light.ignoreOccluderGroup,
+        (int)ownerSourcePolyIndex
+    };
+    if (light.requiresSkyVisibility != 0) {
+        const LightmapTraceHit hit = LightmapTraceClosestHit(occ, ro, dir, shadowQuery);
+        if (hit.kind != LIGHTMAP_TRACE_HIT_SKY) {
+            return Vector3Zero();
+        }
+    } else if (LightmapTraceOccluded(occ, ro, dir, shadowQuery)) {
+        return Vector3Zero();
+    }
+
+    const float dirt = LightUsesDirt(light, settings)
+        ? ComputeDirtAttenuation(dirtOcclusion, EffectiveLightDirtScale(light, settings), EffectiveLightDirtGain(light, settings))
+        : 1.0f;
+    return Vector3Scale(light.color, emit * spot * incidence * att * dirt);
+}
+
+static Vector3 ComputeSurfaceEmitterContribution(const SurfaceLightEmitter& emitter,
+                                                 const Vector3& emitterSamplePoint,
+                                                 const OccluderSet& occ,
+                                                 uint32_t ownerSourcePolyIndex,
+                                                 const Vector3& samplePoint,
+                                                 const Vector3& sampleNormal,
+                                                 float nearHitT,
+                                                 float dirtOcclusion,
+                                                 const LightBakeSettings& settings)
+{
+    const Vector3 toLight = Vector3Subtract(emitterSamplePoint, samplePoint);
+    const float dist = Vector3Length(toLight);
+    if (dist > emitter.baseLight.intensity || dist < 1e-3f) {
+        return Vector3Zero();
+    }
+
+    const Vector3 dirToLight = Vector3Scale(toLight, 1.0f / dist);
+    const Vector3 lightToSurface = Vector3Scale(dirToLight, -1.0f);
+
+    float geometric = 1.0f;
+    const float receiverDot = Vector3DotProduct(sampleNormal, dirToLight);
+    if (emitter.omnidirectional) {
+        geometric = std::max(0.0f, receiverDot * 0.5f);
+    } else {
+        float emitterDot = Vector3DotProduct(emitter.surfaceNormal, lightToSurface);
+        if (emitterDot < -LIGHT_ANGLE_EPSILON || receiverDot < -LIGHT_ANGLE_EPSILON) {
+            return Vector3Zero();
+        }
+        if (emitter.rescale) {
+            emitterDot = 0.5f + emitterDot * 0.5f;
+            const float rescaledReceiverDot = 0.5f + receiverDot * 0.5f;
+            geometric = std::max(0.0f, emitterDot * rescaledReceiverDot);
+        } else {
+            geometric = std::max(0.0f, emitterDot * receiverDot);
+        }
+    }
+    if (geometric <= 0.0f) {
+        return Vector3Zero();
+    }
+
+    const float spot = EvaluateSpotlightFactor(emitter.baseLight, dirToLight);
+    if (spot <= 0.0f) {
+        return Vector3Zero();
+    }
+
+    const float falloff = EvaluateSurfaceEmitterDistanceFalloff(emitter, dist);
+    if (falloff <= 0.0f) {
+        return Vector3Zero();
+    }
+
+    const float unshadowedScale = geometric * spot * falloff;
+    const float peakUnshadowed = std::max(emitter.baseLight.color.x,
+                                          std::max(emitter.baseLight.color.y, emitter.baseLight.color.z)) * unshadowedScale;
+    if (peakUnshadowed <= SURFACE_EMITTER_TRACE_THRESHOLD) {
+        return Vector3Zero();
+    }
+
+    const Vector3 ro = BuildSampleShadowRayOrigin(samplePoint, sampleNormal, dirToLight);
+    const LightmapTraceQuery shadowQuery{
+        nearHitT,
+        std::max(0.0f, dist - (SHADOW_BIAS * 2.0f)),
+        emitter.baseLight.ignoreOccluderGroup,
+        (int)ownerSourcePolyIndex
+    };
+    if (emitter.baseLight.requiresSkyVisibility != 0) {
+        const LightmapTraceHit hit = LightmapTraceClosestHit(occ, ro, dirToLight, shadowQuery);
+        if (hit.kind != LIGHTMAP_TRACE_HIT_SKY) {
+            return Vector3Zero();
+        }
+    } else if (LightmapTraceOccluded(occ, ro, dirToLight, shadowQuery)) {
+        return Vector3Zero();
+    }
+
+    const float dirt = LightUsesDirt(emitter.baseLight, settings)
+        ? ComputeDirtAttenuation(dirtOcclusion,
+                                 EffectiveLightDirtScale(emitter.baseLight, settings),
+                                 EffectiveLightDirtGain(emitter.baseLight, settings))
+        : 1.0f;
+    return Vector3Scale(emitter.baseLight.color, unshadowedScale * dirt);
+}
+
+enum LightmapCPUOnlyFeature : uint32_t {
+    LIGHTMAP_CPU_ONLY_NONE = 0u,
+    LIGHTMAP_CPU_ONLY_TRACE_HIT_CLASSIFICATION = 1u << 0,
+    LIGHTMAP_CPU_ONLY_REPAIRED_SAMPLE_OWNERSHIP = 1u << 1,
+    LIGHTMAP_CPU_ONLY_SURFACE_EMITTERS = 1u << 2,
+    LIGHTMAP_CPU_ONLY_SAMPLE_POSITION_SEMANTICS = 1u << 3,
+    LIGHTMAP_CPU_ONLY_STITCHED_EXTRA_RESOLVE = 1u << 4,
+};
+
+static uint32_t GatherCPUOnlyLightingFeatures(uint32_t pageIndex,
+                                              const std::vector<FaceRect>& rects,
+                                              const std::vector<PhongSourcePoly>& sourcePhongs,
+                                              const std::vector<PointLight>& pageLights,
+                                              bool usesSurfaceEmitters,
+                                              bool allowHybridSurfaceEmitters,
+                                              const LightBakeSettings& settings)
+{
+    // Later refactor phases can light up bits here as soon as a feature lands on
+    // the CPU reference path before shader parity exists.
+    (void)sourcePhongs;
+    uint32_t features = LIGHTMAP_CPU_ONLY_NONE;
+    if (settings.sunlightNoSky == 0 &&
+        (settings.sunlight2Intensity > 0.0f || settings.sunlight3Intensity > 0.0f)) {
+        features |= LIGHTMAP_CPU_ONLY_TRACE_HIT_CLASSIFICATION;
+    }
+    for (const PointLight& light : pageLights) {
+        if (light.requiresSkyVisibility != 0) {
+            features |= LIGHTMAP_CPU_ONLY_TRACE_HIT_CLASSIFICATION;
+            break;
+        }
+    }
+    bool pageUsesSurfaceEmitters = false;
+    for (const FaceRect& rect : rects) {
+        if (rect.page != pageIndex) {
+            continue;
+        }
+        if (usesSurfaceEmitters && !pageUsesSurfaceEmitters && !rect.surfaceEmitterIndices.empty()) {
+            pageUsesSurfaceEmitters = true;
+        }
+        if (pageUsesSurfaceEmitters) {
+            break;
+        }
+    }
+    if (pageUsesSurfaceEmitters && !allowHybridSurfaceEmitters) {
+        features |= LIGHTMAP_CPU_ONLY_SURFACE_EMITTERS;
+    }
+    return features;
+}
+
 static bool PageUsesCPUOnlyLightingFeatures(uint32_t pageIndex,
                                             const std::vector<FaceRect>& rects,
                                             const std::vector<PhongSourcePoly>& sourcePhongs,
                                             const std::vector<PointLight>& pageLights,
+                                            bool usesSurfaceEmitters,
+                                            bool allowHybridSurfaceEmitters,
                                             const LightBakeSettings& settings,
                                             std::string* reason)
 {
-    (void)pageIndex;
-    (void)rects;
-    (void)sourcePhongs;
-    (void)pageLights;
-    (void)settings;
     if (reason) {
         reason->clear();
     }
+    const uint32_t requiredCpuFeatures = GatherCPUOnlyLightingFeatures(
+        pageIndex, rects, sourcePhongs, pageLights, usesSurfaceEmitters, allowHybridSurfaceEmitters, settings);
+    if ((requiredCpuFeatures & LIGHTMAP_CPU_ONLY_TRACE_HIT_CLASSIFICATION) != 0u) {
+        if (reason) {
+            *reason = "page uses trace-hit classification semantics that the compute baker does not support yet";
+        }
+        return true;
+    }
+    if ((requiredCpuFeatures & LIGHTMAP_CPU_ONLY_SURFACE_EMITTERS) != 0u) {
+        if (reason) {
+            *reason = "page uses surface-emitter lighting that the compute baker does not support yet";
+        }
+        return true;
+    }
     return false;
+}
+
+static void ShadeRectOversampled(const FaceRect& rect,
+                                 const std::vector<PhongSourcePoly>& sourcePhongs,
+                                 const std::vector<RepairSourcePoly>& repairPolys,
+                                 const std::vector<PointLight>& lights,
+                                 const std::vector<SurfaceLightEmitter>* surfaceEmitters,
+                                 const std::vector<uint32_t>& rectLightIndices,
+                                 const std::vector<uint32_t>& rectSurfaceEmitterIndices,
+                                 const OccluderSet& occ,
+                                 const std::vector<BrushSolid>& repairSolids,
+                                 const LightBakeSettings& settings,
+                                 float skyTraceDistance,
+                                 OversampledRectBuffer* outBuffer)
+{
+    if (!outBuffer) {
+        return;
+    }
+
+    const int aaGrid = g_aaGrid;
+    const float invG = 1.0f / (float)aaGrid;
+    const int hiW = rect.gpu.w * aaGrid;
+    const int hiH = rect.gpu.h * aaGrid;
+    const size_t hiPixelCount = (size_t)hiW * (size_t)hiH;
+    outBuffer->width = hiW;
+    outBuffer->height = hiH;
+    outBuffer->opaque.assign(hiPixelCount, 0);
+    outBuffer->pixelsR.assign(hiPixelCount, 0.0f);
+    outBuffer->pixelsG.assign(hiPixelCount, 0.0f);
+    outBuffer->pixelsB.assign(hiPixelCount, 0.0f);
+
+    bool usesDirt = false;
+    for (uint32_t lightIndex : rectLightIndices) {
+        if (lightIndex >= lights.size()) {
+            continue;
+        }
+        if (LightUsesDirt(lights[lightIndex], settings)) {
+            usesDirt = true;
+            break;
+        }
+    }
+    if (!usesDirt && surfaceEmitters) {
+        for (uint32_t emitterIndex : rectSurfaceEmitterIndices) {
+            if (emitterIndex >= surfaceEmitters->size()) {
+                continue;
+            }
+            if (LightUsesDirt((*surfaceEmitters)[emitterIndex].baseLight, settings)) {
+                usesDirt = true;
+                break;
+            }
+        }
+    }
+    usesDirt = usesDirt || SkyDomeUsesDirt(settings);
+
+    for (int ly = 0; ly < rect.gpu.h; ++ly) {
+        for (int lx = 0; lx < rect.gpu.w; ++lx) {
+            for (int sy = 0; sy < aaGrid; ++sy) {
+                for (int sx = 0; sx < aaGrid; ++sx) {
+                    const float ju = (lx - LM_PAD) + (sx + 0.5f) * invG;
+                    const float jv = (ly - LM_PAD) + (sy + 0.5f) * invG;
+                    if (!InsidePoly2D(rect.poly2d, ju, jv)) {
+                        continue;
+                    }
+
+                    const Vector3 planePoint = ComputeLuxelPlanePoint(rect, ju, jv);
+                    const RepairedSamplePoint repairedSample = RepairSamplePoint(
+                        rect, repairPolys, repairSolids, planePoint, rect.gpu.luxelSize, settings.surfaceSampleOffset);
+                    const Vector3 faceSamplePoint = OffsetSamplePointOffSurface(
+                        planePoint, rect.gpu.normal, settings.surfaceSampleOffset);
+                    const bool faceSampleInsideSolid = PointInsideAnySolid(repairSolids, faceSamplePoint, SOLID_REPAIR_EPSILON);
+                    const uint32_t ownerSourcePolyIndex = faceSampleInsideSolid ? repairedSample.sourcePolyIndex : rect.sourcePolyIndex;
+                    const Vector3 ownerPlanePoint = faceSampleInsideSolid ? repairedSample.planePoint : planePoint;
+                    const Vector3 ownerNormal = (faceSampleInsideSolid && Vector3LengthSq(repairedSample.ownerNormal) > 1e-8f)
+                        ? repairedSample.ownerNormal
+                        : rect.gpu.normal;
+                    const Vector3 samplePoint = faceSampleInsideSolid ? repairedSample.samplePoint : faceSamplePoint;
+                    Vector3 sampleNormal = EvaluatePhongNormal(sourcePhongs, ownerSourcePolyIndex, ownerPlanePoint, rect.gpu.luxelSize);
+                    if (Vector3LengthSq(sampleNormal) <= 1e-8f) {
+                        sampleNormal = ownerNormal;
+                    }
+                    const float nearHitT = ComputeEdgeAwareNearHitT(rect.poly2d, ju, jv);
+
+                    float cr = settings.ambientColor.x;
+                    float cg = settings.ambientColor.y;
+                    float cb = settings.ambientColor.z;
+                    const float dirtOcclusion = usesDirt
+                        ? ComputeDirtOcclusionRatio(occ, samplePoint, sampleNormal, settings)
+                        : 0.0f;
+                    for (uint32_t lightIndex : rectLightIndices) {
+                        if (lightIndex >= lights.size()) {
+                            continue;
+                        }
+                        const PointLight& light = lights[lightIndex];
+                        const Vector3 contrib = ComputeDirectLightContribution(
+                            light,
+                            light.position,
+                            occ,
+                            ownerSourcePolyIndex,
+                            ownerPlanePoint,
+                            ownerNormal,
+                            samplePoint,
+                            sampleNormal,
+                            nearHitT,
+                            dirtOcclusion,
+                            settings);
+                        cr += contrib.x;
+                        cg += contrib.y;
+                        cb += contrib.z;
+                    }
+                    if (surfaceEmitters) {
+                        for (uint32_t emitterIndex : rectSurfaceEmitterIndices) {
+                            if (emitterIndex >= surfaceEmitters->size()) {
+                                continue;
+                            }
+                            const SurfaceLightEmitter& emitter = (*surfaceEmitters)[emitterIndex];
+                            for (const Vector3& emitterSamplePoint : emitter.samplePoints) {
+                                const Vector3 contrib = ComputeSurfaceEmitterContribution(
+                                    emitter,
+                                    emitterSamplePoint,
+                                    occ,
+                                    ownerSourcePolyIndex,
+                                    samplePoint,
+                                    sampleNormal,
+                                    nearHitT,
+                                    dirtOcclusion,
+                                    settings);
+                                cr += contrib.x;
+                                cg += contrib.y;
+                                cb += contrib.z;
+                            }
+                        }
+                    }
+                    const Vector3 skyContrib = ComputeSkyDomeContribution(
+                        occ, ownerSourcePolyIndex, ownerPlanePoint, ownerNormal, samplePoint, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
+                    cr += skyContrib.x;
+                    cg += skyContrib.y;
+                    cb += skyContrib.z;
+
+                    const int hiX = lx * aaGrid + sx;
+                    const int hiY = ly * aaGrid + sy;
+                    const size_t hiIndex = (size_t)hiY * (size_t)hiW + (size_t)hiX;
+                    outBuffer->opaque[hiIndex] = 1;
+                    outBuffer->pixelsR[hiIndex] = std::max(0.0f, cr);
+                    outBuffer->pixelsG[hiIndex] = std::max(0.0f, cg);
+                    outBuffer->pixelsB[hiIndex] = std::max(0.0f, cb);
+                }
+            }
+        }
+    }
+}
+
+static void ResolveOversampledBufferToPage(const FaceRect& rect,
+                                           const OversampledRectBuffer& buffer,
+                                           LightmapPage& page)
+{
+    const int W = page.width;
+    const int aaGrid = g_aaGrid;
+    for (int ly = 0; ly < rect.gpu.h; ++ly) {
+        for (int lx = 0; lx < rect.gpu.w; ++lx) {
+            float sumR = 0.0f;
+            float sumG = 0.0f;
+            float sumB = 0.0f;
+            int opaqueCount = 0;
+            float sumRIgnoringCoverage = 0.0f;
+            float sumGIgnoringCoverage = 0.0f;
+            float sumBIgnoringCoverage = 0.0f;
+            int totalCount = 0;
+
+            for (int sy = 0; sy < aaGrid; ++sy) {
+                for (int sx = 0; sx < aaGrid; ++sx) {
+                    const int hiX = lx * aaGrid + sx;
+                    const int hiY = ly * aaGrid + sy;
+                    const size_t hiIndex = (size_t)hiY * (size_t)buffer.width + (size_t)hiX;
+                    if (hiIndex >= buffer.opaque.size() ||
+                        hiIndex >= buffer.pixelsR.size() ||
+                        hiIndex >= buffer.pixelsG.size() ||
+                        hiIndex >= buffer.pixelsB.size()) {
+                        continue;
+                    }
+                    sumRIgnoringCoverage += buffer.pixelsR[hiIndex];
+                    sumGIgnoringCoverage += buffer.pixelsG[hiIndex];
+                    sumBIgnoringCoverage += buffer.pixelsB[hiIndex];
+                    ++totalCount;
+                    if (!buffer.opaque[hiIndex]) {
+                        continue;
+                    }
+                    sumR += buffer.pixelsR[hiIndex];
+                    sumG += buffer.pixelsG[hiIndex];
+                    sumB += buffer.pixelsB[hiIndex];
+                    ++opaqueCount;
+                }
+            }
+
+            float outR = 0.0f;
+            float outG = 0.0f;
+            float outB = 0.0f;
+            if (opaqueCount > 0) {
+                const float invCount = 1.0f / (float)opaqueCount;
+                outR = sumR * invCount;
+                outG = sumG * invCount;
+                outB = sumB * invCount;
+            } else if (totalCount > 0) {
+                const float invCount = 1.0f / (float)totalCount;
+                outR = sumRIgnoringCoverage * invCount;
+                outG = sumGIgnoringCoverage * invCount;
+                outB = sumBIgnoringCoverage * invCount;
+            }
+
+            const size_t off = ((size_t)(rect.gpu.y + ly) * (size_t)W + (size_t)(rect.gpu.x + lx)) * 4;
+            if (off + 3 >= page.pixels.size()) {
+                continue;
+            }
+            page.pixels[off + 0] = std::max(0.0f, outR);
+            page.pixels[off + 1] = std::max(0.0f, outG);
+            page.pixels[off + 2] = std::max(0.0f, outB);
+            page.pixels[off + 3] = 1.0f;
+        }
+    }
+}
+
+static bool ResolveStitchedOversampledCanvas(const StitchedSourceFaceCanvas& hiCanvas,
+                                             int sampleScale,
+                                             StitchedSourceFaceCanvas* outCanvas)
+{
+    if (!outCanvas || sampleScale <= 0 || hiCanvas.width <= 0 || hiCanvas.height <= 0) {
+        return false;
+    }
+
+    if ((hiCanvas.width % sampleScale) != 0 || (hiCanvas.height % sampleScale) != 0) {
+        return false;
+    }
+
+    const int lowWidth = hiCanvas.width / sampleScale;
+    const int lowHeight = hiCanvas.height / sampleScale;
+    if (lowWidth <= 0 || lowHeight <= 0) {
+        return false;
+    }
+
+    const size_t lowPixelCount = (size_t)lowWidth * (size_t)lowHeight;
+    outCanvas->minU = hiCanvas.minU;
+    outCanvas->minV = hiCanvas.minV;
+    outCanvas->luxelSize = hiCanvas.luxelSize * (float)sampleScale;
+    outCanvas->width = lowWidth;
+    outCanvas->height = lowHeight;
+    outCanvas->valid.assign(lowPixelCount, 0);
+    outCanvas->pixelsR.assign(lowPixelCount, 0.0f);
+    outCanvas->pixelsG.assign(lowPixelCount, 0.0f);
+    outCanvas->pixelsB.assign(lowPixelCount, 0.0f);
+
+    bool anyResolved = false;
+    for (int y = 0; y < lowHeight; ++y) {
+        for (int x = 0; x < lowWidth; ++x) {
+            float sumR = 0.0f;
+            float sumG = 0.0f;
+            float sumB = 0.0f;
+            int opaqueCount = 0;
+            float sumRIgnoringCoverage = 0.0f;
+            float sumGIgnoringCoverage = 0.0f;
+            float sumBIgnoringCoverage = 0.0f;
+            int totalCount = 0;
+
+            for (int sy = 0; sy < sampleScale; ++sy) {
+                for (int sx = 0; sx < sampleScale; ++sx) {
+                    const int hiX = x * sampleScale + sx;
+                    const int hiY = y * sampleScale + sy;
+                    const size_t hiIndex = (size_t)hiY * (size_t)hiCanvas.width + (size_t)hiX;
+                    if (hiIndex >= hiCanvas.valid.size() ||
+                        hiIndex >= hiCanvas.pixelsR.size() ||
+                        hiIndex >= hiCanvas.pixelsG.size() ||
+                        hiIndex >= hiCanvas.pixelsB.size()) {
+                        continue;
+                    }
+                    sumRIgnoringCoverage += hiCanvas.pixelsR[hiIndex];
+                    sumGIgnoringCoverage += hiCanvas.pixelsG[hiIndex];
+                    sumBIgnoringCoverage += hiCanvas.pixelsB[hiIndex];
+                    ++totalCount;
+                    if (!hiCanvas.valid[hiIndex]) {
+                        continue;
+                    }
+                    sumR += hiCanvas.pixelsR[hiIndex];
+                    sumG += hiCanvas.pixelsG[hiIndex];
+                    sumB += hiCanvas.pixelsB[hiIndex];
+                    ++opaqueCount;
+                }
+            }
+
+            const size_t lowIndex = (size_t)y * (size_t)lowWidth + (size_t)x;
+            if (opaqueCount > 0) {
+                const float invCount = 1.0f / (float)opaqueCount;
+                outCanvas->pixelsR[lowIndex] = std::max(0.0f, sumR * invCount);
+                outCanvas->pixelsG[lowIndex] = std::max(0.0f, sumG * invCount);
+                outCanvas->pixelsB[lowIndex] = std::max(0.0f, sumB * invCount);
+                outCanvas->valid[lowIndex] = 1;
+                anyResolved = true;
+            } else if (totalCount > 0) {
+                const float invCount = 1.0f / (float)totalCount;
+                outCanvas->pixelsR[lowIndex] = std::max(0.0f, sumRIgnoringCoverage * invCount);
+                outCanvas->pixelsG[lowIndex] = std::max(0.0f, sumGIgnoringCoverage * invCount);
+                outCanvas->pixelsB[lowIndex] = std::max(0.0f, sumBIgnoringCoverage * invCount);
+            }
+        }
+    }
+    return anyResolved;
+}
+
+static bool BuildComputeOversampledGroupRects(const std::vector<FaceRect>& rects,
+                                              const std::vector<size_t>& rectGroup,
+                                              const StitchedSourceFaceCanvas& hiCanvas,
+                                              std::vector<LightmapComputeFaceRect>* outRects,
+                                              std::vector<size_t>* outRectIndices = nullptr)
+{
+    if (!outRects) {
+        return false;
+    }
+
+    outRects->clear();
+    if (outRectIndices) {
+        outRectIndices->clear();
+        outRectIndices->reserve(rectGroup.size());
+    }
+    outRects->reserve(rectGroup.size());
+    for (size_t rectIndex : rectGroup) {
+        if (rectIndex >= rects.size()) {
+            continue;
+        }
+
+        const FaceRect& rect = rects[rectIndex];
+        const int interiorW = InteriorSpanX(rect);
+        const int interiorH = InteriorSpanY(rect);
+        if (interiorW <= 0 || interiorH <= 0) {
+            continue;
+        }
+
+        int hiX = 0;
+        int hiY = 0;
+        if (!GlobalCenterToStitchedIndex(hiCanvas.minU,
+                                         hiCanvas.minV,
+                                         hiCanvas.luxelSize,
+                                         hiCanvas.width,
+                                         hiCanvas.height,
+                                         rect.gpu.minU + hiCanvas.luxelSize * 0.5f,
+                                         rect.gpu.minV + hiCanvas.luxelSize * 0.5f,
+                                         &hiX,
+                                         &hiY)) {
+            return false;
+        }
+
+        LightmapComputeFaceRect gpuRect = rect.gpu;
+        gpuRect.x = hiX;
+        gpuRect.y = hiY;
+        gpuRect.w = interiorW * g_aaGrid;
+        gpuRect.h = interiorH * g_aaGrid;
+        outRects->push_back(gpuRect);
+        if (outRectIndices) {
+            outRectIndices->push_back(rectIndex);
+        }
+    }
+
+    return !outRects->empty();
+}
+
+static bool BakeLightmapComputeStitchedExtra(const std::vector<FaceRect>& rects,
+                                             const std::vector<std::vector<uint8_t>>& validMasks,
+                                             const std::vector<LightmapComputeOccluderTri>& computeOccluders,
+                                             const std::vector<LightmapComputeBrushSolid>& computeBrushSolids,
+                                             const std::vector<LightmapComputeSolidPlane>& computeSolidPlanes,
+                                             const std::vector<LightmapComputeRepairSourcePoly>& computeRepairSourcePolys,
+                                             const std::vector<LightmapComputeRepairSourceNeighbor>& computeRepairSourceNeighbors,
+                                             const std::vector<LightmapComputePhongSourcePoly>& computePhongSourcePolys,
+                                             const std::vector<LightmapComputePhongNeighbor>& computePhongNeighbors,
+                                             const std::vector<PointLight>& lights,
+                                             const std::vector<LightmapComputeSurfaceEmitter>& surfaceEmitters,
+                                             const std::vector<LightmapComputeSurfaceEmitterSample>& surfaceEmitterSamples,
+                                             const LightBakeSettings& settings,
+                                             float skyTraceDistance,
+                                             std::vector<LightmapPage>& pages,
+                                             std::string* error)
+{
+    if (g_aaGrid <= 1) {
+        return true;
+    }
+
+    const auto rectsBySourcePoly = GroupRectsBySourcePoly(rects);
+    for (const auto& [sourcePolyIndex, rectGroup] : rectsBySourcePoly) {
+        (void)sourcePolyIndex;
+        StitchedSourceFaceCanvas hiCanvas;
+        if (!InitializeStitchedSourceFaceCanvas(rects, rectGroup, g_aaGrid, &hiCanvas)) {
+            continue;
+        }
+
+        std::vector<LightmapComputeFaceRect> hiRects;
+        std::vector<size_t> hiRectIndices;
+        if (!BuildComputeOversampledGroupRects(rects, rectGroup, hiCanvas, &hiRects, &hiRectIndices)) {
+            if (error) {
+                *error = "failed to build oversampled compute rects for a stitched source face";
+            }
+            return false;
+        }
+
+        std::vector<LightmapComputeRectSurfaceEmitterRange> hiRectSurfaceEmitterRanges;
+        std::vector<uint32_t> hiRectSurfaceEmitterIndices;
+        BuildComputeRectSurfaceEmitterDispatchData(rects,
+                                                  hiRectIndices,
+                                                  &hiRectSurfaceEmitterRanges,
+                                                  &hiRectSurfaceEmitterIndices);
+
+        std::vector<float> hiPixels;
+        if (!BakeLightmapCompute(hiRects,
+                                 computeOccluders,
+                                 computeBrushSolids,
+                                 computeSolidPlanes,
+                                 computeRepairSourcePolys,
+                                 computeRepairSourceNeighbors,
+                                 computePhongSourcePolys,
+                                 computePhongNeighbors,
+                                 lights,
+                                 surfaceEmitters,
+                                 surfaceEmitterSamples,
+                                 hiRectSurfaceEmitterRanges,
+                                 hiRectSurfaceEmitterIndices,
+                                 settings,
+                                 skyTraceDistance,
+                                 hiCanvas.width,
+                                 hiCanvas.height,
+                                 true,
+                                 hiPixels,
+                                 error)) {
+            return false;
+        }
+
+        const size_t hiPixelCount = (size_t)hiCanvas.width * (size_t)hiCanvas.height;
+        if (hiPixels.size() < hiPixelCount * 4) {
+            if (error) {
+                *error = "compute oversampled output buffer was smaller than expected";
+            }
+            return false;
+        }
+        for (size_t i = 0; i < hiPixelCount; ++i) {
+            hiCanvas.pixelsR[i] = std::max(0.0f, hiPixels[i * 4 + 0]);
+            hiCanvas.pixelsG[i] = std::max(0.0f, hiPixels[i * 4 + 1]);
+            hiCanvas.pixelsB[i] = std::max(0.0f, hiPixels[i * 4 + 2]);
+            hiCanvas.valid[i] = (hiPixels[i * 4 + 3] > 0.5f) ? 1 : 0;
+        }
+
+        FloodFillTransparentCanvas(hiCanvas.width, hiCanvas.height, hiCanvas.valid, hiCanvas.pixelsR, hiCanvas.pixelsG, hiCanvas.pixelsB);
+
+        StitchedSourceFaceCanvas lowCanvas;
+        if (!ResolveStitchedOversampledCanvas(hiCanvas, g_aaGrid, &lowCanvas)) {
+            continue;
+        }
+        WriteStitchedSourceFaceCanvas(lowCanvas, rects, validMasks, rectGroup, pages);
+    }
+
+    return true;
+}
+
+static void BakeLightmapCPUStitchedExtra(const std::vector<PhongSourcePoly>& sourcePhongs,
+                                         const std::vector<RepairSourcePoly>& repairPolys,
+                                         const std::vector<PointLight>& lights,
+                                         const std::vector<SurfaceLightEmitter>* surfaceEmitters,
+                                         const std::vector<FaceRect>& rects,
+                                         const std::vector<std::vector<uint32_t>>* lightIndicesByRect,
+                                         const std::vector<std::vector<uint32_t>>* surfaceEmitterIndicesByRect,
+                                         const std::vector<std::vector<uint8_t>>& validMasks,
+                                         const OccluderSet& occ,
+                                         const std::vector<BrushSolid>& repairSolids,
+                                         const LightBakeSettings& settings,
+                                         float skyTraceDistance,
+                                         std::vector<LightmapPage>& pages)
+{
+    if (g_aaGrid <= 1) {
+        return;
+    }
+
+    static const std::vector<uint32_t> kEmptyLightIndices;
+    const auto rectsBySourcePoly = GroupRectsBySourcePoly(rects);
+    for (const auto& [sourcePolyIndex, rectGroup] : rectsBySourcePoly) {
+        (void)sourcePolyIndex;
+        StitchedSourceFaceCanvas hiCanvas;
+        if (!InitializeStitchedSourceFaceCanvas(rects, rectGroup, g_aaGrid, &hiCanvas)) {
+            continue;
+        }
+
+        const size_t hiPixelCount = (size_t)hiCanvas.width * (size_t)hiCanvas.height;
+        std::vector<uint16_t> sampleCounts(hiPixelCount, 0);
+        for (size_t rectIndex : rectGroup) {
+            if (rectIndex >= rects.size()) {
+                continue;
+            }
+            const FaceRect& rect = rects[rectIndex];
+            const std::vector<uint32_t>& rectLightIndices = lights.empty()
+                ? kEmptyLightIndices
+                : (lightIndicesByRect ? (*lightIndicesByRect)[rectIndex] : rect.lightIndices);
+            const std::vector<uint32_t>& rectSurfaceEmitterIndices = surfaceEmitterIndicesByRect
+                ? (*surfaceEmitterIndicesByRect)[rectIndex]
+                : rect.surfaceEmitterIndices;
+
+            OversampledRectBuffer rectBuffer;
+            ShadeRectOversampled(rect,
+                                 sourcePhongs,
+                                 repairPolys,
+                                 lights,
+                                 surfaceEmitters,
+                                 rectLightIndices,
+                                 rectSurfaceEmitterIndices,
+                                 occ,
+                                 repairSolids,
+                                 settings,
+                                 skyTraceDistance,
+                                 &rectBuffer);
+
+            for (int ly = 0; ly < rect.gpu.h; ++ly) {
+                for (int lx = 0; lx < rect.gpu.w; ++lx) {
+                    for (int sy = 0; sy < g_aaGrid; ++sy) {
+                        for (int sx = 0; sx < g_aaGrid; ++sx) {
+                            const int hiX = lx * g_aaGrid + sx;
+                            const int hiY = ly * g_aaGrid + sy;
+                            const size_t rectHiIndex = (size_t)hiY * (size_t)rectBuffer.width + (size_t)hiX;
+                            if (rectHiIndex >= rectBuffer.opaque.size() || !rectBuffer.opaque[rectHiIndex]) {
+                                continue;
+                            }
+
+                            int stitchedX = 0;
+                            int stitchedY = 0;
+                            if (!RectLocalSubsampleToStitchedIndex(rect,
+                                                                   hiCanvas.minU,
+                                                                   hiCanvas.minV,
+                                                                   hiCanvas.luxelSize,
+                                                                   hiCanvas.width,
+                                                                   hiCanvas.height,
+                                                                   lx,
+                                                                   ly,
+                                                                   sx,
+                                                                   sy,
+                                                                   g_aaGrid,
+                                                                   &stitchedX,
+                                                                   &stitchedY)) {
+                                continue;
+                            }
+
+                            const size_t stitchedIndex = (size_t)stitchedY * (size_t)hiCanvas.width + (size_t)stitchedX;
+                            if (stitchedIndex >= hiPixelCount) {
+                                continue;
+                            }
+                            hiCanvas.pixelsR[stitchedIndex] += rectBuffer.pixelsR[rectHiIndex];
+                            hiCanvas.pixelsG[stitchedIndex] += rectBuffer.pixelsG[rectHiIndex];
+                            hiCanvas.pixelsB[stitchedIndex] += rectBuffer.pixelsB[rectHiIndex];
+                            sampleCounts[stitchedIndex] += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        bool anyValid = false;
+        for (size_t i = 0; i < hiPixelCount; ++i) {
+            if (sampleCounts[i] == 0) {
+                continue;
+            }
+            const float invCount = 1.0f / (float)sampleCounts[i];
+            hiCanvas.pixelsR[i] *= invCount;
+            hiCanvas.pixelsG[i] *= invCount;
+            hiCanvas.pixelsB[i] *= invCount;
+            hiCanvas.valid[i] = 1;
+            anyValid = true;
+        }
+        if (!anyValid) {
+            continue;
+        }
+
+        FloodFillTransparentCanvas(hiCanvas.width, hiCanvas.height, hiCanvas.valid, hiCanvas.pixelsR, hiCanvas.pixelsG, hiCanvas.pixelsB);
+
+        StitchedSourceFaceCanvas lowCanvas;
+        if (!ResolveStitchedOversampledCanvas(hiCanvas, g_aaGrid, &lowCanvas)) {
+            continue;
+        }
+        WriteStitchedSourceFaceCanvas(lowCanvas, rects, validMasks, rectGroup, pages);
+    }
 }
 
 static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 const std::vector<PhongSourcePoly>& sourcePhongs,
                                 const std::vector<RepairSourcePoly>& repairPolys,
                                 const std::vector<PointLight>& lights,
+                                const std::vector<SurfaceLightEmitter>* surfaceEmitters,
                                 const std::vector<FaceRect>& rects,
                                 const std::vector<std::vector<uint32_t>>* lightIndicesByRect,
+                                const std::vector<std::vector<uint32_t>>* surfaceEmitterIndicesByRect,
                                 uint32_t pageIndex,
                                 const OccluderSet& occ,
                                 const std::vector<BrushSolid>& repairSolids,
@@ -3111,129 +4864,50 @@ static void BakeLightmapCPUPage(const std::vector<BakePatch>& patches,
                                 float skyTraceDistance,
                                 LightmapPage& page)
 {
-    const int W = page.width;
-    const int aaGrid = g_aaGrid;
-    const int SAMPLES = aaGrid * aaGrid;
-    const float invG = 1.0f / (float)aaGrid;
+    (void)patches;
+    static const std::vector<uint32_t> kEmptyLightIndices;
 
-    for (size_t i = 0; i < patches.size(); ++i) {
-        const MapPolygon& p = patches[i].poly;
+    for (size_t i = 0; i < rects.size(); ++i) {
         const FaceRect& r = rects[i];
         if (r.page != pageIndex) {
             continue;
         }
 
-        for (int ly = 0; ly < r.gpu.h; ++ly) {
-            for (int lx = 0; lx < r.gpu.w; ++lx) {
-                float ar = 0, ag = 0, ab = 0;
-                int usedSamples = 0;
+        const std::vector<uint32_t>& rectLightIndices = lights.empty()
+            ? kEmptyLightIndices
+            : (lightIndicesByRect ? (*lightIndicesByRect)[i] : r.lightIndices);
+        const std::vector<uint32_t>& rectSurfaceEmitterIndices = surfaceEmitterIndicesByRect
+            ? (*surfaceEmitterIndicesByRect)[i]
+            : r.surfaceEmitterIndices;
 
-                for (int sy = 0; sy < aaGrid; ++sy) {
-                    for (int sx = 0; sx < aaGrid; ++sx) {
-                        const float ju = (lx - LM_PAD) + (sx + 0.5f) * invG;
-                        const float jv = (ly - LM_PAD) + (sy + 0.5f) * invG;
-                        if (!InsidePoly2D(r.poly2d, ju, jv)) {
-                            continue;
-                        }
-                        const Vector3 planePoint = ComputeLuxelPlanePoint(r, ju, jv);
-                        const RepairedSamplePoint repairedSample = RepairSamplePoint(r, repairPolys, repairSolids, planePoint, r.gpu.luxelSize);
-                        Vector3 sampleNormal = EvaluatePhongNormal(sourcePhongs, r.sourcePolyIndex, planePoint, r.gpu.luxelSize);
-                        if (Vector3LengthSq(sampleNormal) <= 1e-8f) {
-                            sampleNormal = r.gpu.normal;
-                        }
-                        const Vector3 faceSamplePoint = OffsetSamplePointOffSurface(planePoint, r.gpu.normal);
-                        const bool faceSampleInsideSolid = PointInsideAnySolid(repairSolids, faceSamplePoint, SOLID_REPAIR_EPSILON);
-                        const Vector3 samplePoint = faceSampleInsideSolid ? repairedSample.samplePoint : faceSamplePoint;
-                        const float nearHitT = 0.0f;
-
-                        float cr = settings.ambientColor.x;
-                        float cg = settings.ambientColor.y;
-                        float cb = settings.ambientColor.z;
-                        const std::vector<uint32_t>& rectLightIndices = lightIndicesByRect ? (*lightIndicesByRect)[i] : r.lightIndices;
-                        bool usesDirt = false;
-                        for (uint32_t lightIndex : rectLightIndices) {
-                            if (LightUsesDirt(lights[lightIndex], settings)) {
-                                usesDirt = true;
-                                break;
-                                }
-                        }
-                        usesDirt = usesDirt || SkyDomeUsesDirt(settings);
-                        const float dirtOcclusion = usesDirt ? ComputeDirtOcclusionRatio(occ, samplePoint, sampleNormal, settings) : 0.0f;
-                        for (uint32_t lightIndex : rectLightIndices) {
-                            const PointLight& L = lights[lightIndex];
-                            Vector3 dir{};
-                            float dist = 0.0f;
-                            float att = 1.0f;
-                            if (IsParallelLight(L)) {
-                                dir = Vector3Normalize(L.parallelDirection);
-                                dist = std::max(1.0f, L.intensity);
-                            } else {
-                                const Vector3 toL = Vector3Subtract(L.position, planePoint);
-                                dist = Vector3Length(toL);
-                                if (dist > L.intensity || dist < 1e-3f) continue;
-                                dir = Vector3Scale(toL, 1.f / dist);
-                                att = EvaluateLightAttenuation(L, dist);
-                                if (att <= 0.0f) continue;
-                            }
-                            // Keep visibility rays on the owning face. Using the repaired
-                            // off-surface sample here can let direct light and skylight
-                            // peek around adjacent corners.
-                            const Vector3 ro = BuildFaceLocalShadowRayOrigin(planePoint, r.gpu.normal, dir);
-                            float emit = 1.0f;
-                            if (L.directional) {
-                                const Vector3 lightToSurface = Vector3Scale(dir, -1.0f);
-                                emit = Vector3DotProduct(L.emissionNormal, lightToSurface);
-                                if (emit <= 0.0f) continue;
-                            }
-                            const float spot = EvaluateSpotlightFactor(L, dir);
-                            if (spot <= 0.0f) continue;
-                            const float ndl = Vector3DotProduct(sampleNormal, dir);
-                            const float incidence = EvaluateIncidenceScale(L, ndl);
-                            if (incidence <= 0.0f) continue;
-                            if (Occluded(occ, ro, dir, nearHitT, std::max(0.0f, dist - (SHADOW_BIAS * 2.0f)), L.ignoreOccluderGroup, (int)r.sourcePolyIndex)) continue;
-                            const float dirt = LightUsesDirt(L, settings)
-                                ? ComputeDirtAttenuation(dirtOcclusion, EffectiveLightDirtScale(L, settings), EffectiveLightDirtGain(L, settings))
-                                : 1.0f;
-                            const float contrib = emit * spot * incidence * att * dirt;
-                            cr += L.color.x * contrib;
-                            cg += L.color.y * contrib;
-                            cb += L.color.z * contrib;
-                        }
-                        const Vector3 skyContrib = ComputeSkyDomeContribution(
-                            occ, r.sourcePolyIndex, planePoint, r.gpu.normal, samplePoint, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
-                        cr += skyContrib.x;
-                        cg += skyContrib.y;
-                        cb += skyContrib.z;
-                        ar += cr; ag += cg; ab += cb;
-                        ++usedSamples;
-                    }
-                }
-
-                if (usedSamples > 0) {
-                    const float invSamples = 1.0f / (float)usedSamples;
-                    ar *= invSamples;
-                    ag *= invSamples;
-                    ab *= invSamples;
-                }
-                const size_t off = ((size_t)(r.gpu.y + ly) * W + (r.gpu.x + lx)) * 4;
-                page.pixels[off + 0] = std::max(0.0f, ar);
-                page.pixels[off + 1] = std::max(0.0f, ag);
-                page.pixels[off + 2] = std::max(0.0f, ab);
-                page.pixels[off + 3] = 1.0f;
-            }
+        OversampledRectBuffer buffer;
+        ShadeRectOversampled(r,
+                             sourcePhongs,
+                             repairPolys,
+                             lights,
+                             surfaceEmitters,
+                             rectLightIndices,
+                             rectSurfaceEmitterIndices,
+                             occ,
+                             repairSolids,
+                             settings,
+                             skyTraceDistance,
+                             &buffer);
+        if (g_aaGrid > 1) {
+            FloodFillTransparentCanvas(buffer.width, buffer.height, buffer.opaque, buffer.pixelsR, buffer.pixelsG, buffer.pixelsB);
         }
+        ResolveOversampledBufferToPage(r, buffer, page);
     }
 }
 
 // ---------------------------------------------------------------------------
 //  Post-process box-filter "soften" pass for `_soften`.
 //
-//  For each valid luxel in a stitched source-face canvas, replace its value
-//  with the average of the (2n+1) x (2n+1) neighbourhood centred on it. The
-//  kernel is clipped at invalid (uncovered) luxels, so the softening crosses
-//  split bake-patch seams for the same source face without bleeding into
-//  unrelated atlas rects or the still-black padding luxels that DilatePage
-//  will fill in later.
+//  For each stitched source-face canvas, first flood-fill uncovered cells from
+//  neighbouring covered cells, then replace each original covered luxel with
+//  the average of a clamped (2n+1) x (2n+1) neighbourhood. This keeps the blur
+//  continuous across split bake patches while behaving more like ericw's
+//  flood-fill + box-blur output path near face borders.
 // ---------------------------------------------------------------------------
 static void ApplyLightmapSoften(std::vector<LightmapPage>& pages,
                                 const std::vector<FaceRect>& rects,
@@ -3252,14 +4926,17 @@ static void ApplyLightmapSoften(std::vector<LightmapPage>& pages,
 
         const int W = canvas.width;
         const int H = canvas.height;
-        std::vector<float> srcR = canvas.pixelsR;
-        std::vector<float> srcG = canvas.pixelsG;
-        std::vector<float> srcB = canvas.pixelsB;
+        const std::vector<uint8_t> originalValid = canvas.valid;
+        std::vector<uint8_t> filteredValid = canvas.valid;
+        std::vector<float> filteredR = canvas.pixelsR;
+        std::vector<float> filteredG = canvas.pixelsG;
+        std::vector<float> filteredB = canvas.pixelsB;
+        FloodFillTransparentCanvas(W, H, filteredValid, filteredR, filteredG, filteredB);
 
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
                 const size_t idx = (size_t)y * (size_t)W + (size_t)x;
-                if (!canvas.valid[idx]) {
+                if (!originalValid[idx]) {
                     continue;
                 }
 
@@ -3267,24 +4944,25 @@ static void ApplyLightmapSoften(std::vector<LightmapPage>& pages,
                 float sumG = 0.0f;
                 float sumB = 0.0f;
                 int count = 0;
+                float sumRIgnoringCoverage = 0.0f;
+                float sumGIgnoringCoverage = 0.0f;
+                float sumBIgnoringCoverage = 0.0f;
+                int countIgnoringCoverage = 0;
                 for (int oy = -n; oy <= n; ++oy) {
-                    const int ny = y + oy;
-                    if (ny < 0 || ny >= H) {
-                        continue;
-                    }
+                    const int ny = std::clamp(y + oy, 0, H - 1);
                     for (int ox = -n; ox <= n; ++ox) {
-                        const int nx = x + ox;
-                        if (nx < 0 || nx >= W) {
-                            continue;
-                        }
+                        const int nx = std::clamp(x + ox, 0, W - 1);
                         const size_t ni = (size_t)ny * (size_t)W + (size_t)nx;
-                        if (!canvas.valid[ni]) {
-                            continue;
+                        sumRIgnoringCoverage += filteredR[ni];
+                        sumGIgnoringCoverage += filteredG[ni];
+                        sumBIgnoringCoverage += filteredB[ni];
+                        ++countIgnoringCoverage;
+                        if (filteredValid[ni]) {
+                            sumR += filteredR[ni];
+                            sumG += filteredG[ni];
+                            sumB += filteredB[ni];
+                            ++count;
                         }
-                        sumR += srcR[ni];
-                        sumG += srcG[ni];
-                        sumB += srcB[ni];
-                        ++count;
                     }
                 }
                 if (count > 0) {
@@ -3292,6 +4970,11 @@ static void ApplyLightmapSoften(std::vector<LightmapPage>& pages,
                     canvas.pixelsR[idx] = sumR * invCount;
                     canvas.pixelsG[idx] = sumG * invCount;
                     canvas.pixelsB[idx] = sumB * invCount;
+                } else if (countIgnoringCoverage > 0) {
+                    const float invCount = 1.0f / (float)countIgnoringCoverage;
+                    canvas.pixelsR[idx] = sumRIgnoringCoverage * invCount;
+                    canvas.pixelsG[idx] = sumGIgnoringCoverage * invCount;
+                    canvas.pixelsB[idx] = sumBIgnoringCoverage * invCount;
                 }
             }
         }
@@ -3305,10 +4988,16 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                            const std::vector<MapPolygon>& occluderPolys,
                            const std::vector<PointLight>& lights,
                            const std::vector<SurfaceLightTemplate>& surfaceLights,
+                           const std::unordered_map<std::string, Vector3>& textureBounceColors,
                            const LightBakeSettings& settings)
 {
     LightmapAtlas atlas;
     const float luxelSize = std::max(0.125f, settings.luxelSize);
+    const bool forceCpuBake = ForceLightmapCPUFromEnv();
+    if (forceCpuBake) {
+        printf("[Lightmap] forcing CPU reference bake via WARPED_LIGHTMAP_FORCE_CPU.\n");
+        fflush(stdout);
+    }
 
     // Pick the super-sampling grid size from the worldspawn `_extra_samples`
     // key. 0 -> 1x1 (off), 2 -> 2x2, 4 -> 4x4 (historical default). This value
@@ -3325,13 +5014,15 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
     }
     const std::vector<PhongSourcePoly> sourcePhongs = BuildPhongSourcePolys(visiblePolys);
     const std::vector<RepairSourcePoly> repairPolys = BuildRepairSourcePolys(visiblePolys, sourcePhongs);
+    const std::vector<BrushSolid> repairSolids = BuildBrushSolids(polys);
     const AABB visibleBounds = ComputeMapBounds(visiblePolys);
     const Vector3 mapCenter = Vector3Scale(Vector3Add(visibleBounds.min, visibleBounds.max), 0.5f);
     const float skyTraceDistance = std::max(2048.0f, sqrtf(Vector3LengthSq(Vector3Subtract(visibleBounds.max, visibleBounds.min))) * 2.0f + 1024.0f);
-    const std::vector<PointLight> allLights = BuildExpandedLights(visiblePolys, lights, surfaceLights, settings, mapCenter, skyTraceDistance);
+    const std::vector<PointLight> directPointLights = BuildDirectPointLights(lights, settings, mapCenter, skyTraceDistance);
+    const std::vector<SurfaceLightEmitter> surfaceEmitters = BuildSurfaceEmitters(visiblePolys, surfaceLights, repairSolids, settings);
     std::vector<BakePatch> patches = SubdivideLightmappedPolygons(visiblePolys, luxelSize);
-    std::vector<FaceRect> rects = BuildFaceRects(patches, allLights, repairPolys, sourcePhongs, luxelSize);
-    const std::vector<BrushSolid> repairSolids = BuildBrushSolids(polys);
+    std::vector<FaceRect> rects = BuildFaceRects(patches, directPointLights, repairPolys, sourcePhongs, luxelSize);
+    BuildRectSurfaceEmitterIndices(rects, surfaceEmitters);
 
     std::vector<LightmapPageLayout> layouts = PackLightmapPages(rects);
     if (layouts.empty() && !rects.empty()) {
@@ -3354,12 +5045,19 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
     }
 
     OccluderSet occ = BuildOccluders(occluderPolys.empty() ? visiblePolys : occluderPolys);
+    const std::vector<LightmapComputeOccluderTri> computeOccluders = BuildLightmapComputeOccluders(occ);
     std::vector<LightmapComputeBrushSolid> computeBrushSolids;
     std::vector<LightmapComputeSolidPlane> computeSolidPlanes;
     std::vector<LightmapComputeRepairSourcePoly> computeRepairSourcePolys;
     std::vector<LightmapComputeRepairSourceNeighbor> computeRepairSourceNeighbors;
+    std::vector<LightmapComputePhongSourcePoly> computePhongSourcePolys;
+    std::vector<LightmapComputePhongNeighbor> computePhongNeighbors;
+    std::vector<LightmapComputeSurfaceEmitter> computeSurfaceEmitters;
+    std::vector<LightmapComputeSurfaceEmitterSample> computeSurfaceEmitterSamples;
     BuildComputeBrushSolids(repairSolids, &computeBrushSolids, &computeSolidPlanes);
     BuildComputeRepairSourceGraph(repairPolys, &computeRepairSourcePolys, &computeRepairSourceNeighbors);
+    BuildComputePhongGraph(sourcePhongs, &computePhongSourcePolys, &computePhongNeighbors);
+    BuildComputeSurfaceEmitterPayload(surfaceEmitters, &computeSurfaceEmitters, &computeSurfaceEmitterSamples);
     const bool repairGraphExceedsComputeVerts = std::any_of(
         repairPolys.begin(),
         repairPolys.end(),
@@ -3374,9 +5072,9 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
             }
         }
     }
-    printf("[Lightmap] %zu source faces -> %zu bake patches across %zu pages of up to %dx%d, %zu explicit/direct lights, %zu tris, %zu luxels x %d samples = %zu rays/light (luxel=%.3f, ambient=%.2f/%.2f/%.2f, bounces=%d, bounceScale=%.2f)\n",
+    printf("[Lightmap] %zu source faces -> %zu bake patches across %zu pages of up to %dx%d, %zu direct point lights, %zu grouped surface emitters, %zu tris, %zu luxels x %d samples = %zu rays/light (luxel=%.3f, ambient=%.2f/%.2f/%.2f, bounces=%d, bounceScale=%.2f)\n",
            visiblePolys.size(), patches.size(), atlas.pages.size(), LIGHTMAP_PAGE_SIZE, LIGHTMAP_PAGE_SIZE,
-           allLights.size(), occ.tris.size(),
+           directPointLights.size(), surfaceEmitters.size(), occ.tris.size(),
            totalLuxels, g_aaGrid * g_aaGrid, totalLuxels * (size_t)(g_aaGrid * g_aaGrid),
            luxelSize,
            settings.ambientColor.x, settings.ambientColor.y, settings.ambientColor.z,
@@ -3385,27 +5083,91 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
 
     std::vector<std::vector<uint8_t>> coverageMasks(atlas.pages.size());
     std::vector<std::vector<uint8_t>> baseValidMasks(atlas.pages.size());
+    std::vector<std::vector<uint8_t>> strictInteriorMasks(atlas.pages.size());
+    for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
+        const LightmapPage& page = atlas.pages[pageIndex];
+        coverageMasks[pageIndex] = BuildCoverageMask(rects, pageIndex, page.width, page.height);
+        baseValidMasks[pageIndex] = CoverageToValidMask(coverageMasks[pageIndex]);
+        strictInteriorMasks[pageIndex] = BuildStrictInteriorMask(rects, pageIndex, page.width, page.height);
+    }
+
+    const bool useStitchedExtraResolve = (g_aaGrid > 1);
+    bool directUseComputeStitchedResolve = false;
+    std::string directComputeStitchedError;
+    if (useStitchedExtraResolve && !forceCpuBake) {
+        directUseComputeStitchedResolve = true;
+        for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
+            std::vector<PointLight> pageLights = GatherPageLights(rects, pageIndex, directPointLights);
+            for (const FaceRect& rect : rects) {
+                if (rect.page != pageIndex || rect.computeCompatible) {
+                    continue;
+                }
+                directUseComputeStitchedResolve = false;
+                directComputeStitchedError = rect.computeFallbackReason.empty()
+                    ? "page contains rects that the compute baker does not support"
+                    : rect.computeFallbackReason;
+                break;
+            }
+            if (!directUseComputeStitchedResolve) {
+                break;
+            }
+            if (PageUsesCPUOnlyLightingFeatures(pageIndex, rects, sourcePhongs, pageLights, false, true, settings, &directComputeStitchedError)) {
+                directUseComputeStitchedResolve = false;
+                break;
+            }
+        }
+
+        if (directUseComputeStitchedResolve &&
+            !BakeLightmapComputeStitchedExtra(rects,
+                                              baseValidMasks,
+                                              computeOccluders,
+                                              computeBrushSolids,
+                                              computeSolidPlanes,
+                                              computeRepairSourcePolys,
+                                              computeRepairSourceNeighbors,
+                                              computePhongSourcePolys,
+                                              computePhongNeighbors,
+                                              directPointLights,
+                                              computeSurfaceEmitters,
+                                              computeSurfaceEmitterSamples,
+                                              settings,
+                                              skyTraceDistance,
+                                              atlas.pages,
+                                              &directComputeStitchedError)) {
+            directUseComputeStitchedResolve = false;
+        }
+    }
+
+    bool directStitchedCpuBaked = false;
     for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
         LightmapPage& page = atlas.pages[pageIndex];
         printf("[Lightmap] page %u/%zu begin (%dx%d)\n",
                pageIndex + 1, atlas.pages.size(), page.width, page.height);
         fflush(stdout);
         std::vector<uint8_t>& coverage = coverageMasks[pageIndex];
-        coverage = BuildCoverageMask(rects, pageIndex, page.width, page.height);
         std::vector<uint8_t>& valid = baseValidMasks[pageIndex];
-        valid = CoverageToValidMask(coverage);
-        std::vector<PointLight> pageLights = GatherPageLights(rects, pageIndex, allLights);
+        std::vector<PointLight> pageLights = GatherPageLights(rects, pageIndex, directPointLights);
+        const size_t pageSurfaceEmitterCount = CountPageSurfaceEmitters(rects, pageIndex, surfaceEmitters.size());
         size_t pageLuxels = 0;
 
         std::vector<LightmapComputeFaceRect> pageRects;
+        std::vector<size_t> pageRectIndices;
         pageRects.reserve(rects.size());
-        bool pageRequiresCPU = false;
-        std::string computeError;
-        for (const FaceRect& r : rects) {
+        pageRectIndices.reserve(rects.size());
+        bool pageRequiresCPU = forceCpuBake ||
+            (useStitchedExtraResolve && (!directUseComputeStitchedResolve || directStitchedCpuBaked));
+        std::string computeError = forceCpuBake
+            ? "forced CPU reference bake via WARPED_LIGHTMAP_FORCE_CPU"
+            : ((useStitchedExtraResolve && directStitchedCpuBaked)
+                ? "stitched direct bake already fell back to CPU earlier in this atlas"
+                : ((useStitchedExtraResolve && !directUseComputeStitchedResolve) ? directComputeStitchedError : std::string()));
+        for (size_t rectIndex = 0; rectIndex < rects.size(); ++rectIndex) {
+            const FaceRect& r = rects[rectIndex];
             if (r.page == pageIndex) {
                 pageRects.push_back(r.gpu);
+                pageRectIndices.push_back(rectIndex);
                 pageLuxels += (size_t)r.gpu.w * (size_t)r.gpu.h;
-                if (!r.computeCompatible) {
+                if (!useStitchedExtraResolve && !r.computeCompatible) {
                     pageRequiresCPU = true;
                     if (computeError.empty()) {
                         computeError = r.computeFallbackReason;
@@ -3413,26 +5175,66 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                 }
             }
         }
-        printf("[Lightmap] page %u stats: %zu rects, %zu explicit/direct lights%s%s, %zu luxels\n",
+        printf("[Lightmap] page %u stats: %zu rects, %zu direct point lights, %zu grouped surface emitters%s%s, %zu luxels\n",
                pageIndex,
                pageRects.size(),
                pageLights.size(),
+               pageSurfaceEmitterCount,
                (settings.sunlight2Intensity > 0.0f) ? ", + upper skylight" : "",
                (settings.sunlight3Intensity > 0.0f) ? ", + lower skylight" : "",
                pageLuxels);
         fflush(stdout);
 
         bool usedCPUFallback = false;
-        if (!pageRequiresCPU && PageUsesCPUOnlyLightingFeatures(pageIndex, rects, sourcePhongs, pageLights, settings, &computeError)) {
+        if (!pageRequiresCPU &&
+            !directUseComputeStitchedResolve &&
+            PageUsesCPUOnlyLightingFeatures(pageIndex, rects, sourcePhongs, pageLights, !surfaceEmitters.empty(), true, settings, &computeError)) {
             pageRequiresCPU = true;
         }
-        if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, computeBrushSolids, computeSolidPlanes, computeRepairSourcePolys, computeRepairSourceNeighbors, pageLights, settings, skyTraceDistance, page.width, page.height, page.pixels, &computeError)) {
+        std::vector<LightmapComputeRectSurfaceEmitterRange> pageRectSurfaceEmitterRanges;
+        std::vector<uint32_t> pageRectSurfaceEmitterIndices;
+        BuildComputeRectSurfaceEmitterDispatchData(rects,
+                                                  pageRectIndices,
+                                                  &pageRectSurfaceEmitterRanges,
+                                                  &pageRectSurfaceEmitterIndices);
+        const bool usedPrecomputedComputeResult = directUseComputeStitchedResolve && !directStitchedCpuBaked;
+        if (!usedPrecomputedComputeResult &&
+            (pageRequiresCPU || !BakeLightmapCompute(pageRects,
+                                                     computeOccluders,
+                                                     computeBrushSolids,
+                                                     computeSolidPlanes,
+                                                     computeRepairSourcePolys,
+                                                     computeRepairSourceNeighbors,
+                                                     computePhongSourcePolys,
+                                                     computePhongNeighbors,
+                                                     pageLights,
+                                                     computeSurfaceEmitters,
+                                                     computeSurfaceEmitterSamples,
+                                                     pageRectSurfaceEmitterRanges,
+                                                     pageRectSurfaceEmitterIndices,
+                                                     settings,
+                                                     skyTraceDistance,
+                                                     page.width,
+                                                     page.height,
+                                                     false,
+                                                     page.pixels,
+                                                     &computeError))) {
             printf("[Lightmap] page %u compute bake unavailable, falling back to CPU: %s\n",
                    pageIndex, computeError.c_str());
             fflush(stdout);
-            BakeLightmapCPUPage(patches, sourcePhongs, repairPolys, allLights, rects, nullptr, pageIndex, occ, repairSolids, settings, skyTraceDistance, page);
+            if (useStitchedExtraResolve) {
+                if (!directStitchedCpuBaked) {
+                    BakeLightmapCPUStitchedExtra(sourcePhongs, repairPolys, directPointLights, &surfaceEmitters, rects, nullptr, nullptr, baseValidMasks, occ, repairSolids, settings, skyTraceDistance, atlas.pages);
+                    directStitchedCpuBaked = true;
+                }
+            } else {
+                BakeLightmapCPUPage(patches, sourcePhongs, repairPolys, directPointLights, &surfaceEmitters, rects, nullptr, nullptr, pageIndex, occ, repairSolids, settings, skyTraceDistance, page);
+            }
             usedCPUFallback = true;
             printf("[Lightmap] page %u CPU bake complete\n", pageIndex);
+            fflush(stdout);
+        } else if (usedPrecomputedComputeResult) {
+            printf("[Lightmap] page %u stitched compute bake complete\n", pageIndex);
             fflush(stdout);
         }
 
@@ -3446,15 +5248,24 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
             StabilizeEdgeTexels(page, coverage);
             edgeTexelsStabilized = true;
 
-            const DarkLuxelStats darkStats = GatherDarkLuxelStats(page, valid, coverage);
+            const DarkLuxelStats darkStats = GatherDarkLuxelStats(page, valid, coverage, strictInteriorMasks[pageIndex]);
             if (HasInvalidDarkValidLuxels(darkStats)) {
                 printf("[Lightmap] page %u compute bake produced invalid dark valid texels "
-                       "(dark valid=%zu/%zu, dark full=%zu/%zu), falling back to CPU.\n",
+                       "(dark valid=%zu/%zu, dark full=%zu/%zu, dark strict interior=%zu/%zu), falling back to CPU.\n",
                        pageIndex,
                        darkStats.darkValidCount, darkStats.validCount,
-                       darkStats.darkFullCoverageCount, darkStats.fullCoverageCount);
+                       darkStats.darkFullCoverageCount, darkStats.fullCoverageCount,
+                       darkStats.darkStrictInteriorCount, darkStats.strictInteriorCount);
                 fflush(stdout);
-                BakeLightmapCPUPage(patches, sourcePhongs, repairPolys, allLights, rects, nullptr, pageIndex, occ, repairSolids, settings, skyTraceDistance, page);
+                if (useStitchedExtraResolve) {
+                    if (!directStitchedCpuBaked) {
+                        BakeLightmapCPUStitchedExtra(sourcePhongs, repairPolys, directPointLights, &surfaceEmitters, rects, nullptr, nullptr, baseValidMasks, occ, repairSolids, settings, skyTraceDistance, atlas.pages);
+                        directStitchedCpuBaked = true;
+                    }
+                } else {
+                    BakeLightmapCPUPage(patches, sourcePhongs, repairPolys, directPointLights, &surfaceEmitters, rects, nullptr, nullptr, pageIndex, occ, repairSolids, settings, skyTraceDistance, page);
+                }
+                usedCPUFallback = true;
                 edgeTexelsStabilized = false;
                 printf("[Lightmap] page %u CPU re-bake complete\n", pageIndex);
                 fflush(stdout);
@@ -3479,9 +5290,9 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
     std::vector<LightmapPage> bounceSourcePages = atlas.pages;
     Vector3 bounceAmbient = settings.ambientColor;
     for (int bouncePass = 0; bouncePass < settings.bounceCount; ++bouncePass) {
-        const std::vector<PointLight> indirectLights = BuildIndirectBounceLights(
-            patches, rects, bounceSourcePages, coverageMasks, bounceAmbient, settings.bounceScale);
-        if (indirectLights.empty()) {
+        const std::vector<SurfaceLightEmitter> indirectEmitters = BuildIndirectBounceEmitters(
+            visiblePolys, rects, bounceSourcePages, coverageMasks, surfaceLights, textureBounceColors, bounceAmbient, repairSolids, settings, bouncePass + 1);
+        if (indirectEmitters.empty()) {
             if (bouncePass == 0) {
                 printf("[Lightmap] indirect bounce emitters: 0\n");
                 fflush(stdout);
@@ -3490,53 +5301,38 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         }
 
         printf("[Lightmap] bounce pass %d/%d emitters: %zu\n",
-               bouncePass + 1, settings.bounceCount, indirectLights.size());
+               bouncePass + 1, settings.bounceCount, indirectEmitters.size());
         fflush(stdout);
-        const std::vector<std::vector<uint32_t>> indirectLightIndices = BuildRectLightIndices(rects, indirectLights);
+        const std::vector<std::vector<uint32_t>> indirectEmitterIndices = BuildSurfaceEmitterIndicesByRect(rects, indirectEmitters);
         std::vector<LightmapPage> bouncedPages = atlas.pages;
         for (LightmapPage& bouncedPage : bouncedPages) {
             bouncedPage = MakeBlankPageLike(bouncedPage);
         }
+        const std::vector<PointLight> noIndirectPointLights;
+        bool bounceStitchedCpuBaked = false;
 
         for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
             LightmapPage& page = atlas.pages[pageIndex];
             LightmapPage& bouncedPage = bouncedPages[pageIndex];
-            const std::vector<PointLight> pageIndirectLights = GatherPageLights(rects, pageIndex, indirectLights, &indirectLightIndices);
-            if (pageIndirectLights.empty()) {
+            const size_t pageIndirectEmitterCount = CountPageSurfaceEmitters(rects, pageIndex, indirectEmitters.size(), &indirectEmitterIndices);
+            if (pageIndirectEmitterCount == 0) {
                 continue;
             }
 
-            std::vector<LightmapComputeFaceRect> pageRects;
-            pageRects.reserve(rects.size());
-            bool pageRequiresCPU = false;
-            std::string computeError;
-            for (const FaceRect& r : rects) {
-                if (r.page == pageIndex) {
-                    pageRects.push_back(r.gpu);
-                    if (!r.computeCompatible) {
-                        pageRequiresCPU = true;
-                        if (computeError.empty()) {
-                            computeError = r.computeFallbackReason;
-                        }
-                    }
-                }
-            }
-
-            printf("[Lightmap] page %u bounce %d begin (%zu bounce lights)\n",
-                   pageIndex, bouncePass + 1, pageIndirectLights.size());
+            printf("[Lightmap] page %u bounce %d begin (%zu bounce emitters)\n",
+                   pageIndex, bouncePass + 1, pageIndirectEmitterCount);
             fflush(stdout);
-            if (!pageRequiresCPU && PageUsesCPUOnlyLightingFeatures(pageIndex, rects, sourcePhongs, pageIndirectLights, settings, &computeError)) {
-                pageRequiresCPU = true;
-            }
             LightBakeSettings bounceSettings = settings;
             bounceSettings.ambientColor = Vector3Zero();
             bounceSettings.sunlight2Intensity = 0.0f;
             bounceSettings.sunlight3Intensity = 0.0f;
-            if (pageRequiresCPU || !BakeLightmapCompute(pageRects, occ.tris, computeBrushSolids, computeSolidPlanes, computeRepairSourcePolys, computeRepairSourceNeighbors, pageIndirectLights, bounceSettings, skyTraceDistance, page.width, page.height, bouncedPage.pixels, &computeError)) {
-                printf("[Lightmap] page %u bounce %d compute unavailable, falling back to CPU: %s\n",
-                       pageIndex, bouncePass + 1, computeError.c_str());
-                fflush(stdout);
-                BakeLightmapCPUPage(patches, sourcePhongs, repairPolys, indirectLights, rects, &indirectLightIndices, pageIndex, occ, repairSolids, bounceSettings, skyTraceDistance, bouncedPage);
+            if (useStitchedExtraResolve) {
+                if (!bounceStitchedCpuBaked) {
+                    BakeLightmapCPUStitchedExtra(sourcePhongs, repairPolys, noIndirectPointLights, &indirectEmitters, rects, nullptr, &indirectEmitterIndices, baseValidMasks, occ, repairSolids, bounceSettings, skyTraceDistance, bouncedPages);
+                    bounceStitchedCpuBaked = true;
+                }
+            } else {
+                BakeLightmapCPUPage(patches, sourcePhongs, repairPolys, noIndirectPointLights, &indirectEmitters, rects, nullptr, &indirectEmitterIndices, pageIndex, occ, repairSolids, bounceSettings, skyTraceDistance, bouncedPage);
             }
 
             StabilizeEdgeTexels(bouncedPage, coverageMasks[pageIndex]);
@@ -3552,8 +5348,21 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
             fflush(stdout);
         }
 
+        WeldSiblingPatchSeams(rects, bouncedPages, coverageMasks, luxelSize);
+
         bounceSourcePages = std::move(bouncedPages);
         bounceAmbient = Vector3Zero();
+    }
+
+    const float outputRangeScale = EffectiveOutputRangeScale(settings);
+    const float outputGamma = EffectiveOutputGamma(settings);
+    if (settings.maxLight > 0.0f ||
+        fabsf(outputRangeScale - 1.0f) > 1e-6f ||
+        fabsf(outputGamma - 1.0f) > 1e-6f) {
+        printf("[Lightmap] applying output conditioning (_maxlight=%.3f, _range=%.2f -> scale=%.3f, _gamma=%.2f)\n",
+               settings.maxLight, settings.rangeScale, outputRangeScale, settings.lightmapGamma);
+        fflush(stdout);
+        ApplyLightmapOutputConditioning(atlas.pages, baseValidMasks, settings);
     }
 
     if (settings.lmAAScale > 0) {

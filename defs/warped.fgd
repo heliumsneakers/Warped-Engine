@@ -62,6 +62,11 @@
     _sunlight_color(color255) : "Sunlight Color" : "255 255 255" : "Color of the directional sunlight."
     _sunlight_mangle(angle) : "Sunlight Direction" : "0 -90 0" : "Yaw Pitch Roll describing the sunlight direction."
     _sun_mangle(angle) : "Sunlight Direction Alias" : "0 -90 0" : "Alias for _sunlight_mangle."
+    _sunlight_nosky(choices) : "Sunlight No-Sky Compatibility" : 0 : "When enabled, _sunlight, _sunlight2, and _sunlight3 use legacy unoccluded-to-distance behavior instead of requiring a sky hit." =
+    [
+        0 : "Disabled"
+        1 : "Enabled"
+    ]
     _sunlight_penumbra(float) : "Sun Penumbra" : "0" : "Softens directional sunlight by spreading it across a cone."
     _sunlight2(float) : "Sky Dome Light" : "0" : "Upper-hemisphere dome light brightness."
     _sunlight_color2(color255) : "Sky Dome Color" : "255 255 255" : "Color of the upper-hemisphere dome light."

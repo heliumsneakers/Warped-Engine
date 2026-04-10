@@ -34,4 +34,5 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                            const std::vector<MapPolygon>& occluderPolys,
                            const std::vector<PointLight>& lights,
                            const std::vector<SurfaceLightTemplate>& surfaceLights,
+                           const std::unordered_map<std::string, Vector3>& textureBounceColors,
                            const LightBakeSettings& settings);

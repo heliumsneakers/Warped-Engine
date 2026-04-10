@@ -35,6 +35,26 @@ struct repair_source_poly {
     vec4 poly_verts[32];
 };
 
+struct phong_source_poly {
+    vec3 normal;
+    float area_weight;
+    int enabled;
+    int first_neighbor;
+    int neighbor_count;
+    float _pad0;
+};
+
+struct phong_neighbor {
+    int source_poly_index;
+    vec3 _pad0;
+    vec3 edge_a;
+    float _pad1;
+    vec3 edge_b;
+    float _pad2;
+    vec3 normal;
+    float area_weight;
+};
+
 layout(binding=0) uniform cs_face_params {
     int atlas_width;
     int atlas_height;
@@ -43,11 +63,16 @@ layout(binding=0) uniform cs_face_params {
     int rect_w;
     int rect_h;
     int light_count;
+    int surface_emitter_count_total;
+    int surface_emitter_sample_count_total;
+    int rect_surface_emitter_index_count_total;
     int tri_count;
     int solid_count;
     int solid_plane_count;
     int repair_poly_count;
     int repair_link_count;
+    int phong_poly_count;
+    int phong_neighbor_count_total;
     int repair_source_poly_index;
     int _pad_repair0;
     float min_u;
@@ -60,17 +85,22 @@ layout(binding=0) uniform cs_face_params {
     int dirt_mode;
     int skylight_dirt;
     int phong_neighbor_count;
+    int rect_surface_emitter_index_first;
+    int rect_surface_emitter_index_count;
     float dirt_depth;
     float dirt_scale;
     float dirt_gain;
     float dirt_angle;
     float skylight_angle_scale;
     float sky_trace_distance;
+    int sunlight_nosky;
     // Super-sampling grid size for the bake (worldspawn `_extra_samples`
     // key). Valid values: 1 (off), 2 (2x2), 4 (4x4). The CPU path uses the
     // same derivation from settings.extraSamples via g_aaGrid.
     int extra_samples;
-    int _pad_scalar0;
+    int oversampled_output;
+    float surface_sample_offset;
+    float _pad_scalar0;
     vec3 sunlight2_color;
     float sunlight2_intensity;
     vec3 sunlight3_color;
@@ -111,6 +141,38 @@ struct point_light {
     float dirt_gain;
     float _pad0;
     float _pad1;
+};
+
+struct surface_emitter {
+    vec3 color;
+    float intensity;
+    vec3 surface_normal;
+    float sample_intensity_scale;
+    vec3 spot_direction;
+    float spot_outer_cos;
+    float spot_inner_cos;
+    float attenuation_scale;
+    float transport_scale;
+    float hotspot_clamp;
+    float dirt_scale;
+    float dirt_gain;
+    int ignore_occluder_group;
+    int dirt;
+    int first_sample_point;
+    int sample_point_count;
+    int omnidirectional;
+    int rescale;
+    vec2 _pad0;
+};
+
+struct surface_emitter_sample {
+    vec3 point;
+    float _pad0;
+};
+
+struct surface_emitter_index {
+    uint emitter_index;
+    vec3 _pad0;
 };
 
 struct occluder_tri {
@@ -154,8 +216,28 @@ layout(binding=5) readonly buffer cs_repair_source_neighbors {
     repair_source_neighbor repair_source_neighbors[];
 };
 
-layout(binding=6) buffer cs_output {
+layout(binding=6) readonly buffer cs_phong_source_polys {
+    phong_source_poly phong_source_polys[];
+};
+
+layout(binding=7) readonly buffer cs_phong_neighbors {
+    phong_neighbor phong_neighbors[];
+};
+
+layout(binding=8) buffer cs_output {
     baked_pixel pixels[];
+};
+
+layout(binding=9) readonly buffer cs_surface_emitters {
+    surface_emitter surface_emitters[];
+};
+
+layout(binding=10) readonly buffer cs_surface_emitter_samples {
+    surface_emitter_sample surface_emitter_samples[];
+};
+
+layout(binding=11) readonly buffer cs_rect_surface_emitter_indices {
+    surface_emitter_index rect_surface_emitter_indices[];
 };
 
 layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
@@ -164,7 +246,6 @@ const int AA_GRID = 4;
 const int SAMPLES = AA_GRID * AA_GRID;
 const float EDGE_SEAM_GUARD_LUXELS = 0.75;
 const float EDGE_SEAM_TMIN_SCALE = 3.0;
-const float SURFACE_SAMPLE_OFFSET = 0.125;
 const int POINT_LIGHT_ATTEN_QUADRATIC = 0;
 const int POINT_LIGHT_ATTEN_LINEAR = 1;
 const int POINT_LIGHT_ATTEN_INVERSE = 2;
@@ -188,10 +269,21 @@ vec3 safe_normalize(vec3 v, vec3 fallback) {
     return v * inversesqrt(len_sq);
 }
 
+vec3 build_sample_shadow_ray_origin(vec3 sample_point, vec3 sample_normal, vec3 dir) {
+    vec3 bias_dir = dir;
+    if (dot(bias_dir, bias_dir) <= 1e-8) {
+        bias_dir = sample_normal;
+    }
+    if (dot(bias_dir, bias_dir) <= 1e-8) {
+        return sample_point;
+    }
+    return sample_point + safe_normalize(bias_dir, vec3(0.0, 1.0, 0.0)) * (shadow_bias * 0.25);
+}
+
 vec3 build_face_local_shadow_ray_origin(vec3 plane_point, vec3 face_normal, vec3 dir) {
     return plane_point
-        + safe_normalize(face_normal, vec3(0.0, 1.0, 0.0)) * (shadow_bias * 0.25)
-        + dir * 0.0;
+        + safe_normalize(face_normal, vec3(0.0, 1.0, 0.0)) * shadow_bias
+        + dir * shadow_bias;
 }
 
 void face_basis(vec3 n, out vec3 u, out vec3 v) {
@@ -507,6 +599,39 @@ float effective_light_dirt_gain(point_light light) {
     return (light.dirt_gain > 0.0) ? light.dirt_gain : dirt_gain;
 }
 
+float evaluate_surface_emitter_spotlight_factor(surface_emitter emitter, vec3 dir_to_light) {
+    if ((emitter.spot_outer_cos <= -1.5) || (dot(emitter.spot_direction, emitter.spot_direction) <= 1e-6)) {
+        return 1.0;
+    }
+    vec3 light_to_surface = -dir_to_light;
+    float spot_cos = dot(safe_normalize(emitter.spot_direction, vec3(0.0, 1.0, 0.0)), light_to_surface);
+    if (spot_cos <= emitter.spot_outer_cos) {
+        return 0.0;
+    }
+    if (emitter.spot_inner_cos <= emitter.spot_outer_cos) {
+        return 1.0;
+    }
+    return clamp((spot_cos - emitter.spot_outer_cos) / (emitter.spot_inner_cos - emitter.spot_outer_cos), 0.0, 1.0);
+}
+
+bool surface_emitter_uses_dirt(surface_emitter emitter) {
+    int dirt_setting = (emitter.dirt == -2) ? global_dirt : emitter.dirt;
+    return dirt_setting == 1;
+}
+
+float effective_surface_emitter_dirt_scale(surface_emitter emitter) {
+    return (emitter.dirt_scale > 0.0) ? emitter.dirt_scale : dirt_scale;
+}
+
+float effective_surface_emitter_dirt_gain(surface_emitter emitter) {
+    return (emitter.dirt_gain > 0.0) ? emitter.dirt_gain : dirt_gain;
+}
+
+float evaluate_surface_emitter_distance_falloff(surface_emitter emitter, float dist) {
+    float scaled_dist = max(emitter.hotspot_clamp, max(0.01, emitter.attenuation_scale * dist));
+    return (emitter.transport_scale * emitter.sample_intensity_scale) / (scaled_dist * scaled_dist);
+}
+
 float compute_dirt_attenuation(float occlusion_ratio, float dirt_scale_value, float dirt_gain_value) {
     float scaled = clamp(occlusion_ratio * max(0.0, dirt_scale_value), 0.0, 1.0);
     float gained = pow(scaled, max(0.01, dirt_gain_value));
@@ -654,7 +779,7 @@ bool source_poly_visited(int visited[REPAIR_RECURSION_MAX + 1], int visited_coun
 }
 
 bool try_repair_candidate(vec3 plane_point, vec3 face_normal, out vec3 repaired_point) {
-    repaired_point = plane_point + safe_normalize(face_normal, normal) * SURFACE_SAMPLE_OFFSET;
+    repaired_point = plane_point + safe_normalize(face_normal, normal) * surface_sample_offset;
     if (!point_inside_any_solid(repaired_point)) {
         return true;
     }
@@ -711,7 +836,7 @@ bool try_recursive_repair_walk(int start_source_poly_index, vec3 start_seed_poin
             vec2 projected_uv = vec2(dot(projected, poly.axis_u), dot(projected, poly.axis_v));
             stack_projected[depth] = projected;
             stack_projected_uv[depth] = projected_uv;
-            stack_face_seed[depth] = projected + safe_normalize(poly.normal, normal) * SURFACE_SAMPLE_OFFSET;
+            stack_face_seed[depth] = projected + safe_normalize(poly.normal, normal) * surface_sample_offset;
             stack_inside_face[depth] = inside_repair_source_poly(source_poly_index, projected_uv) ? 1 : 0;
             stack_best_edge[depth] = (stack_inside_face[depth] != 0)
                 ? -1
@@ -828,7 +953,7 @@ bool try_recursive_repair_walk(int start_source_poly_index, vec3 start_seed_poin
 repaired_sample repair_sample_point(vec3 plane_point) {
     repaired_sample result;
     result.plane_point = plane_point;
-    result.sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * SURFACE_SAMPLE_OFFSET;
+    result.sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * surface_sample_offset;
     result.source_poly_index = repair_source_poly_index;
     if (!point_inside_any_solid(result.sample_point)) {
         return result;
@@ -846,6 +971,43 @@ repaired_sample repair_sample_point(vec3 plane_point) {
     }
 
     return result;
+}
+
+vec3 owner_face_normal(int source_poly_index, vec3 fallback_normal) {
+    if (repair_source_poly_valid(source_poly_index)) {
+        return safe_normalize(repair_source_polys[source_poly_index].normal, fallback_normal);
+    }
+    return safe_normalize(fallback_normal, vec3(0.0, 1.0, 0.0));
+}
+
+vec3 evaluate_phong_normal_for_source(int source_poly_index, vec3 sample_point, vec3 fallback_normal) {
+    if ((source_poly_index < 0) || (source_poly_index >= phong_poly_count)) {
+        return safe_normalize(fallback_normal, normal);
+    }
+
+    phong_source_poly source = phong_source_polys[source_poly_index];
+    vec3 base_normal = safe_normalize(source.normal, fallback_normal);
+    if ((source.enabled == 0) || (source.neighbor_count <= 0)) {
+        return base_normal;
+    }
+
+    vec3 accum = base_normal * (source.area_weight * 2.0);
+    float distance_bias = max(0.25, luxel_size);
+    for (int i = 0; i < source.neighbor_count; ++i) {
+        int neighbor_index = source.first_neighbor + i;
+        if ((neighbor_index < 0) || (neighbor_index >= phong_neighbor_count_total)) {
+            continue;
+        }
+        phong_neighbor neighbor = phong_neighbors[neighbor_index];
+        float dist = dist_point_segment_3d(sample_point, neighbor.edge_a, neighbor.edge_b);
+        float weight = neighbor.area_weight / max(distance_bias, dist);
+        accum += neighbor.normal * weight;
+    }
+
+    if (dot(accum, accum) <= 1e-8) {
+        return base_normal;
+    }
+    return safe_normalize(accum, base_normal);
 }
 
 vec3 sample_cone_direction(vec3 axis, float cone_angle_deg, int sample_index, int sample_count) {
@@ -883,7 +1045,13 @@ vec3 ericw_skydome_direction(bool upper_hemisphere, int sample_index, float rota
                           upper_hemisphere ? vec3(0.0, 1.0, 0.0) : vec3(0.0, -1.0, 0.0));
 }
 
-vec3 compute_skydome_lighting(vec3 plane_point, vec3 sample_point, vec3 sample_normal, float near_hit_t, float dirt_occlusion) {
+vec3 compute_skydome_lighting(int owner_source_poly_index,
+                              vec3 visibility_plane_point,
+                              vec3 visibility_face_normal,
+                              vec3 sample_point,
+                              vec3 sample_normal,
+                              float near_hit_t,
+                              float dirt_occlusion) {
     vec3 result = vec3(0.0);
     float upper_per_sample = (sunlight2_intensity > 0.0) ? (sunlight2_intensity / (300.0 * float(SKYDOME_SAMPLE_COUNT))) : 0.0;
     float lower_per_sample = (sunlight3_intensity > 0.0) ? (sunlight3_intensity / (300.0 * float(SKYDOME_SAMPLE_COUNT))) : 0.0;
@@ -902,16 +1070,22 @@ vec3 compute_skydome_lighting(vec3 plane_point, vec3 sample_point, vec3 sample_n
     for (int i = 0; i < SKYDOME_SAMPLE_COUNT; ++i) {
         if (upper_per_sample > 0.0) {
             vec3 dir = ericw_skydome_direction(true, i, upper_rotation);
-            vec3 ro = build_face_local_shadow_ray_origin(plane_point, normal, dir);
-            if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1, repair_source_poly_index)) {
+            vec3 ro = build_face_local_shadow_ray_origin(visibility_plane_point, visibility_face_normal, dir);
+            bool visible = (sunlight_nosky != 0)
+                ? !occluded(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index)
+                : (closest_hit_distance(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index) >= sky_trace_distance);
+            if (visible) {
                 float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
                 result += sunlight2_color * (upper_per_sample * incidence * dirt);
             }
         }
         if (lower_per_sample > 0.0) {
             vec3 dir = ericw_skydome_direction(false, i, lower_rotation);
-            vec3 ro = build_face_local_shadow_ray_origin(plane_point, normal, dir);
-            if (!occluded(ro, dir, near_hit_t, sky_trace_distance, -1, repair_source_poly_index)) {
+            vec3 ro = build_face_local_shadow_ray_origin(visibility_plane_point, visibility_face_normal, dir);
+            bool visible = (sunlight_nosky != 0)
+                ? !occluded(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index)
+                : (closest_hit_distance(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index) >= sky_trace_distance);
+            if (visible) {
                 float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
                 result += sunlight3_color * (lower_per_sample * incidence * dirt);
             }
@@ -921,19 +1095,10 @@ vec3 compute_skydome_lighting(vec3 plane_point, vec3 sample_point, vec3 sample_n
     return result;
 }
 
-vec3 evaluate_phong_normal(vec3 sample_point) {
-    if (phong_neighbor_count <= 0) {
-        return normal;
-    }
-    vec3 base_normal = safe_normalize(phong_base_normal_weight.xyz, normal);
-    vec3 accum = base_normal * (phong_base_normal_weight.w * 2.0);
-    float distance_bias = max(0.25, luxel_size);
-    for (int i = 0; i < phong_neighbor_count; ++i) {
-        float dist = dist_point_segment_3d(sample_point, phong_neighbor_edge_a[i].xyz, phong_neighbor_edge_b[i].xyz);
-        float weight = phong_neighbor_normal_weight[i].w / max(distance_bias, dist);
-        accum += phong_neighbor_normal_weight[i].xyz * weight;
-    }
-    return safe_normalize(accum, base_normal);
+float compute_edge_aware_near_hit_t(float ju, float jv) {
+    float edge_dist_luxels = min_dist_to_poly_edge_2d(ju, jv);
+    float edge_factor = clamp(1.0 - edge_dist_luxels / EDGE_SEAM_GUARD_LUXELS, 0.0, 1.0);
+    return shadow_bias + (shadow_bias * EDGE_SEAM_TMIN_SCALE) * edge_factor;
 }
 
 float compute_dirt_occlusion_ratio(vec3 sample_point, vec3 sample_normal) {
@@ -952,6 +1117,198 @@ float compute_dirt_occlusion_ratio(vec3 sample_point, vec3 sample_normal) {
     return clamp(1.0 - (avg_hit_distance / max(1.0, dirt_depth)), 0.0, 1.0);
 }
 
+vec3 compute_surface_emitter_contribution(surface_emitter emitter,
+                                          vec3 emitter_sample_point,
+                                          int owner_source_poly_index,
+                                          vec3 sample_point,
+                                          vec3 sample_normal,
+                                          float near_hit_t,
+                                          float dirt_occlusion)
+{
+    vec3 to_light = emitter_sample_point - sample_point;
+    float dist = length(to_light);
+    if ((dist > emitter.intensity) || (dist < 1e-3)) {
+        return vec3(0.0);
+    }
+
+    vec3 dir_to_light = to_light / dist;
+    vec3 light_to_surface = -dir_to_light;
+
+    float receiver_dot = dot(sample_normal, dir_to_light);
+    float geometric = 1.0;
+    if (emitter.omnidirectional != 0) {
+        geometric = max(0.0, receiver_dot * 0.5);
+    } else {
+        float emitter_dot = dot(emitter.surface_normal, light_to_surface);
+        if ((emitter_dot < -0.01) || (receiver_dot < -0.01)) {
+            return vec3(0.0);
+        }
+        if (emitter.rescale != 0) {
+            emitter_dot = 0.5 + emitter_dot * 0.5;
+            float rescaled_receiver_dot = 0.5 + receiver_dot * 0.5;
+            geometric = max(0.0, emitter_dot * rescaled_receiver_dot);
+        } else {
+            geometric = max(0.0, emitter_dot * receiver_dot);
+        }
+    }
+    if (geometric <= 0.0) {
+        return vec3(0.0);
+    }
+
+    float spotlight = evaluate_surface_emitter_spotlight_factor(emitter, dir_to_light);
+    if (spotlight <= 0.0) {
+        return vec3(0.0);
+    }
+
+    float falloff = evaluate_surface_emitter_distance_falloff(emitter, dist);
+    if (falloff <= 0.0) {
+        return vec3(0.0);
+    }
+
+    float unshadowed_scale = geometric * spotlight * falloff;
+    float peak_unshadowed = max(emitter.color.x, max(emitter.color.y, emitter.color.z)) * unshadowed_scale;
+    if (peak_unshadowed <= (1.0 / 255.0)) {
+        return vec3(0.0);
+    }
+
+    vec3 ro = build_sample_shadow_ray_origin(sample_point, sample_normal, dir_to_light);
+    if (occluded(ro,
+                 dir_to_light,
+                 near_hit_t,
+                 max(0.0, dist - (shadow_bias * 2.0)),
+                 emitter.ignore_occluder_group,
+                 owner_source_poly_index)) {
+        return vec3(0.0);
+    }
+
+    float dirt = surface_emitter_uses_dirt(emitter)
+        ? compute_dirt_attenuation(dirt_occlusion,
+                                   effective_surface_emitter_dirt_scale(emitter),
+                                   effective_surface_emitter_dirt_gain(emitter))
+        : 1.0;
+    return emitter.color * (unshadowed_scale * dirt);
+}
+
+bool shade_sample(float ju, float jv, out vec3 sample_rgb) {
+    if (!inside_poly_2d(ju, jv)) {
+        sample_rgb = vec3(0.0);
+        return false;
+    }
+
+    vec3 plane_point = origin + axis_u * (ju * luxel_size) + axis_v * (jv * luxel_size);
+    repaired_sample repaired = repair_sample_point(plane_point);
+    vec3 face_sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * surface_sample_offset;
+    bool face_sample_inside_solid = point_inside_any_solid(face_sample_point);
+    int owner_source_poly_index = face_sample_inside_solid ? repaired.source_poly_index : repair_source_poly_index;
+    vec3 owner_plane_point = face_sample_inside_solid ? repaired.plane_point : plane_point;
+    vec3 owner_normal = face_sample_inside_solid
+        ? owner_face_normal(repaired.source_poly_index, normal)
+        : safe_normalize(normal, vec3(0.0, 1.0, 0.0));
+    vec3 sample_point = face_sample_inside_solid ? repaired.sample_point : face_sample_point;
+    vec3 sample_normal = evaluate_phong_normal_for_source(owner_source_poly_index, owner_plane_point, owner_normal);
+    if (dot(sample_normal, sample_normal) <= 1e-8) {
+        sample_normal = owner_normal;
+    }
+    float near_hit_t = compute_edge_aware_near_hit_t(ju, jv);
+
+    sample_rgb = ambient_color;
+    bool uses_dirt = skylight_dirt != 0;
+    for (int li = 0; li < light_count; ++li) {
+        if (light_uses_dirt(lights[li])) {
+            uses_dirt = true;
+            break;
+        }
+    }
+    if (!uses_dirt) {
+        for (int ei = 0; ei < rect_surface_emitter_index_count; ++ei) {
+            int flat_index = rect_surface_emitter_index_first + ei;
+            if ((flat_index < 0) || (flat_index >= rect_surface_emitter_index_count_total)) {
+                continue;
+            }
+            uint emitter_index = rect_surface_emitter_indices[flat_index].emitter_index;
+            if (emitter_index >= uint(surface_emitter_count_total)) {
+                continue;
+            }
+            if (surface_emitter_uses_dirt(surface_emitters[emitter_index])) {
+                uses_dirt = true;
+                break;
+            }
+        }
+    }
+    float dirt_occlusion = uses_dirt ? compute_dirt_occlusion_ratio(sample_point, sample_normal) : 0.0;
+    for (int li = 0; li < light_count; ++li) {
+        point_light light = lights[li];
+        vec3 dir;
+        float dist;
+        float attenuation = 1.0;
+        if (light.parallel != 0) {
+            dir = safe_normalize(light.parallel_direction, vec3(0.0, 1.0, 0.0));
+            dist = max(1.0, light.intensity);
+        } else {
+            vec3 to_light = light.position - owner_plane_point;
+            dist = length(to_light);
+            if ((dist > light.intensity) || (dist < 1e-3)) {
+                continue;
+            }
+            dir = to_light / dist;
+            attenuation = evaluate_light_attenuation(light, dist);
+            if (attenuation <= 0.0) {
+                continue;
+            }
+        }
+        float emit = 1.0;
+        if (light.directional != 0) {
+            emit = dot(light.emission_normal, -dir);
+            if (emit <= 0.0) {
+                continue;
+            }
+        }
+        float ndl = dot(sample_normal, dir);
+        float incidence = evaluate_incidence_scale(light, ndl);
+        if (incidence <= 0.0) {
+            continue;
+        }
+        float spotlight = evaluate_spotlight_factor(light, dir);
+        if (spotlight <= 0.0) {
+            continue;
+        }
+        vec3 ro = build_face_local_shadow_ray_origin(owner_plane_point, owner_normal, dir);
+        if (occluded(ro, dir, near_hit_t, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group, owner_source_poly_index)) {
+            continue;
+        }
+        float dirt = light_uses_dirt(light)
+            ? compute_dirt_attenuation(dirt_occlusion, effective_light_dirt_scale(light), effective_light_dirt_gain(light))
+            : 1.0;
+        sample_rgb += light.color * (emit * spotlight * incidence * attenuation * dirt);
+    }
+    for (int ei = 0; ei < rect_surface_emitter_index_count; ++ei) {
+        int flat_index = rect_surface_emitter_index_first + ei;
+        if ((flat_index < 0) || (flat_index >= rect_surface_emitter_index_count_total)) {
+            continue;
+        }
+        uint emitter_index = rect_surface_emitter_indices[flat_index].emitter_index;
+        if (emitter_index >= uint(surface_emitter_count_total)) {
+            continue;
+        }
+        surface_emitter emitter = surface_emitters[emitter_index];
+        for (int si = 0; si < emitter.sample_point_count; ++si) {
+            int sample_index = emitter.first_sample_point + si;
+            if ((sample_index < 0) || (sample_index >= surface_emitter_sample_count_total)) {
+                continue;
+            }
+            sample_rgb += compute_surface_emitter_contribution(emitter,
+                                                               surface_emitter_samples[sample_index].point,
+                                                               owner_source_poly_index,
+                                                               sample_point,
+                                                               sample_normal,
+                                                               near_hit_t,
+                                                               dirt_occlusion);
+        }
+    }
+    sample_rgb += compute_skydome_lighting(owner_source_poly_index, owner_plane_point, owner_normal, sample_point, sample_normal, near_hit_t, dirt_occlusion);
+    return true;
+}
+
 void main() {
     ivec2 local_xy = ivec2(gl_GlobalInvocationID.xy);
     if ((local_xy.x >= rect_w) || (local_xy.y >= rect_h)) {
@@ -967,79 +1324,24 @@ void main() {
     int aa_grid = (extra_samples <= 0) ? 1
                : (extra_samples <= 2) ? 2 : 4;
     float inv_grid = 1.0 / float(aa_grid);
+    ivec2 atlas_xy = ivec2(rect_x + local_xy.x, rect_y + local_xy.y);
+    uint out_index = uint(atlas_xy.y * atlas_width + atlas_xy.x);
+    if (oversampled_output != 0) {
+        vec3 sample_rgb;
+        float ju = (float(local_xy.x) + 0.5) * inv_grid;
+        float jv = (float(local_xy.y) + 0.5) * inv_grid;
+        bool valid = shade_sample(ju, jv, sample_rgb);
+        pixels[out_index].value = valid ? vec4(max(sample_rgb, vec3(0.0)), 1.0) : vec4(0.0);
+        return;
+    }
     for (int sy = 0; sy < aa_grid; ++sy) {
         for (int sx = 0; sx < aa_grid; ++sx) {
             float ju = float(local_xy.x - 2) + (float(sx) + 0.5) * inv_grid;
             float jv = float(local_xy.y - 2) + (float(sy) + 0.5) * inv_grid;
-            if (!inside_poly_2d(ju, jv)) {
+            vec3 sample_rgb;
+            if (!shade_sample(ju, jv, sample_rgb)) {
                 continue;
             }
-            vec3 plane_point = origin + axis_u * (ju * luxel_size) + axis_v * (jv * luxel_size);
-            repaired_sample repaired = repair_sample_point(plane_point);
-            vec3 sample_normal = evaluate_phong_normal(plane_point);
-            vec3 face_sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * SURFACE_SAMPLE_OFFSET;
-            bool face_sample_inside_solid = point_inside_any_solid(face_sample_point);
-            vec3 sample_point = face_sample_inside_solid ? repaired.sample_point : face_sample_point;
-            float near_hit_t = 0.0;
-
-            vec3 sample_rgb = ambient_color;
-            bool uses_dirt = skylight_dirt != 0;
-            for (int li = 0; li < light_count; ++li) {
-                if (light_uses_dirt(lights[li])) {
-                    uses_dirt = true;
-                    break;
-                }
-            }
-            float dirt_occlusion = uses_dirt ? compute_dirt_occlusion_ratio(sample_point, sample_normal) : 0.0;
-            for (int li = 0; li < light_count; ++li) {
-                point_light light = lights[li];
-                vec3 dir;
-                float dist;
-                float attenuation = 1.0;
-                if (light.parallel != 0) {
-                    dir = safe_normalize(light.parallel_direction, vec3(0.0, 1.0, 0.0));
-                    dist = max(1.0, light.intensity);
-                } else {
-                    vec3 to_light = light.position - plane_point;
-                    dist = length(to_light);
-                    if ((dist > light.intensity) || (dist < 1e-3)) {
-                        continue;
-                    }
-                    dir = to_light / dist;
-                    attenuation = evaluate_light_attenuation(light, dist);
-                    if (attenuation <= 0.0) {
-                        continue;
-                    }
-                }
-                // Keep visibility rays on the owning face. Using the repaired
-                // off-surface sample here can let light peek around adjacent
-                // corners.
-                vec3 ro = build_face_local_shadow_ray_origin(plane_point, normal, dir);
-                float emit = 1.0;
-                if (light.directional != 0) {
-                    emit = dot(light.emission_normal, -dir);
-                    if (emit <= 0.0) {
-                        continue;
-                    }
-                }
-                float ndl = dot(sample_normal, dir);
-                float incidence = evaluate_incidence_scale(light, ndl);
-                if (incidence <= 0.0) {
-                    continue;
-                }
-                float spotlight = evaluate_spotlight_factor(light, dir);
-                if (spotlight <= 0.0) {
-                    continue;
-                }
-                if (occluded(ro, dir, near_hit_t, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group, repair_source_poly_index)) {
-                    continue;
-                }
-                float dirt = light_uses_dirt(light)
-                    ? compute_dirt_attenuation(dirt_occlusion, effective_light_dirt_scale(light), effective_light_dirt_gain(light))
-                    : 1.0;
-                sample_rgb += light.color * (emit * spotlight * incidence * attenuation * dirt);
-            }
-            sample_rgb += compute_skydome_lighting(plane_point, sample_point, sample_normal, near_hit_t, dirt_occlusion);
             accum += sample_rgb;
             used_samples += 1;
         }
@@ -1048,8 +1350,6 @@ void main() {
     if (used_samples > 0) {
         accum /= float(used_samples);
     }
-    ivec2 atlas_xy = ivec2(rect_x + local_xy.x, rect_y + local_xy.y);
-    uint out_index = uint(atlas_xy.y * atlas_width + atlas_xy.x);
     pixels[out_index].value = vec4(max(accum, vec3(0.0)), 1.0);
 }
 @end

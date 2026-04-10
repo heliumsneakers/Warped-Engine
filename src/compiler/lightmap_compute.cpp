@@ -44,11 +44,16 @@ constexpr float kShadowBias = 0.03125f;
 constexpr float kRayEps = 1e-4f;
 
 using GpuPointLight = warped_lightmap_bake_point_light_t;
+using GpuSurfaceEmitter = warped_lightmap_bake_surface_emitter_t;
+using GpuSurfaceEmitterSample = warped_lightmap_bake_surface_emitter_sample_t;
+using GpuSurfaceEmitterIndex = warped_lightmap_bake_surface_emitter_index_t;
 using GpuOccluderTri = warped_lightmap_bake_occluder_tri_t;
 using GpuBrushSolid = warped_lightmap_bake_brush_solid_t;
 using GpuSolidPlane = warped_lightmap_bake_solid_plane_t;
 using GpuRepairSourcePoly = warped_lightmap_bake_repair_source_poly_t;
 using GpuRepairSourceNeighbor = warped_lightmap_bake_repair_source_neighbor_t;
+using GpuPhongSourcePoly = warped_lightmap_bake_phong_source_poly_t;
+using GpuPhongNeighbor = warped_lightmap_bake_phong_neighbor_t;
 using GpuFaceParams = warped_lightmap_bake_cs_face_params_t;
 using GpuBakedPixel = warped_lightmap_bake_baked_pixel_t;
 
@@ -371,11 +376,18 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          const std::vector<LightmapComputeSolidPlane>& solidPlanes,
                          const std::vector<LightmapComputeRepairSourcePoly>& repairSourcePolys,
                          const std::vector<LightmapComputeRepairSourceNeighbor>& repairSourceNeighbors,
+                         const std::vector<LightmapComputePhongSourcePoly>& phongSourcePolys,
+                         const std::vector<LightmapComputePhongNeighbor>& phongNeighbors,
                          const std::vector<PointLight>& lights,
+                         const std::vector<LightmapComputeSurfaceEmitter>& surfaceEmitters,
+                         const std::vector<LightmapComputeSurfaceEmitterSample>& surfaceEmitterSamples,
+                         const std::vector<LightmapComputeRectSurfaceEmitterRange>& rectSurfaceEmitterRanges,
+                         const std::vector<uint32_t>& rectSurfaceEmitterIndices,
                          const LightBakeSettings& settings,
                          float skyTraceDistance,
                          int atlasWidth,
                          int atlasHeight,
+                         bool oversampledOutput,
                          std::vector<float>& outPixels,
                          std::string* error)
 {
@@ -403,6 +415,39 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         gpuLights[i].dirt_gain = lights[i].dirtGain;
         gpuLights[i]._pad0 = 0;
         gpuLights[i]._pad1 = 0;
+    }
+
+    std::vector<GpuSurfaceEmitter> gpuSurfaceEmitters(std::max<size_t>(1, surfaceEmitters.size()));
+    for (size_t i = 0; i < surfaceEmitters.size(); ++i) {
+        CopyVec3(gpuSurfaceEmitters[i].color, surfaceEmitters[i].baseLight.color);
+        gpuSurfaceEmitters[i].intensity = surfaceEmitters[i].baseLight.intensity;
+        CopyVec3(gpuSurfaceEmitters[i].surface_normal, surfaceEmitters[i].surfaceNormal);
+        gpuSurfaceEmitters[i].sample_intensity_scale = surfaceEmitters[i].sampleIntensityScale;
+        CopyVec3(gpuSurfaceEmitters[i].spot_direction, surfaceEmitters[i].baseLight.spotDirection);
+        gpuSurfaceEmitters[i].spot_outer_cos = surfaceEmitters[i].baseLight.spotOuterCos;
+        gpuSurfaceEmitters[i].spot_inner_cos = surfaceEmitters[i].baseLight.spotInnerCos;
+        gpuSurfaceEmitters[i].attenuation_scale = surfaceEmitters[i].attenuationScale;
+        gpuSurfaceEmitters[i].transport_scale = surfaceEmitters[i].transportScale;
+        gpuSurfaceEmitters[i].hotspot_clamp = surfaceEmitters[i].hotspotClamp;
+        gpuSurfaceEmitters[i].dirt_scale = surfaceEmitters[i].baseLight.dirtScale;
+        gpuSurfaceEmitters[i].dirt_gain = surfaceEmitters[i].baseLight.dirtGain;
+        gpuSurfaceEmitters[i].ignore_occluder_group = surfaceEmitters[i].baseLight.ignoreOccluderGroup;
+        gpuSurfaceEmitters[i].dirt = (int32_t)surfaceEmitters[i].baseLight.dirt;
+        gpuSurfaceEmitters[i].first_sample_point = surfaceEmitters[i].firstSamplePoint;
+        gpuSurfaceEmitters[i].sample_point_count = surfaceEmitters[i].samplePointCount;
+        gpuSurfaceEmitters[i].omnidirectional = (int32_t)surfaceEmitters[i].omnidirectional;
+        gpuSurfaceEmitters[i].rescale = (int32_t)surfaceEmitters[i].rescale;
+    }
+
+    std::vector<GpuSurfaceEmitterSample> gpuSurfaceEmitterSamples(std::max<size_t>(1, surfaceEmitterSamples.size()));
+    for (size_t i = 0; i < surfaceEmitterSamples.size(); ++i) {
+        CopyVec3(gpuSurfaceEmitterSamples[i].point, surfaceEmitterSamples[i].point);
+        gpuSurfaceEmitterSamples[i]._pad0 = 0.0f;
+    }
+
+    std::vector<GpuSurfaceEmitterIndex> gpuRectSurfaceEmitterIndices(std::max<size_t>(1, rectSurfaceEmitterIndices.size()));
+    for (size_t i = 0; i < rectSurfaceEmitterIndices.size(); ++i) {
+        gpuRectSurfaceEmitterIndices[i].emitter_index = rectSurfaceEmitterIndices[i];
     }
 
     std::vector<GpuOccluderTri> gpuOccluders(std::max<size_t>(1, occluders.size()));
@@ -465,6 +510,30 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         gpuRepairSourceNeighbors[i]._pad[1] = 0.0f;
     }
 
+    std::vector<GpuPhongSourcePoly> gpuPhongSourcePolys(std::max<size_t>(1, phongSourcePolys.size()));
+    for (size_t i = 0; i < phongSourcePolys.size(); ++i) {
+        CopyVec3(gpuPhongSourcePolys[i].normal, phongSourcePolys[i].normal);
+        gpuPhongSourcePolys[i].area_weight = phongSourcePolys[i].areaWeight;
+        gpuPhongSourcePolys[i].enabled = phongSourcePolys[i].enabled;
+        gpuPhongSourcePolys[i].first_neighbor = phongSourcePolys[i].firstNeighbor;
+        gpuPhongSourcePolys[i].neighbor_count = phongSourcePolys[i].neighborCount;
+        gpuPhongSourcePolys[i]._pad0 = 0.0f;
+    }
+
+    std::vector<GpuPhongNeighbor> gpuPhongNeighbors(std::max<size_t>(1, phongNeighbors.size()));
+    for (size_t i = 0; i < phongNeighbors.size(); ++i) {
+        gpuPhongNeighbors[i].source_poly_index = phongNeighbors[i].sourcePolyIndex;
+        gpuPhongNeighbors[i]._pad0[0] = 0.0f;
+        gpuPhongNeighbors[i]._pad0[1] = 0.0f;
+        gpuPhongNeighbors[i]._pad0[2] = 0.0f;
+        CopyVec3(gpuPhongNeighbors[i].edge_a, phongNeighbors[i].edgeA);
+        gpuPhongNeighbors[i]._pad1 = 0.0f;
+        CopyVec3(gpuPhongNeighbors[i].edge_b, phongNeighbors[i].edgeB);
+        gpuPhongNeighbors[i]._pad2 = 0.0f;
+        CopyVec3(gpuPhongNeighbors[i].normal, phongNeighbors[i].normal);
+        gpuPhongNeighbors[i].area_weight = phongNeighbors[i].areaWeight;
+    }
+
     sg_environment environment{};
     if (!LightmapComputePlatform_Init(&environment, error)) {
         return false;
@@ -472,44 +541,64 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
 
     bool success = false;
     sg_buffer lightsBuffer{};
+    sg_buffer surfaceEmitterBuffer{};
+    sg_buffer surfaceEmitterSampleBuffer{};
+    sg_buffer rectSurfaceEmitterIndexBuffer{};
     sg_buffer occluderBuffer{};
     sg_buffer solidBuffer{};
     sg_buffer solidPlaneBuffer{};
     sg_buffer repairSourcePolyBuffer{};
     sg_buffer repairSourceNeighborBuffer{};
+    sg_buffer phongSourcePolyBuffer{};
+    sg_buffer phongNeighborBuffer{};
     sg_buffer outputBuffer{};
     sg_view lightsView{};
+    sg_view surfaceEmitterView{};
+    sg_view surfaceEmitterSampleView{};
+    sg_view rectSurfaceEmitterIndexView{};
     sg_view occluderView{};
     sg_view solidView{};
     sg_view solidPlaneView{};
     sg_view repairSourcePolyView{};
     sg_view repairSourceNeighborView{};
+    sg_view phongSourcePolyView{};
+    sg_view phongNeighborView{};
     sg_view outputView{};
     sg_shader shader{};
     sg_pipeline pipeline{};
     sg_desc setupDesc{};
     sg_pipeline_desc pipelineDesc{};
     sg_buffer_desc lightsDesc{};
+    sg_buffer_desc surfaceEmitterDesc{};
+    sg_buffer_desc surfaceEmitterSampleDesc{};
+    sg_buffer_desc rectSurfaceEmitterIndexDesc{};
     sg_buffer_desc occluderDesc{};
     sg_buffer_desc solidDesc{};
     sg_buffer_desc solidPlaneDesc{};
     sg_buffer_desc repairSourcePolyDesc{};
     sg_buffer_desc repairSourceNeighborDesc{};
+    sg_buffer_desc phongSourcePolyDesc{};
+    sg_buffer_desc phongNeighborDesc{};
     sg_buffer_desc outputDesc{};
     sg_view_desc lightsViewDesc{};
+    sg_view_desc surfaceEmitterViewDesc{};
+    sg_view_desc surfaceEmitterSampleViewDesc{};
+    sg_view_desc rectSurfaceEmitterIndexViewDesc{};
     sg_view_desc occluderViewDesc{};
     sg_view_desc solidViewDesc{};
     sg_view_desc solidPlaneViewDesc{};
     sg_view_desc repairSourcePolyViewDesc{};
     sg_view_desc repairSourceNeighborViewDesc{};
+    sg_view_desc phongSourcePolyViewDesc{};
+    sg_view_desc phongNeighborViewDesc{};
     sg_view_desc outputViewDesc{};
     sg_pass pass{};
     sg_bindings bindings{};
 
-    setupDesc.buffer_pool_size = 10;
+    setupDesc.buffer_pool_size = 12;
     setupDesc.shader_pool_size = 2;
     setupDesc.pipeline_pool_size = 2;
-    setupDesc.view_pool_size = 10;
+    setupDesc.view_pool_size = 12;
     // One face-params upload is issued per rect dispatch. On Metal these uploads
     // are placed into a ring buffer with 256-byte alignment, so a 32-rect batch
     // needs far more than the old fixed 4 KB allocation.
@@ -557,6 +646,27 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     lightsDesc.label = "lightmap-lights";
     lightsBuffer = sg_make_buffer(&lightsDesc);
 
+    surfaceEmitterDesc.size = gpuSurfaceEmitters.size() * sizeof(GpuSurfaceEmitter);
+    surfaceEmitterDesc.usage.storage_buffer = true;
+    surfaceEmitterDesc.usage.immutable = true;
+    surfaceEmitterDesc.data = ByteRange(gpuSurfaceEmitters);
+    surfaceEmitterDesc.label = "lightmap-surface-emitters";
+    surfaceEmitterBuffer = sg_make_buffer(&surfaceEmitterDesc);
+
+    surfaceEmitterSampleDesc.size = gpuSurfaceEmitterSamples.size() * sizeof(GpuSurfaceEmitterSample);
+    surfaceEmitterSampleDesc.usage.storage_buffer = true;
+    surfaceEmitterSampleDesc.usage.immutable = true;
+    surfaceEmitterSampleDesc.data = ByteRange(gpuSurfaceEmitterSamples);
+    surfaceEmitterSampleDesc.label = "lightmap-surface-emitter-samples";
+    surfaceEmitterSampleBuffer = sg_make_buffer(&surfaceEmitterSampleDesc);
+
+    rectSurfaceEmitterIndexDesc.size = gpuRectSurfaceEmitterIndices.size() * sizeof(GpuSurfaceEmitterIndex);
+    rectSurfaceEmitterIndexDesc.usage.storage_buffer = true;
+    rectSurfaceEmitterIndexDesc.usage.immutable = true;
+    rectSurfaceEmitterIndexDesc.data = ByteRange(gpuRectSurfaceEmitterIndices);
+    rectSurfaceEmitterIndexDesc.label = "lightmap-rect-surface-emitter-indices";
+    rectSurfaceEmitterIndexBuffer = sg_make_buffer(&rectSurfaceEmitterIndexDesc);
+
     occluderDesc.size = gpuOccluders.size() * sizeof(GpuOccluderTri);
     occluderDesc.usage.storage_buffer = true;
     occluderDesc.usage.immutable = true;
@@ -592,6 +702,20 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     repairSourceNeighborDesc.label = "lightmap-repair-source-neighbors";
     repairSourceNeighborBuffer = sg_make_buffer(&repairSourceNeighborDesc);
 
+    phongSourcePolyDesc.size = gpuPhongSourcePolys.size() * sizeof(GpuPhongSourcePoly);
+    phongSourcePolyDesc.usage.storage_buffer = true;
+    phongSourcePolyDesc.usage.immutable = true;
+    phongSourcePolyDesc.data = ByteRange(gpuPhongSourcePolys);
+    phongSourcePolyDesc.label = "lightmap-phong-source-polys";
+    phongSourcePolyBuffer = sg_make_buffer(&phongSourcePolyDesc);
+
+    phongNeighborDesc.size = gpuPhongNeighbors.size() * sizeof(GpuPhongNeighbor);
+    phongNeighborDesc.usage.storage_buffer = true;
+    phongNeighborDesc.usage.immutable = true;
+    phongNeighborDesc.data = ByteRange(gpuPhongNeighbors);
+    phongNeighborDesc.label = "lightmap-phong-neighbors";
+    phongNeighborBuffer = sg_make_buffer(&phongNeighborDesc);
+
     outputDesc.size = bakedPixels.size() * sizeof(GpuBakedPixel);
     outputDesc.usage.storage_buffer = true;
     outputDesc.usage.immutable = true;
@@ -599,21 +723,31 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     outputDesc.label = "lightmap-output";
     outputBuffer = sg_make_buffer(&outputDesc);
     if ((sg_query_buffer_state(lightsBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(surfaceEmitterBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(surfaceEmitterSampleBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(rectSurfaceEmitterIndexBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(occluderBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(solidBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(solidPlaneBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(repairSourcePolyBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(repairSourceNeighborBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(phongSourcePolyBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(phongNeighborBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(outputBuffer) != SG_RESOURCESTATE_VALID))
     {
         SetError(error,
-                 "Failed to create compute buffers: lights=%s occluders=%s solids=%s solid_planes=%s repair_polys=%s repair_neighbors=%s output=%s.",
+                 "Failed to create compute buffers: lights=%s surface_emitters=%s surface_samples=%s rect_surface_indices=%s occluders=%s solids=%s solid_planes=%s repair_polys=%s repair_neighbors=%s phong_polys=%s phong_neighbors=%s output=%s.",
                  ResourceStateName(sg_query_buffer_state(lightsBuffer)),
+                 ResourceStateName(sg_query_buffer_state(surfaceEmitterBuffer)),
+                 ResourceStateName(sg_query_buffer_state(surfaceEmitterSampleBuffer)),
+                 ResourceStateName(sg_query_buffer_state(rectSurfaceEmitterIndexBuffer)),
                  ResourceStateName(sg_query_buffer_state(occluderBuffer)),
                  ResourceStateName(sg_query_buffer_state(solidBuffer)),
                  ResourceStateName(sg_query_buffer_state(solidPlaneBuffer)),
                  ResourceStateName(sg_query_buffer_state(repairSourcePolyBuffer)),
                  ResourceStateName(sg_query_buffer_state(repairSourceNeighborBuffer)),
+                 ResourceStateName(sg_query_buffer_state(phongSourcePolyBuffer)),
+                 ResourceStateName(sg_query_buffer_state(phongNeighborBuffer)),
                  ResourceStateName(sg_query_buffer_state(outputBuffer)));
         goto cleanup;
     }
@@ -621,6 +755,18 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     lightsViewDesc.storage_buffer.buffer = lightsBuffer;
     lightsViewDesc.label = "lightmap-lights-view";
     lightsView = sg_make_view(&lightsViewDesc);
+
+    surfaceEmitterViewDesc.storage_buffer.buffer = surfaceEmitterBuffer;
+    surfaceEmitterViewDesc.label = "lightmap-surface-emitters-view";
+    surfaceEmitterView = sg_make_view(&surfaceEmitterViewDesc);
+
+    surfaceEmitterSampleViewDesc.storage_buffer.buffer = surfaceEmitterSampleBuffer;
+    surfaceEmitterSampleViewDesc.label = "lightmap-surface-emitter-samples-view";
+    surfaceEmitterSampleView = sg_make_view(&surfaceEmitterSampleViewDesc);
+
+    rectSurfaceEmitterIndexViewDesc.storage_buffer.buffer = rectSurfaceEmitterIndexBuffer;
+    rectSurfaceEmitterIndexViewDesc.label = "lightmap-rect-surface-emitter-indices-view";
+    rectSurfaceEmitterIndexView = sg_make_view(&rectSurfaceEmitterIndexViewDesc);
 
     occluderViewDesc.storage_buffer.buffer = occluderBuffer;
     occluderViewDesc.label = "lightmap-occluders-view";
@@ -642,25 +788,43 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     repairSourceNeighborViewDesc.label = "lightmap-repair-source-neighbors-view";
     repairSourceNeighborView = sg_make_view(&repairSourceNeighborViewDesc);
 
+    phongSourcePolyViewDesc.storage_buffer.buffer = phongSourcePolyBuffer;
+    phongSourcePolyViewDesc.label = "lightmap-phong-source-polys-view";
+    phongSourcePolyView = sg_make_view(&phongSourcePolyViewDesc);
+
+    phongNeighborViewDesc.storage_buffer.buffer = phongNeighborBuffer;
+    phongNeighborViewDesc.label = "lightmap-phong-neighbors-view";
+    phongNeighborView = sg_make_view(&phongNeighborViewDesc);
+
     outputViewDesc.storage_buffer.buffer = outputBuffer;
     outputViewDesc.label = "lightmap-output-view";
     outputView = sg_make_view(&outputViewDesc);
     if ((sg_query_view_state(lightsView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(surfaceEmitterView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(surfaceEmitterSampleView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(rectSurfaceEmitterIndexView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(occluderView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(solidView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(solidPlaneView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(repairSourcePolyView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(repairSourceNeighborView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(phongSourcePolyView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(phongNeighborView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(outputView) != SG_RESOURCESTATE_VALID))
     {
         SetError(error,
-                 "Failed to create compute buffer views: lights=%s occluders=%s solids=%s solid_planes=%s repair_polys=%s repair_neighbors=%s output=%s.",
+                 "Failed to create compute buffer views: lights=%s surface_emitters=%s surface_samples=%s rect_surface_indices=%s occluders=%s solids=%s solid_planes=%s repair_polys=%s repair_neighbors=%s phong_polys=%s phong_neighbors=%s output=%s.",
                  ResourceStateName(sg_query_view_state(lightsView)),
+                 ResourceStateName(sg_query_view_state(surfaceEmitterView)),
+                 ResourceStateName(sg_query_view_state(surfaceEmitterSampleView)),
+                 ResourceStateName(sg_query_view_state(rectSurfaceEmitterIndexView)),
                  ResourceStateName(sg_query_view_state(occluderView)),
                  ResourceStateName(sg_query_view_state(solidView)),
                  ResourceStateName(sg_query_view_state(solidPlaneView)),
                  ResourceStateName(sg_query_view_state(repairSourcePolyView)),
                  ResourceStateName(sg_query_view_state(repairSourceNeighborView)),
+                 ResourceStateName(sg_query_view_state(phongSourcePolyView)),
+                 ResourceStateName(sg_query_view_state(phongNeighborView)),
                  ResourceStateName(sg_query_view_state(outputView)));
         goto cleanup;
     }
@@ -675,7 +839,12 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     bindings.views[VIEW_warped_lightmap_bake_cs_solid_planes] = solidPlaneView;
     bindings.views[VIEW_warped_lightmap_bake_cs_repair_source_polys] = repairSourcePolyView;
     bindings.views[VIEW_warped_lightmap_bake_cs_repair_source_neighbors] = repairSourceNeighborView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_phong_source_polys] = phongSourcePolyView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_phong_neighbors] = phongNeighborView;
     bindings.views[VIEW_warped_lightmap_bake_cs_output] = outputView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_surface_emitters] = surfaceEmitterView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_surface_emitter_samples] = surfaceEmitterSampleView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_rect_surface_emitter_indices] = rectSurfaceEmitterIndexView;
 
     for (size_t batchStart = 0; batchStart < rects.size(); batchStart += kDispatchBatchSize) {
         const size_t batchEnd = std::min(batchStart + (size_t)kDispatchBatchSize, rects.size());
@@ -693,11 +862,16 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             params.rect_w = rect.w;
             params.rect_h = rect.h;
             params.light_count = (int) lights.size();
+            params.surface_emitter_count_total = (int)surfaceEmitters.size();
+            params.surface_emitter_sample_count_total = (int)surfaceEmitterSamples.size();
+            params.rect_surface_emitter_index_count_total = (int)rectSurfaceEmitterIndices.size();
             params.tri_count = (int) occluders.size();
             params.solid_count = (int) brushSolids.size();
             params.solid_plane_count = (int) solidPlanes.size();
             params.repair_poly_count = (int) repairSourcePolys.size();
             params.repair_link_count = (int) repairSourceNeighbors.size();
+            params.phong_poly_count = (int) phongSourcePolys.size();
+            params.phong_neighbor_count_total = (int) phongNeighbors.size();
             params.repair_source_poly_index = rect.sourcePolyIndex;
             params._pad_repair0 = 0;
             params.min_u = rect.minU;
@@ -710,17 +884,27 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             params.dirt_mode = settings.dirtMode;
             params.skylight_dirt = ((settings.sunlight2Dirt == -2) ? settings.dirt : settings.sunlight2Dirt) == 1 ? 1 : 0;
             params.phong_neighbor_count = rect.phongNeighborCount;
+            if (rectIndex < rectSurfaceEmitterRanges.size()) {
+                params.rect_surface_emitter_index_first = rectSurfaceEmitterRanges[rectIndex].firstEmitterIndex;
+                params.rect_surface_emitter_index_count = rectSurfaceEmitterRanges[rectIndex].emitterCount;
+            } else {
+                params.rect_surface_emitter_index_first = 0;
+                params.rect_surface_emitter_index_count = 0;
+            }
             params.dirt_depth = settings.dirtDepth;
             params.dirt_scale = settings.dirtScale;
             params.dirt_gain = settings.dirtGain;
             params.dirt_angle = settings.dirtAngle;
             params.skylight_angle_scale = settings.sunlightAngleScale;
             params.sky_trace_distance = skyTraceDistance;
+            params.sunlight_nosky = settings.sunlightNoSky;
             // Mirror the CPU-side aaGrid derivation from settings.extraSamples.
             // 0 -> 1x1 (off), 2 -> 2x2, 4 -> 4x4 (historical default).
             params.extra_samples = (settings.extraSamples <= 0) ? 1
                                  : (settings.extraSamples <= 2) ? 2 : 4;
-            params._pad_scalar0 = 0;
+            params.oversampled_output = oversampledOutput ? 1 : 0;
+            params.surface_sample_offset = settings.surfaceSampleOffset;
+            params._pad_scalar0 = 0.0f;
             CopyVec3(params.sunlight2_color, settings.sunlight2Color);
             params.sunlight2_intensity = settings.sunlight2Intensity;
             CopyVec3(params.sunlight3_color, settings.sunlight3Color);
@@ -799,6 +983,21 @@ cleanup:
     if (outputView.id) {
         sg_destroy_view(outputView);
     }
+    if (rectSurfaceEmitterIndexView.id) {
+        sg_destroy_view(rectSurfaceEmitterIndexView);
+    }
+    if (surfaceEmitterSampleView.id) {
+        sg_destroy_view(surfaceEmitterSampleView);
+    }
+    if (surfaceEmitterView.id) {
+        sg_destroy_view(surfaceEmitterView);
+    }
+    if (phongNeighborView.id) {
+        sg_destroy_view(phongNeighborView);
+    }
+    if (phongSourcePolyView.id) {
+        sg_destroy_view(phongSourcePolyView);
+    }
     if (repairSourceNeighborView.id) {
         sg_destroy_view(repairSourceNeighborView);
     }
@@ -819,6 +1018,21 @@ cleanup:
     }
     if (outputBuffer.id) {
         sg_destroy_buffer(outputBuffer);
+    }
+    if (rectSurfaceEmitterIndexBuffer.id) {
+        sg_destroy_buffer(rectSurfaceEmitterIndexBuffer);
+    }
+    if (surfaceEmitterSampleBuffer.id) {
+        sg_destroy_buffer(surfaceEmitterSampleBuffer);
+    }
+    if (surfaceEmitterBuffer.id) {
+        sg_destroy_buffer(surfaceEmitterBuffer);
+    }
+    if (phongNeighborBuffer.id) {
+        sg_destroy_buffer(phongNeighborBuffer);
+    }
+    if (phongSourcePolyBuffer.id) {
+        sg_destroy_buffer(phongSourcePolyBuffer);
     }
     if (repairSourceNeighborBuffer.id) {
         sg_destroy_buffer(repairSourceNeighborBuffer);

@@ -971,6 +971,19 @@ static void AppendDeviatedLights(const PointLight& baseLight,
 LightBakeSettings GetLightBakeSettings(const Map &map) {
     LightBakeSettings settings;
 
+    auto ConvertLegacyMaxLight = [](float value) {
+        if (value <= 0.0f) {
+            return 0.0f;
+        }
+        // Ericw-style maxlight lives in the classic Quake brightness domain.
+        // Values above a small HDR-style threshold are treated as legacy values
+        // and mapped into Warped's float lightmap space.
+        if (value > 4.0f) {
+            return value / 64.0f;
+        }
+        return value;
+    };
+
     for (const Entity& entity : map.entities) {
         if (!EntityHasClass(entity, "worldspawn")) {
             continue;
@@ -997,9 +1010,58 @@ LightBakeSettings GetLightBakeSettings(const Map &map) {
             settings.bounceScale = std::max(0.0f, bounceScale);
         }
 
+        float bounceColorScale = settings.bounceColorScale;
+        if (ParseFloatProp(entity, "_bouncecolorscale", bounceColorScale)) {
+            settings.bounceColorScale = std::clamp(bounceColorScale, 0.0f, 1.0f);
+        }
+
+        float bounceLightSubdivision = settings.bounceLightSubdivision;
+        if (ParseFloatProp(entity, "_bouncelightsubdivision", bounceLightSubdivision)) {
+            settings.bounceLightSubdivision = std::max(1.0f, bounceLightSubdivision);
+        }
+
+        float rangeScale = settings.rangeScale;
+        if (ParseFloatProp(entity, "_range", rangeScale)) {
+            settings.rangeScale = std::max(0.0f, rangeScale);
+        }
+
+        float maxLight = settings.maxLight;
+        if (ParseFloatProp(entity, "_maxlight", maxLight)) {
+            settings.maxLight = ConvertLegacyMaxLight(maxLight);
+        }
+
+        float lightmapGamma = settings.lightmapGamma;
+        if (ParseFloatProp(entity, "_gamma", lightmapGamma) ||
+            ParseFloatProp(entity, "gamma", lightmapGamma)) {
+            settings.lightmapGamma = std::max(0.01f, lightmapGamma);
+        }
+
+        float surfLightScale = settings.surfLightScale;
+        if (ParseFloatProp(entity, "_surflightscale", surfLightScale)) {
+            settings.surfLightScale = std::max(0.0f, surfLightScale);
+        }
+
+        float surfLightAttenuation = settings.surfLightAttenuation;
+        if (ParseFloatProp(entity, "_surflight_atten", surfLightAttenuation)) {
+            settings.surfLightAttenuation = std::max(0.0f, surfLightAttenuation);
+        }
+
+        float surfLightSubdivision = settings.surfLightSubdivision;
+        if (ParseFloatProp(entity, "_surflightsubdivision", surfLightSubdivision) ||
+            ParseFloatProp(entity, "_choplight", surfLightSubdivision)) {
+            settings.surfLightSubdivision = std::max(1.0f, surfLightSubdivision);
+        }
+
+        float surfaceSampleOffset = settings.surfaceSampleOffset;
+        if (ParseFloatProp(entity, "_sampleoffset", surfaceSampleOffset) ||
+            ParseFloatProp(entity, "_sample_offset", surfaceSampleOffset)) {
+            settings.surfaceSampleOffset = std::max(0.125f, surfaceSampleOffset);
+        }
+
         ParseFloatProp(entity, "_sunlight", settings.sunlightIntensity);
         ParseFloatProp(entity, "_sunlight2", settings.sunlight2Intensity);
         ParseFloatProp(entity, "_sunlight3", settings.sunlight3Intensity);
+        ParseIntProp(entity, "_sunlight_nosky", settings.sunlightNoSky);
         ParseFloatProp(entity, "_sunlight_penumbra", settings.sunlightPenumbra);
         settings.sunlightAngleScale = ParseAngleScaleProp(entity, settings.sunlightAngleScale);
         settings.dirt = ParseDirtOverrideProp(entity, "_dirt", settings.dirt);
@@ -1064,10 +1126,14 @@ LightBakeSettings GetLightBakeSettings(const Map &map) {
         break;
     }
 
-    printf("[LightSettings] ambient=(%.2f,%.2f,%.2f) luxel=%.3f bounces=%d bounceScale=%.2f sun=%.1f sun2=%.1f sun3=%.1f dirt=%d lmAA=%d extraSamples=%d soften=%d\n",
+    printf("[LightSettings] ambient=(%.2f,%.2f,%.2f) luxel=%.3f bounces=%d bounceScale=%.2f bounceColorScale=%.2f bounceSubdiv=%.1f range=%.2f maxLight=%.3f gamma=%.2f surfScale=%.2f surfAtten=%.2f surfSubdiv=%.1f sampleOffset=%.3f sun=%.1f sun2=%.1f sun3=%.1f sunNoSky=%d dirt=%d lmAA=%d extraSamples=%d soften=%d\n",
            settings.ambientColor.x, settings.ambientColor.y, settings.ambientColor.z,
-           settings.luxelSize, settings.bounceCount, settings.bounceScale,
+           settings.luxelSize, settings.bounceCount, settings.bounceScale, settings.bounceColorScale,
+           settings.bounceLightSubdivision, settings.rangeScale, settings.maxLight, settings.lightmapGamma,
+           settings.surfLightScale, settings.surfLightAttenuation, settings.surfLightSubdivision,
+           settings.surfaceSampleOffset,
            settings.sunlightIntensity, settings.sunlight2Intensity, settings.sunlight3Intensity,
+           settings.sunlightNoSky,
            settings.dirt, settings.lmAAScale, settings.extraSamples, settings.soften);
     return settings;
 }
@@ -1412,6 +1478,22 @@ static void AppendBrushEntityPolygons(const Entity& entity,
     ParseIntProp(entity, "_phong_group", phongGroup);
     int surfaceLightGroup = 0;
     ParseIntProp(entity, "_surflight_group", surfaceLightGroup);
+    int noBounce = 0;
+    ParseIntProp(entity, "_nobounce", noBounce);
+    float surfLightAttenuation = -1.0f;
+    if (ParseFloatProp(entity, "_surflight_atten", surfLightAttenuation)) {
+        surfLightAttenuation = std::max(0.0f, surfLightAttenuation);
+    }
+    int surfLightRescale = -1;
+    if (ParseIntProp(entity, "_surflight_rescale", surfLightRescale)) {
+        surfLightRescale = (surfLightRescale != 0) ? 1 : 0;
+    }
+    if (!EntityHasClass(entity, "worldspawn")) {
+        int bounceOverride = 1;
+        if (ParseIntProp(entity, "_bounce", bounceOverride) && bounceOverride <= 0) {
+            noBounce = 1;
+        }
+    }
 
     std::vector<MapPolygon> entityPolys;
 
@@ -1475,6 +1557,9 @@ static void AppendBrushEntityPolygons(const Entity& entity,
             mp.sourceEntityId = sourceEntityId;
             mp.sourceFaceIndex = i;
             mp.surfaceLightGroup = surfaceLightGroup;
+            mp.noBounce = (uint8_t)(noBounce != 0);
+            mp.surfLightAttenuation = surfLightAttenuation;
+            mp.surfLightRescale = (int8_t)surfLightRescale;
             mp.phong = phongEnabled != 0;
             mp.phongAngle = std::max(1.0f, phongAngle);
             mp.phongAngleConcave = std::max(0.0f, phongAngleConcave);

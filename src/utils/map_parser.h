@@ -75,6 +75,7 @@ struct PointLight {
     int     directional = 0;
     Vector3 parallelDirection{0.0f, 0.0f, 0.0f}; // surface -> light direction for parallel sun/skydome samples
     int     parallel = 0;
+    int     requiresSkyVisibility = 0;
     int     ignoreOccluderGroup = -1;
     uint8_t attenuationMode = POINT_LIGHT_ATTEN_QUADRATIC;
     float   angleScale = 1.0f;
@@ -101,11 +102,29 @@ struct LightBakeSettings {
     float   luxelSize = 1.0f;
     int     bounceCount = 1;
     float   bounceScale = 1.0f;
+    float   bounceColorScale = 0.0f;
+    float   bounceLightSubdivision = 64.0f;
+    // Ericw-style `_range`: 0.5 is neutral, >0.5 brighter, <0.5 darker.
+    // Warped preserves current output by mapping this to a neutral multiplier
+    // of 1.0 at the default value of 0.5.
+    float   rangeScale = 0.5f;
+    // `_maxlight` interpreted into Warped's linear HDR lightmap domain. 0
+    // disables the clamp.
+    float   maxLight = 0.0f;
+    // Ericw-style `_gamma`. 1.0 is neutral, >1 brightens, <1 darkens.
+    float   lightmapGamma = 1.0f;
+    float   surfLightScale = 1.0f;
+    float   surfLightAttenuation = 1.0f;
+    float   surfLightSubdivision = 16.0f;
+    // Ericw-style sample positioning lifts luxels 1 unit off the face before
+    // shading / visibility tests. This stays CPU-only until compute parity.
+    float   surfaceSampleOffset = 1.0f;
     float   sunlightIntensity = 0.0f;
     Vector3 sunlightColor{1.0f, 1.0f, 1.0f};
     Vector3 sunlightDirection{0.0f, 1.0f, 0.0f}; // surface -> light
     float   sunlightPenumbra = 0.0f;
     float   sunlightAngleScale = 0.5f;
+    int     sunlightNoSky = 0;
     float   sunlight2Intensity = 0.0f;
     Vector3 sunlight2Color{1.0f, 1.0f, 1.0f};
     float   sunlight3Intensity = 0.0f;
@@ -158,6 +177,9 @@ struct MapPolygon {
     int                  sourceEntityId = -1;
     int                  sourceFaceIndex = -1;
     int                  surfaceLightGroup = 0;
+    uint8_t              noBounce = 0;
+    float                surfLightAttenuation = -1.0f;
+    int8_t               surfLightRescale = -1;
     uint8_t              phong = 0;
     float                phongAngle = 89.0f;
     float                phongAngleConcave = 0.0f;

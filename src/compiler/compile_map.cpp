@@ -17,6 +17,7 @@
 #include "stb_image.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -47,6 +48,66 @@ static TexInfo ProbeTexture(const std::string& mapDir, const std::string& name,
     else printf("[compile_map] texture '%s' not found, assuming 64x64\n", name.c_str());
     cache[name] = ti;
     return ti;
+}
+
+static float Srgb8ToLinearFloat(uint8_t c)
+{
+    const float srgb = (float)c / 255.0f;
+    if (srgb <= 0.04045f) {
+        return srgb / 12.92f;
+    }
+    return powf((srgb + 0.055f) / 1.055f, 2.4f);
+}
+
+static Vector3 ProbeTextureAverageColor(const std::string& mapDir,
+                                        const std::string& name,
+                                        std::unordered_map<std::string, Vector3>& cache)
+{
+    auto it = cache.find(name);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    Vector3 avgColor{0.5f, 0.5f, 0.5f};
+    if (name.empty() || !IsPackableTextureName(name)) {
+        cache[name] = avgColor;
+        return avgColor;
+    }
+
+    std::string path = mapDir + "/../textures/" + name + ".png";
+    int w = 0, h = 0, comp = 0;
+    unsigned char* pixels = stbi_load(path.c_str(), &w, &h, &comp, 0);
+    if (pixels && w > 0 && h > 0 && comp >= 3) {
+        double accumR = 0.0;
+        double accumG = 0.0;
+        double accumB = 0.0;
+        double accumWeight = 0.0;
+        const size_t pixelCount = (size_t)w * (size_t)h;
+        for (size_t i = 0; i < pixelCount; ++i) {
+            const unsigned char* px = pixels + i * (size_t)comp;
+            const float alpha = (comp >= 4) ? ((float)px[3] / 255.0f) : 1.0f;
+            if (alpha <= 0.0f) {
+                continue;
+            }
+            accumR += (double)Srgb8ToLinearFloat(px[0]) * (double)alpha;
+            accumG += (double)Srgb8ToLinearFloat(px[1]) * (double)alpha;
+            accumB += (double)Srgb8ToLinearFloat(px[2]) * (double)alpha;
+            accumWeight += (double)alpha;
+        }
+        if (accumWeight > 1e-6) {
+            avgColor = {
+                (float)(accumR / accumWeight),
+                (float)(accumG / accumWeight),
+                (float)(accumB / accumWeight)
+            };
+        }
+    }
+    if (pixels) {
+        stbi_image_free(pixels);
+    }
+
+    cache[name] = avgColor;
+    return avgColor;
 }
 
 // --------------------------------------------------------------------------
@@ -156,6 +217,7 @@ int main(int argc, char** argv)
     std::vector<SurfaceLightTemplate> surfaceLights = GetSurfaceLightTemplates(map);
     LightBakeSettings lightSettings = GetLightBakeSettings(map);
     std::unordered_map<std::string,TexInfo> texCache;
+    std::unordered_map<std::string,Vector3> textureColorCache;
     std::unordered_map<std::string,uint32_t> texIdx;
     std::vector<BSPTexture> textures;
     std::vector<PackagedAssetEntry> packagedAssets;
@@ -179,11 +241,15 @@ int main(int argc, char** argv)
     StructuralBSPData structural = BuildStructuralBSP(rawPolys, GetTex);
     const std::vector<MapPolygon>& bspPolys =
         structural.splitPolygons.empty() ? rawPolys : structural.splitPolygons;
+    std::unordered_map<std::string, Vector3> textureBounceColors;
+    for (const MapPolygon& poly : bspPolys) {
+        textureBounceColors[poly.texture] = ProbeTextureAverageColor(mapDir, poly.texture, textureColorCache);
+    }
     printf("[compile_map] structural bsp: %zu raw faces -> %zu bsp faces, %zu planes, %zu nodes, %zu leaves\n",
            rawPolys.size(), bspPolys.size(), structural.planes.size(), structural.nodes.size(), structural.leaves.size());
 
     printf("[compile_map] baking lightmap...\n");
-    LightmapAtlas lm = BakeLightmap(bspPolys, bspPolys, lights, surfaceLights, lightSettings);
+    LightmapAtlas lm = BakeLightmap(bspPolys, bspPolys, lights, surfaceLights, textureBounceColors, lightSettings);
 
     // ----- triangulate into buckets ---------------------------------------
     std::vector<BSPVertex>  vertices;

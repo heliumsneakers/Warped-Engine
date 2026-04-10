@@ -31,6 +31,26 @@ struct LightmapComputeRepairSourcePoly {
     float polyVerts[LIGHTMAP_COMPUTE_MAX_POLY_VERTS][4] = {};
 };
 
+struct LightmapComputePhongNeighbor {
+    int sourcePolyIndex = -1;
+    float _pad0[3] = {};
+    Vector3 edgeA{};
+    float _pad1 = 0.0f;
+    Vector3 edgeB{};
+    float _pad2 = 0.0f;
+    Vector3 normal{};
+    float areaWeight = 1.0f;
+};
+
+struct LightmapComputePhongSourcePoly {
+    Vector3 normal{};
+    float areaWeight = 1.0f;
+    int enabled = 0;
+    int firstNeighbor = 0;
+    int neighborCount = 0;
+    float _pad0 = 0.0f;
+};
+
 struct LightmapComputeFaceRect {
     int w = 0;
     int h = 0;
@@ -53,6 +73,30 @@ struct LightmapComputeFaceRect {
     float phongNeighborEdgeA[LIGHTMAP_COMPUTE_MAX_PHONG_NEIGHBORS][4] = {};
     float phongNeighborEdgeB[LIGHTMAP_COMPUTE_MAX_PHONG_NEIGHBORS][4] = {};
     float phongNeighborNormalWeight[LIGHTMAP_COMPUTE_MAX_PHONG_NEIGHBORS][4] = {};
+};
+
+struct LightmapComputeSurfaceEmitter {
+    PointLight baseLight{};
+    Vector3 surfaceNormal{};
+    float sampleIntensityScale = 1.0f;
+    float attenuationScale = 1.0f;
+    float transportScale = 1.0f;
+    float hotspotClamp = 16.0f;
+    int firstSamplePoint = 0;
+    int samplePointCount = 0;
+    uint8_t omnidirectional = 0;
+    uint8_t rescale = 0;
+    uint8_t _pad0[2] = {};
+};
+
+struct LightmapComputeSurfaceEmitterSample {
+    Vector3 point{};
+    float _pad0 = 0.0f;
+};
+
+struct LightmapComputeRectSurfaceEmitterRange {
+    int firstEmitterIndex = 0;
+    int emitterCount = 0;
 };
 
 struct LightmapComputeOccluderTri {
@@ -83,10 +127,17 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          const std::vector<LightmapComputeSolidPlane>& solidPlanes,
                          const std::vector<LightmapComputeRepairSourcePoly>& repairSourcePolys,
                          const std::vector<LightmapComputeRepairSourceNeighbor>& repairSourceNeighbors,
+                         const std::vector<LightmapComputePhongSourcePoly>& phongSourcePolys,
+                         const std::vector<LightmapComputePhongNeighbor>& phongNeighbors,
                          const std::vector<PointLight>& lights,
+                         const std::vector<LightmapComputeSurfaceEmitter>& surfaceEmitters,
+                         const std::vector<LightmapComputeSurfaceEmitterSample>& surfaceEmitterSamples,
+                         const std::vector<LightmapComputeRectSurfaceEmitterRange>& rectSurfaceEmitterRanges,
+                         const std::vector<uint32_t>& rectSurfaceEmitterIndices,
                          const LightBakeSettings& settings,
                          float skyTraceDistance,
                          int atlasWidth,
                          int atlasHeight,
+                         bool oversampledOutput,
                          std::vector<float>& outPixels,
                          std::string* error);
