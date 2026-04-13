@@ -67,6 +67,8 @@ layout(binding=0) uniform cs_face_params {
     int surface_emitter_sample_count_total;
     int rect_surface_emitter_index_count_total;
     int tri_count;
+    int bvh_node_count;
+    int bvh_tri_index_count;
     int solid_count;
     int solid_plane_count;
     int repair_poly_count;
@@ -188,6 +190,18 @@ struct occluder_tri {
     int source_poly_index;
 };
 
+struct bvh_node {
+    vec3 bounds_min;
+    int left_first;
+    vec3 bounds_max;
+    int right_count;
+};
+
+struct bvh_tri_index {
+    uint tri_index;
+    vec3 _pad0;
+};
+
 struct baked_pixel {
     vec4 value;
 };
@@ -198,6 +212,14 @@ layout(binding=0) readonly buffer cs_lights {
 
 layout(binding=1) readonly buffer cs_occluders {
     occluder_tri tris[];
+};
+
+layout(binding=12) readonly buffer cs_bvh_nodes {
+    bvh_node bvh_nodes[];
+};
+
+layout(binding=13) readonly buffer cs_bvh_tri_indices {
+    bvh_tri_index bvh_tri_indices[];
 };
 
 layout(binding=2) readonly buffer cs_solids {
@@ -260,6 +282,7 @@ const int SKYDOME_ELEVATION_STEPS = 5;
 const int SKYDOME_ANGLE_STEPS = SKYDOME_ELEVATION_STEPS * 4;
 const int SKYDOME_SAMPLE_COUNT = SKYDOME_ANGLE_STEPS * SKYDOME_ELEVATION_STEPS + 1;
 const int REPAIR_RECURSION_MAX = 3;
+const int BVH_STACK_SIZE = 64;
 
 vec3 safe_normalize(vec3 v, vec3 fallback) {
     float len_sq = dot(v, v);
@@ -467,7 +490,7 @@ vec3 safe_inverse_dir(vec3 rd) {
     return 1.0 / denom;
 }
 
-bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
+bool occluded_bruteforce(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
     vec3 inv_rd = safe_inverse_dir(rd);
     for (int i = 0; i < tri_count; ++i) {
         occluder_tri tri = tris[i];
@@ -487,7 +510,7 @@ bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder
     return false;
 }
 
-float closest_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
+float closest_hit_distance_bruteforce(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
     vec3 inv_rd = safe_inverse_dir(rd);
     float closest = dist;
     for (int i = 0; i < tri_count; ++i) {
@@ -507,6 +530,130 @@ float closest_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, int ig
         }
     }
     return closest;
+}
+
+bool occluded_bvh(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
+    vec3 inv_rd = safe_inverse_dir(rd);
+    int stack[BVH_STACK_SIZE];
+    int stack_size = 0;
+    int node_index = 0;
+
+    while (true) {
+        if ((node_index >= 0) && (node_index < bvh_node_count)) {
+            bvh_node node = bvh_nodes[node_index];
+            if (ray_aabb(ro, inv_rd, node.bounds_min, node.bounds_max, dist)) {
+                if (node.right_count > 0) {
+                    for (int i = 0; i < node.right_count; ++i) {
+                        int index_index = node.left_first + i;
+                        if ((index_index < 0) || (index_index >= bvh_tri_index_count)) {
+                            continue;
+                        }
+                        int tri_index = int(bvh_tri_indices[index_index].tri_index);
+                        if ((tri_index < 0) || (tri_index >= tri_count)) {
+                            continue;
+                        }
+                        occluder_tri tri = tris[tri_index];
+                        if ((ignore_occluder_group >= 0) && (tri.occluder_group == ignore_occluder_group)) {
+                            continue;
+                        }
+                        if ((ignore_source_poly_index >= 0) && (tri.source_poly_index == ignore_source_poly_index)) {
+                            continue;
+                        }
+                        if (ray_tri(ro, rd, tri, min_hit_t, dist)) {
+                            return true;
+                        }
+                    }
+                } else {
+                    int left_child = node.left_first;
+                    int right_child = -node.right_count;
+                    if (stack_size >= BVH_STACK_SIZE) {
+                        return occluded_bruteforce(ro, rd, min_hit_t, dist, ignore_occluder_group, ignore_source_poly_index);
+                    }
+                    stack[stack_size] = right_child;
+                    stack_size += 1;
+                    node_index = left_child;
+                    continue;
+                }
+            }
+        }
+
+        if (stack_size <= 0) {
+            break;
+        }
+        stack_size -= 1;
+        node_index = stack[stack_size];
+    }
+    return false;
+}
+
+float closest_hit_distance_bvh(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
+    vec3 inv_rd = safe_inverse_dir(rd);
+    float closest = dist;
+    int stack[BVH_STACK_SIZE];
+    int stack_size = 0;
+    int node_index = 0;
+
+    while (true) {
+        if ((node_index >= 0) && (node_index < bvh_node_count)) {
+            bvh_node node = bvh_nodes[node_index];
+            if (ray_aabb(ro, inv_rd, node.bounds_min, node.bounds_max, closest)) {
+                if (node.right_count > 0) {
+                    for (int i = 0; i < node.right_count; ++i) {
+                        int index_index = node.left_first + i;
+                        if ((index_index < 0) || (index_index >= bvh_tri_index_count)) {
+                            continue;
+                        }
+                        int tri_index = int(bvh_tri_indices[index_index].tri_index);
+                        if ((tri_index < 0) || (tri_index >= tri_count)) {
+                            continue;
+                        }
+                        occluder_tri tri = tris[tri_index];
+                        if ((ignore_occluder_group >= 0) && (tri.occluder_group == ignore_occluder_group)) {
+                            continue;
+                        }
+                        if ((ignore_source_poly_index >= 0) && (tri.source_poly_index == ignore_source_poly_index)) {
+                            continue;
+                        }
+                        float t = ray_tri_t(ro, rd, tri);
+                        if ((t > min_hit_t) && (t < closest)) {
+                            closest = t;
+                        }
+                    }
+                } else {
+                    int left_child = node.left_first;
+                    int right_child = -node.right_count;
+                    if (stack_size >= BVH_STACK_SIZE) {
+                        return closest_hit_distance_bruteforce(ro, rd, min_hit_t, dist, ignore_occluder_group, ignore_source_poly_index);
+                    }
+                    stack[stack_size] = right_child;
+                    stack_size += 1;
+                    node_index = left_child;
+                    continue;
+                }
+            }
+        }
+
+        if (stack_size <= 0) {
+            break;
+        }
+        stack_size -= 1;
+        node_index = stack[stack_size];
+    }
+    return closest;
+}
+
+bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
+    if (bvh_node_count > 0) {
+        return occluded_bvh(ro, rd, min_hit_t, dist, ignore_occluder_group, ignore_source_poly_index);
+    }
+    return occluded_bruteforce(ro, rd, min_hit_t, dist, ignore_occluder_group, ignore_source_poly_index);
+}
+
+float closest_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
+    if (bvh_node_count > 0) {
+        return closest_hit_distance_bvh(ro, rd, min_hit_t, dist, ignore_occluder_group, ignore_source_poly_index);
+    }
+    return closest_hit_distance_bruteforce(ro, rd, min_hit_t, dist, ignore_occluder_group, ignore_source_poly_index);
 }
 
 vec3 project_point_onto_plane(vec3 point, vec3 plane_point, vec3 plane_normal) {

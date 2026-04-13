@@ -21,7 +21,7 @@
 //  Tunables
 // --------------------------------------------------------------------------
 static constexpr int   LM_PAD             = 2;      // border luxels (filled by dilate)
-static constexpr int   LIGHTMAP_PAGE_SIZE = 2048;
+static constexpr int   LIGHTMAP_PAGE_SIZE = 1024;
 static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face luxel cap (interior only)
 static constexpr float SHADOW_BIAS        = 0.03125f;
 static constexpr float DIRECT_SHADOW_ORIGIN_BIAS = SHADOW_BIAS * 0.25f;
@@ -1331,6 +1331,7 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
     if (nonShadowCasterCount > 0) {
         printf("[Lightmap] skipped %d non-shadow-casting utility faces from occluders.\n", nonShadowCasterCount);
     }
+    LightmapTraceBuildAcceleration(&o);
     return o;
 }
 
@@ -4633,6 +4634,7 @@ static bool BuildComputeOversampledGroupRects(const std::vector<FaceRect>& rects
 static bool BakeLightmapComputeStitchedExtra(const std::vector<FaceRect>& rects,
                                              const std::vector<std::vector<uint8_t>>& validMasks,
                                              const std::vector<LightmapComputeOccluderTri>& computeOccluders,
+                                             const LightmapComputeBvh& computeBvh,
                                              const std::vector<LightmapComputeBrushSolid>& computeBrushSolids,
                                              const std::vector<LightmapComputeSolidPlane>& computeSolidPlanes,
                                              const std::vector<LightmapComputeRepairSourcePoly>& computeRepairSourcePolys,
@@ -4678,6 +4680,7 @@ static bool BakeLightmapComputeStitchedExtra(const std::vector<FaceRect>& rects,
         std::vector<float> hiPixels;
         if (!BakeLightmapCompute(hiRects,
                                  computeOccluders,
+                                 computeBvh,
                                  computeBrushSolids,
                                  computeSolidPlanes,
                                  computeRepairSourcePolys,
@@ -4989,13 +4992,21 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                            const std::vector<PointLight>& lights,
                            const std::vector<SurfaceLightTemplate>& surfaceLights,
                            const std::unordered_map<std::string, Vector3>& textureBounceColors,
-                           const LightBakeSettings& settings)
+                           const LightBakeSettings& settings,
+                           LightmapBakeBackendMode backendMode)
 {
     LightmapAtlas atlas;
     const float luxelSize = std::max(0.125f, settings.luxelSize);
-    const bool forceCpuBake = ForceLightmapCPUFromEnv();
+    const bool forceCpuFromEnv = (backendMode == LIGHTMAP_BAKE_BACKEND_AUTO) && ForceLightmapCPUFromEnv();
+    const bool forceCpuBake = (backendMode == LIGHTMAP_BAKE_BACKEND_FORCE_CPU) || forceCpuFromEnv;
+    const char* forceCpuReason = (backendMode == LIGHTMAP_BAKE_BACKEND_FORCE_CPU)
+        ? "forced CPU reference bake via -cpu"
+        : "forced CPU reference bake via WARPED_LIGHTMAP_FORCE_CPU";
     if (forceCpuBake) {
-        printf("[Lightmap] forcing CPU reference bake via WARPED_LIGHTMAP_FORCE_CPU.\n");
+        printf("[Lightmap] %s.\n", forceCpuReason);
+        fflush(stdout);
+    } else if (backendMode == LIGHTMAP_BAKE_BACKEND_PREFER_GPU) {
+        printf("[Lightmap] preferring GPU compute bake via -gpu; unsupported pages can still fall back to CPU.\n");
         fflush(stdout);
     }
 
@@ -5046,6 +5057,22 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
 
     OccluderSet occ = BuildOccluders(occluderPolys.empty() ? visiblePolys : occluderPolys);
     const std::vector<LightmapComputeOccluderTri> computeOccluders = BuildLightmapComputeOccluders(occ);
+    LightmapComputeBvh computeBvh;
+    if (!forceCpuBake) {
+        std::string computeBvhError;
+        if (BuildLightmapComputeBvh(computeOccluders, &computeBvh, &computeBvhError)) {
+            if (!computeBvh.nodes.empty()) {
+                printf("[Lightmap] Embree-built GPU BVH ready (%zu nodes, %zu tri refs).\n",
+                       computeBvh.nodes.size(),
+                       computeBvh.triIndices.size());
+                fflush(stdout);
+            }
+        } else if (!computeBvhError.empty()) {
+            printf("[Lightmap] GPU BVH unavailable; compute tracing will scan triangles: %s\n",
+                   computeBvhError.c_str());
+            fflush(stdout);
+        }
+    }
     std::vector<LightmapComputeBrushSolid> computeBrushSolids;
     std::vector<LightmapComputeSolidPlane> computeSolidPlanes;
     std::vector<LightmapComputeRepairSourcePoly> computeRepairSourcePolys;
@@ -5121,6 +5148,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
             !BakeLightmapComputeStitchedExtra(rects,
                                               baseValidMasks,
                                               computeOccluders,
+                                              computeBvh,
                                               computeBrushSolids,
                                               computeSolidPlanes,
                                               computeRepairSourcePolys,
@@ -5157,7 +5185,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         bool pageRequiresCPU = forceCpuBake ||
             (useStitchedExtraResolve && (!directUseComputeStitchedResolve || directStitchedCpuBaked));
         std::string computeError = forceCpuBake
-            ? "forced CPU reference bake via WARPED_LIGHTMAP_FORCE_CPU"
+            ? forceCpuReason
             : ((useStitchedExtraResolve && directStitchedCpuBaked)
                 ? "stitched direct bake already fell back to CPU earlier in this atlas"
                 : ((useStitchedExtraResolve && !directUseComputeStitchedResolve) ? directComputeStitchedError : std::string()));
@@ -5201,6 +5229,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         if (!usedPrecomputedComputeResult &&
             (pageRequiresCPU || !BakeLightmapCompute(pageRects,
                                                      computeOccluders,
+                                                     computeBvh,
                                                      computeBrushSolids,
                                                      computeSolidPlanes,
                                                      computeRepairSourcePolys,
@@ -5219,8 +5248,13 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                                                      false,
                                                      page.pixels,
                                                      &computeError))) {
-            printf("[Lightmap] page %u compute bake unavailable, falling back to CPU: %s\n",
-                   pageIndex, computeError.c_str());
+            if (pageRequiresCPU) {
+                printf("[Lightmap] page %u CPU bake selected: %s\n",
+                       pageIndex, computeError.c_str());
+            } else {
+                printf("[Lightmap] page %u compute bake unavailable, falling back to CPU: %s\n",
+                       pageIndex, computeError.c_str());
+            }
             fflush(stdout);
             if (useStitchedExtraResolve) {
                 if (!directStitchedCpuBaked) {

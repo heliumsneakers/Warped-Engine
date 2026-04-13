@@ -1,6 +1,6 @@
 // compile_map.cpp  —  offline .map → .bsp compiler.
 //
-//   Usage:  ./compile_map <PATH_TO_MAP_FILE> <COMPILED_MAP_NAME>
+//   Usage:  ./compile_map <PATH_TO_MAP_FILE> <COMPILED_MAP_NAME> [-cpu|-gpu]
 //
 // Produces <COMPILED_MAP_NAME>.bsp containing pre-triangulated render
 // geometry with baked lightmap UVs, convex-hull collision data, the
@@ -190,13 +190,45 @@ static std::vector<uint8_t> EncodeLightmapPageRGBA16F(const LightmapPage& page)
     return encoded;
 }
 
+static void PrintUsage(const char* exe)
+{
+    fprintf(stderr, "Usage: %s <PATH_TO_MAP_FILE> <COMPILED_MAP_NAME> [-cpu|-gpu]\n", exe);
+    fprintf(stderr, "  -cpu  Force the CPU reference lightmap baker.\n");
+    fprintf(stderr, "  -gpu  Prefer the GPU compute baker; unsupported pages can still fall back to CPU.\n");
+}
+
 // --------------------------------------------------------------------------
 int main(int argc, char** argv)
 {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <PATH_TO_MAP_FILE> <COMPILED_MAP_NAME>\n", argv[0]);
+    if (argc < 3) {
+        PrintUsage(argv[0]);
         return 1;
     }
+
+    LightmapBakeBackendMode backendMode = LIGHTMAP_BAKE_BACKEND_AUTO;
+    for (int argIndex = 3; argIndex < argc; ++argIndex) {
+        const char* arg = argv[argIndex];
+        if (std::strcmp(arg, "-cpu") == 0) {
+            if (backendMode == LIGHTMAP_BAKE_BACKEND_PREFER_GPU) {
+                fprintf(stderr, "[compile_map] -cpu and -gpu are mutually exclusive.\n");
+                PrintUsage(argv[0]);
+                return 1;
+            }
+            backendMode = LIGHTMAP_BAKE_BACKEND_FORCE_CPU;
+        } else if (std::strcmp(arg, "-gpu") == 0) {
+            if (backendMode == LIGHTMAP_BAKE_BACKEND_FORCE_CPU) {
+                fprintf(stderr, "[compile_map] -cpu and -gpu are mutually exclusive.\n");
+                PrintUsage(argv[0]);
+                return 1;
+            }
+            backendMode = LIGHTMAP_BAKE_BACKEND_PREFER_GPU;
+        } else {
+            fprintf(stderr, "[compile_map] unknown option: %s\n", arg);
+            PrintUsage(argv[0]);
+            return 1;
+        }
+    }
+
     std::string mapPath = argv[1];
     std::string outName = argv[2];
     if (outName.size()<4 || outName.substr(outName.size()-4)!=".bsp")
@@ -216,6 +248,11 @@ int main(int argc, char** argv)
     std::vector<PointLight> lights = GetPointLights(map);
     std::vector<SurfaceLightTemplate> surfaceLights = GetSurfaceLightTemplates(map);
     LightBakeSettings lightSettings = GetLightBakeSettings(map);
+    if (backendMode == LIGHTMAP_BAKE_BACKEND_FORCE_CPU) {
+        printf("[compile_map] lightmap backend: CPU forced\n");
+    } else if (backendMode == LIGHTMAP_BAKE_BACKEND_PREFER_GPU) {
+        printf("[compile_map] lightmap backend: GPU preferred\n");
+    }
     std::unordered_map<std::string,TexInfo> texCache;
     std::unordered_map<std::string,Vector3> textureColorCache;
     std::unordered_map<std::string,uint32_t> texIdx;
@@ -249,7 +286,7 @@ int main(int argc, char** argv)
            rawPolys.size(), bspPolys.size(), structural.planes.size(), structural.nodes.size(), structural.leaves.size());
 
     printf("[compile_map] baking lightmap...\n");
-    LightmapAtlas lm = BakeLightmap(bspPolys, bspPolys, lights, surfaceLights, textureBounceColors, lightSettings);
+    LightmapAtlas lm = BakeLightmap(bspPolys, bspPolys, lights, surfaceLights, textureBounceColors, lightSettings, backendMode);
 
     // ----- triangulate into buckets ---------------------------------------
     std::vector<BSPVertex>  vertices;

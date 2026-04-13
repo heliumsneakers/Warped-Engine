@@ -347,6 +347,49 @@ void UnloadAllTextures(TextureManager& mgr) {
 void Renderer_Init(void) {
     sg_backend backend = sg_query_backend();
 
+    /*
+    sg_pixel_format
+
+    sokol_gfx.h basically uses the same pixel formats as WebGPU, since these
+    are supported on most newer GPUs.
+
+    A pixelformat name consist of three parts:
+
+        - components (R, RG, RGB or RGBA)
+        - bit width per component (8, 16 or 32)
+        - component data type:
+            - unsigned normalized (no postfix)
+            - signed normalized (SN postfix)
+            - unsigned integer (UI postfix)
+            - signed integer (SI postfix)
+            - float (F postfix)
+
+    Not all pixel formats can be used for everything, call sg_query_pixelformat()
+    to inspect the capabilities of a given pixelformat. The function returns
+    an sg_pixelformat_info struct with the following members:
+
+        - sample: the pixelformat can be sampled as texture at least with
+                  nearest filtering
+        - filter: the pixelformat can be sampled as texture with linear
+                  filtering
+        - render: the pixelformat can be used as render-pass attachment
+        - blend:  blending is supported when used as render-pass attachment
+        - msaa:   multisample-antialiasing is supported when used
+                  as render-pass attachment
+        - depth:  the pixelformat can be used for depth-stencil attachments
+        - compressed: this is a block-compressed format
+        - bytes_per_pixel: the numbers of bytes in a pixel (0 for compressed formats)
+
+    The default pixel format for texture images is SG_PIXELFORMAT_RGBA8.
+
+    The default pixel format for render target images is platform-dependent
+    and taken from the sg_environment struct passed into sg_setup(). Typically
+    the default formats are:
+
+        - for the Metal, D3D11 and WebGPU backends: SG_PIXELFORMAT_BGRA8
+        - for GL backends: SG_PIXELFORMAT_RGBA8
+*/
+
     // --- sampler (repeat + trilinear) ------------------------------------
     sg_sampler_desc smp = {};
     smp.min_filter = SG_FILTER_LINEAR;

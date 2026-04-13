@@ -108,6 +108,18 @@ struct LightmapComputeOccluderTri {
     int sourcePolyIndex = -1;
 };
 
+struct LightmapComputeBvhNode {
+    Vector3 boundsMin{};
+    int leftFirst = 0;
+    Vector3 boundsMax{};
+    int rightCount = 0;
+};
+
+struct LightmapComputeBvh {
+    std::vector<LightmapComputeBvhNode> nodes;
+    std::vector<uint32_t> triIndices;
+};
+
 struct LightmapComputeBrushSolid {
     int firstPlane = 0;
     int planeCount = 0;
@@ -121,8 +133,13 @@ struct LightmapComputeSolidPlane {
     float _pad1 = 0.0f;
 };
 
+bool BuildLightmapComputeBvh(const std::vector<LightmapComputeOccluderTri>& occluders,
+                             LightmapComputeBvh* outBvh,
+                             std::string* error = nullptr);
+
 bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          const std::vector<LightmapComputeOccluderTri>& occluders,
+                         const LightmapComputeBvh& bvh,
                          const std::vector<LightmapComputeBrushSolid>& brushSolids,
                          const std::vector<LightmapComputeSolidPlane>& solidPlanes,
                          const std::vector<LightmapComputeRepairSourcePoly>& repairSourcePolys,

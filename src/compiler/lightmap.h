@@ -25,6 +25,12 @@ struct LightmapAtlas {
     std::vector<LightmapPatch> patches;
 };
 
+enum LightmapBakeBackendMode : uint8_t {
+    LIGHTMAP_BAKE_BACKEND_AUTO = 0,
+    LIGHTMAP_BAKE_BACKEND_FORCE_CPU,
+    LIGHTMAP_BAKE_BACKEND_PREFER_GPU,
+};
+
 // Allocate per-face UV rects, split oversized faces into lightmap-only bake
 // patches, pack them into multiple lightmap pages and bake Lambert lighting
 // from the supplied point lights. `polys` remains the authoritative source
@@ -35,4 +41,5 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                            const std::vector<PointLight>& lights,
                            const std::vector<SurfaceLightTemplate>& surfaceLights,
                            const std::unordered_map<std::string, Vector3>& textureBounceColors,
-                           const LightBakeSettings& settings);
+                           const LightBakeSettings& settings,
+                           LightmapBakeBackendMode backendMode = LIGHTMAP_BAKE_BACKEND_AUTO);

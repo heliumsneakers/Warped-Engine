@@ -7,6 +7,14 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <new>
+
+#ifdef WARPED_LIGHTMAP_USE_EMBREE
+    #include <embree4/rtcore.h>
+    #include <embree4/rtcore_builder.h>
+#endif
 
 #if defined(WARPED_SOKOL_BACKEND_METAL)
     #define SOKOL_METAL
@@ -55,7 +63,143 @@ using GpuRepairSourceNeighbor = warped_lightmap_bake_repair_source_neighbor_t;
 using GpuPhongSourcePoly = warped_lightmap_bake_phong_source_poly_t;
 using GpuPhongNeighbor = warped_lightmap_bake_phong_neighbor_t;
 using GpuFaceParams = warped_lightmap_bake_cs_face_params_t;
+using GpuBvhNode = warped_lightmap_bake_bvh_node_t;
+using GpuBvhTriIndex = warped_lightmap_bake_bvh_tri_index_t;
 using GpuBakedPixel = warped_lightmap_bake_baked_pixel_t;
+
+#ifdef WARPED_LIGHTMAP_USE_EMBREE
+struct EmbreeGpuBvhNode {
+    bool leaf = false;
+    unsigned int childCount = 0;
+    EmbreeGpuBvhNode* children[2] = {};
+    AABB childBounds[2] = {};
+    AABB bounds = AABBInvalid();
+    size_t leafFirst = 0;
+    size_t leafCount = 0;
+};
+
+struct EmbreeGpuBvhBuildContext {
+    const std::vector<LightmapComputeOccluderTri>* occluders = nullptr;
+    std::vector<uint32_t> triIndices;
+    std::mutex triIndexMutex;
+};
+
+Vector3 RtcBoundsMin(const RTCBounds& bounds) {
+    return Vector3{bounds.lower_x, bounds.lower_y, bounds.lower_z};
+}
+
+Vector3 RtcBoundsMax(const RTCBounds& bounds) {
+    return Vector3{bounds.upper_x, bounds.upper_y, bounds.upper_z};
+}
+
+AABB AABBFromRtcBounds(const RTCBounds& bounds) {
+    AABB result = AABBInvalid();
+    AABBExtend(&result, RtcBoundsMin(bounds));
+    AABBExtend(&result, RtcBoundsMax(bounds));
+    return result;
+}
+
+AABB AABBFromBuildPrimitive(const RTCBuildPrimitive& prim) {
+    AABB result = AABBInvalid();
+    AABBExtend(&result, Vector3{prim.lower_x, prim.lower_y, prim.lower_z});
+    AABBExtend(&result, Vector3{prim.upper_x, prim.upper_y, prim.upper_z});
+    return result;
+}
+
+AABB MergeAABB(AABB a, const AABB& b) {
+    AABBExtend(&a, b.min);
+    AABBExtend(&a, b.max);
+    return a;
+}
+
+void* EmbreeGpuBvhCreateNode(RTCThreadLocalAllocator allocator, unsigned int childCount, void* userPtr) {
+    (void) userPtr;
+    void* ptr = rtcThreadLocalAlloc(allocator, sizeof(EmbreeGpuBvhNode), 16);
+    EmbreeGpuBvhNode* node = new (ptr) EmbreeGpuBvhNode();
+    node->leaf = false;
+    node->childCount = std::min(childCount, 2u);
+    return node;
+}
+
+void EmbreeGpuBvhSetNodeChildren(void* nodePtr, void** children, unsigned int childCount, void* userPtr) {
+    (void) userPtr;
+    EmbreeGpuBvhNode* node = (EmbreeGpuBvhNode*) nodePtr;
+    node->childCount = std::min(childCount, 2u);
+    for (unsigned int i = 0; i < node->childCount; ++i) {
+        node->children[i] = (EmbreeGpuBvhNode*) children[i];
+    }
+}
+
+void EmbreeGpuBvhSetNodeBounds(void* nodePtr, const RTCBounds** bounds, unsigned int childCount, void* userPtr) {
+    (void) userPtr;
+    EmbreeGpuBvhNode* node = (EmbreeGpuBvhNode*) nodePtr;
+    const unsigned int storedChildCount = std::min(childCount, 2u);
+    for (unsigned int i = 0; i < storedChildCount; ++i) {
+        node->childBounds[i] = AABBFromRtcBounds(*bounds[i]);
+    }
+}
+
+void* EmbreeGpuBvhCreateLeaf(RTCThreadLocalAllocator allocator,
+                             const RTCBuildPrimitive* primitives,
+                             size_t primitiveCount,
+                             void* userPtr) {
+    EmbreeGpuBvhBuildContext* context = (EmbreeGpuBvhBuildContext*) userPtr;
+    void* ptr = rtcThreadLocalAlloc(allocator, sizeof(EmbreeGpuBvhNode), 16);
+    EmbreeGpuBvhNode* node = new (ptr) EmbreeGpuBvhNode();
+    node->leaf = true;
+    node->bounds = AABBInvalid();
+
+    std::lock_guard<std::mutex> lock(context->triIndexMutex);
+    node->leafFirst = context->triIndices.size();
+    node->leafCount = primitiveCount;
+    for (size_t i = 0; i < primitiveCount; ++i) {
+        context->triIndices.push_back(primitives[i].primID);
+        node->bounds = MergeAABB(node->bounds, AABBFromBuildPrimitive(primitives[i]));
+    }
+    return node;
+}
+
+int FlattenEmbreeGpuBvhNode(const EmbreeGpuBvhNode* node, LightmapComputeBvh* outBvh) {
+    if (!node) {
+        return -1;
+    }
+
+    if (node->leaf || node->childCount == 0) {
+        const int nodeIndex = (int) outBvh->nodes.size();
+        LightmapComputeBvhNode flat{};
+        flat.boundsMin = node->bounds.min;
+        flat.boundsMax = node->bounds.max;
+        flat.leftFirst = (int) node->leafFirst;
+        flat.rightCount = (int) node->leafCount;
+        outBvh->nodes.push_back(flat);
+        return nodeIndex;
+    }
+
+    if (node->childCount == 1) {
+        return FlattenEmbreeGpuBvhNode(node->children[0], outBvh);
+    }
+
+    const int nodeIndex = (int) outBvh->nodes.size();
+    outBvh->nodes.push_back(LightmapComputeBvhNode{});
+
+    const int leftIndex = FlattenEmbreeGpuBvhNode(node->children[0], outBvh);
+    const int rightIndex = FlattenEmbreeGpuBvhNode(node->children[1], outBvh);
+    if ((leftIndex < 0) || (rightIndex < 0)) {
+        return -1;
+    }
+
+    AABB bounds = AABBInvalid();
+    bounds = MergeAABB(bounds, AABB{outBvh->nodes[(size_t)leftIndex].boundsMin, outBvh->nodes[(size_t)leftIndex].boundsMax});
+    bounds = MergeAABB(bounds, AABB{outBvh->nodes[(size_t)rightIndex].boundsMin, outBvh->nodes[(size_t)rightIndex].boundsMax});
+
+    LightmapComputeBvhNode& flat = outBvh->nodes[(size_t)nodeIndex];
+    flat.boundsMin = bounds.min;
+    flat.boundsMax = bounds.max;
+    flat.leftFirst = leftIndex;
+    flat.rightCount = -rightIndex;
+    return nodeIndex;
+}
+#endif
 
 const char* BackendName(sg_backend backend) {
     switch (backend) {
@@ -370,8 +514,133 @@ bool LightmapComputePlatform_ReadbackBuffer(sg_buffer buffer, size_t numBytes, v
 
 } // namespace
 
+bool BuildLightmapComputeBvh(const std::vector<LightmapComputeOccluderTri>& occluders,
+                             LightmapComputeBvh* outBvh,
+                             std::string* error) {
+    if (!outBvh) {
+        SetError(error, "GPU BVH output pointer was null.");
+        return false;
+    }
+
+    outBvh->nodes.clear();
+    outBvh->triIndices.clear();
+    if (occluders.empty()) {
+        return true;
+    }
+
+#ifndef WARPED_LIGHTMAP_USE_EMBREE
+    SetError(error, "Embree builder support is disabled in this compile_map build.");
+    return false;
+#else
+    if (occluders.size() > (size_t)std::numeric_limits<unsigned int>::max()) {
+        SetError(error, "Too many occluder triangles for Embree GPU BVH build.");
+        return false;
+    }
+
+    std::vector<RTCBuildPrimitive> primitives(occluders.size());
+    for (size_t i = 0; i < occluders.size(); ++i) {
+        const LightmapComputeOccluderTri& tri = occluders[i];
+        RTCBuildPrimitive& prim = primitives[i];
+        prim.lower_x = tri.bounds.min.x;
+        prim.lower_y = tri.bounds.min.y;
+        prim.lower_z = tri.bounds.min.z;
+        prim.geomID = 0;
+        prim.upper_x = tri.bounds.max.x;
+        prim.upper_y = tri.bounds.max.y;
+        prim.upper_z = tri.bounds.max.z;
+        prim.primID = (unsigned int)i;
+    }
+
+    RTCDevice device = rtcNewDevice(nullptr);
+    if (!device) {
+        SetError(error, "Failed to create Embree device for GPU BVH build.");
+        return false;
+    }
+
+    RTCBVH embreeBvh = rtcNewBVH(device);
+    if (!embreeBvh) {
+        const RTCError rtcError = rtcGetDeviceError(device);
+        const char* rtcMessage = rtcGetDeviceLastErrorMessage(device);
+        SetError(error,
+                 "Failed to create Embree BVH for GPU bake (%s%s%s).",
+                 rtcGetErrorString(rtcError),
+                 (rtcMessage && rtcMessage[0]) ? ": " : "",
+                 (rtcMessage && rtcMessage[0]) ? rtcMessage : "");
+        rtcReleaseDevice(device);
+        return false;
+    }
+
+    EmbreeGpuBvhBuildContext context;
+    context.occluders = &occluders;
+    context.triIndices.reserve(occluders.size());
+
+    RTCBuildArguments args = rtcDefaultBuildArguments();
+    args.buildQuality = RTC_BUILD_QUALITY_MEDIUM;
+    args.buildFlags = RTC_BUILD_FLAG_NONE;
+    args.maxBranchingFactor = 2;
+    args.maxDepth = 64;
+    args.sahBlockSize = 1;
+    args.minLeafSize = 1;
+    args.maxLeafSize = 4;
+    args.traversalCost = 1.0f;
+    args.intersectionCost = 1.0f;
+    args.bvh = embreeBvh;
+    args.primitives = primitives.data();
+    args.primitiveCount = primitives.size();
+    args.primitiveArrayCapacity = primitives.size();
+    args.createNode = EmbreeGpuBvhCreateNode;
+    args.setNodeChildren = EmbreeGpuBvhSetNodeChildren;
+    args.setNodeBounds = EmbreeGpuBvhSetNodeBounds;
+    args.createLeaf = EmbreeGpuBvhCreateLeaf;
+    args.userPtr = &context;
+
+    EmbreeGpuBvhNode* root = (EmbreeGpuBvhNode*)rtcBuildBVH(&args);
+    if (!root) {
+        const RTCError rtcError = rtcGetDeviceError(device);
+        const char* rtcMessage = rtcGetDeviceLastErrorMessage(device);
+        SetError(error,
+                 "Embree GPU BVH build failed (%s%s%s).",
+                 rtcGetErrorString(rtcError),
+                 (rtcMessage && rtcMessage[0]) ? ": " : "",
+                 (rtcMessage && rtcMessage[0]) ? rtcMessage : "");
+        rtcReleaseBVH(embreeBvh);
+        rtcReleaseDevice(device);
+        return false;
+    }
+
+    if (context.triIndices.size() > (size_t)std::numeric_limits<int>::max()) {
+        SetError(error, "Embree GPU BVH produced too many triangle references.");
+        rtcReleaseBVH(embreeBvh);
+        rtcReleaseDevice(device);
+        return false;
+    }
+
+    outBvh->triIndices = std::move(context.triIndices);
+    outBvh->nodes.reserve(outBvh->triIndices.size() * 2);
+    const int rootIndex = FlattenEmbreeGpuBvhNode(root, outBvh);
+    rtcReleaseBVH(embreeBvh);
+    rtcReleaseDevice(device);
+
+    if (rootIndex != 0 || outBvh->nodes.empty()) {
+        outBvh->nodes.clear();
+        outBvh->triIndices.clear();
+        SetError(error, "Embree GPU BVH flattening produced an invalid root.");
+        return false;
+    }
+    if (outBvh->nodes.size() > (size_t)std::numeric_limits<int>::max()) {
+        outBvh->nodes.clear();
+        outBvh->triIndices.clear();
+        SetError(error, "Embree GPU BVH produced too many nodes.");
+        return false;
+    }
+
+    return true;
+#endif
+}
+
 bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
                          const std::vector<LightmapComputeOccluderTri>& occluders,
+                         const LightmapComputeBvh& bvh,
                          const std::vector<LightmapComputeBrushSolid>& brushSolids,
                          const std::vector<LightmapComputeSolidPlane>& solidPlanes,
                          const std::vector<LightmapComputeRepairSourcePoly>& repairSourcePolys,
@@ -464,6 +733,28 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         gpuOccluders[i].source_poly_index = occluders[i].sourcePolyIndex;
     }
 
+    if ((bvh.nodes.size() > (size_t)std::numeric_limits<int>::max()) ||
+        (bvh.triIndices.size() > (size_t)std::numeric_limits<int>::max())) {
+        SetError(error, "GPU BVH is too large for shader dispatch parameters.");
+        return false;
+    }
+
+    std::vector<GpuBvhNode> gpuBvhNodes(std::max<size_t>(1, bvh.nodes.size()));
+    for (size_t i = 0; i < bvh.nodes.size(); ++i) {
+        CopyVec3(gpuBvhNodes[i].bounds_min, bvh.nodes[i].boundsMin);
+        gpuBvhNodes[i].left_first = bvh.nodes[i].leftFirst;
+        CopyVec3(gpuBvhNodes[i].bounds_max, bvh.nodes[i].boundsMax);
+        gpuBvhNodes[i].right_count = bvh.nodes[i].rightCount;
+    }
+
+    std::vector<GpuBvhTriIndex> gpuBvhTriIndices(std::max<size_t>(1, bvh.triIndices.size()));
+    for (size_t i = 0; i < bvh.triIndices.size(); ++i) {
+        gpuBvhTriIndices[i].tri_index = bvh.triIndices[i];
+        gpuBvhTriIndices[i]._pad0[0] = 0.0f;
+        gpuBvhTriIndices[i]._pad0[1] = 0.0f;
+        gpuBvhTriIndices[i]._pad0[2] = 0.0f;
+    }
+
     std::vector<GpuBrushSolid> gpuBrushSolids(std::max<size_t>(1, brushSolids.size()));
     for (size_t i = 0; i < brushSolids.size(); ++i) {
         gpuBrushSolids[i].first_plane = brushSolids[i].firstPlane;
@@ -545,6 +836,8 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     sg_buffer surfaceEmitterSampleBuffer{};
     sg_buffer rectSurfaceEmitterIndexBuffer{};
     sg_buffer occluderBuffer{};
+    sg_buffer bvhNodeBuffer{};
+    sg_buffer bvhTriIndexBuffer{};
     sg_buffer solidBuffer{};
     sg_buffer solidPlaneBuffer{};
     sg_buffer repairSourcePolyBuffer{};
@@ -557,6 +850,8 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     sg_view surfaceEmitterSampleView{};
     sg_view rectSurfaceEmitterIndexView{};
     sg_view occluderView{};
+    sg_view bvhNodeView{};
+    sg_view bvhTriIndexView{};
     sg_view solidView{};
     sg_view solidPlaneView{};
     sg_view repairSourcePolyView{};
@@ -573,6 +868,8 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     sg_buffer_desc surfaceEmitterSampleDesc{};
     sg_buffer_desc rectSurfaceEmitterIndexDesc{};
     sg_buffer_desc occluderDesc{};
+    sg_buffer_desc bvhNodeDesc{};
+    sg_buffer_desc bvhTriIndexDesc{};
     sg_buffer_desc solidDesc{};
     sg_buffer_desc solidPlaneDesc{};
     sg_buffer_desc repairSourcePolyDesc{};
@@ -585,6 +882,8 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     sg_view_desc surfaceEmitterSampleViewDesc{};
     sg_view_desc rectSurfaceEmitterIndexViewDesc{};
     sg_view_desc occluderViewDesc{};
+    sg_view_desc bvhNodeViewDesc{};
+    sg_view_desc bvhTriIndexViewDesc{};
     sg_view_desc solidViewDesc{};
     sg_view_desc solidPlaneViewDesc{};
     sg_view_desc repairSourcePolyViewDesc{};
@@ -595,10 +894,10 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     sg_pass pass{};
     sg_bindings bindings{};
 
-    setupDesc.buffer_pool_size = 12;
+    setupDesc.buffer_pool_size = 14;
     setupDesc.shader_pool_size = 2;
     setupDesc.pipeline_pool_size = 2;
-    setupDesc.view_pool_size = 12;
+    setupDesc.view_pool_size = 14;
     // One face-params upload is issued per rect dispatch. On Metal these uploads
     // are placed into a ring buffer with 256-byte alignment, so a 32-rect batch
     // needs far more than the old fixed 4 KB allocation.
@@ -674,6 +973,20 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     occluderDesc.label = "lightmap-occluders";
     occluderBuffer = sg_make_buffer(&occluderDesc);
 
+    bvhNodeDesc.size = gpuBvhNodes.size() * sizeof(GpuBvhNode);
+    bvhNodeDesc.usage.storage_buffer = true;
+    bvhNodeDesc.usage.immutable = true;
+    bvhNodeDesc.data = ByteRange(gpuBvhNodes);
+    bvhNodeDesc.label = "lightmap-bvh-nodes";
+    bvhNodeBuffer = sg_make_buffer(&bvhNodeDesc);
+
+    bvhTriIndexDesc.size = gpuBvhTriIndices.size() * sizeof(GpuBvhTriIndex);
+    bvhTriIndexDesc.usage.storage_buffer = true;
+    bvhTriIndexDesc.usage.immutable = true;
+    bvhTriIndexDesc.data = ByteRange(gpuBvhTriIndices);
+    bvhTriIndexDesc.label = "lightmap-bvh-tri-indices";
+    bvhTriIndexBuffer = sg_make_buffer(&bvhTriIndexDesc);
+
     solidDesc.size = gpuBrushSolids.size() * sizeof(GpuBrushSolid);
     solidDesc.usage.storage_buffer = true;
     solidDesc.usage.immutable = true;
@@ -727,6 +1040,8 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         (sg_query_buffer_state(surfaceEmitterSampleBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(rectSurfaceEmitterIndexBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(occluderBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(bvhNodeBuffer) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_buffer_state(bvhTriIndexBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(solidBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(solidPlaneBuffer) != SG_RESOURCESTATE_VALID) ||
         (sg_query_buffer_state(repairSourcePolyBuffer) != SG_RESOURCESTATE_VALID) ||
@@ -736,12 +1051,14 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         (sg_query_buffer_state(outputBuffer) != SG_RESOURCESTATE_VALID))
     {
         SetError(error,
-                 "Failed to create compute buffers: lights=%s surface_emitters=%s surface_samples=%s rect_surface_indices=%s occluders=%s solids=%s solid_planes=%s repair_polys=%s repair_neighbors=%s phong_polys=%s phong_neighbors=%s output=%s.",
+                 "Failed to create compute buffers: lights=%s surface_emitters=%s surface_samples=%s rect_surface_indices=%s occluders=%s bvh_nodes=%s bvh_tri_indices=%s solids=%s solid_planes=%s repair_polys=%s repair_neighbors=%s phong_polys=%s phong_neighbors=%s output=%s.",
                  ResourceStateName(sg_query_buffer_state(lightsBuffer)),
                  ResourceStateName(sg_query_buffer_state(surfaceEmitterBuffer)),
                  ResourceStateName(sg_query_buffer_state(surfaceEmitterSampleBuffer)),
                  ResourceStateName(sg_query_buffer_state(rectSurfaceEmitterIndexBuffer)),
                  ResourceStateName(sg_query_buffer_state(occluderBuffer)),
+                 ResourceStateName(sg_query_buffer_state(bvhNodeBuffer)),
+                 ResourceStateName(sg_query_buffer_state(bvhTriIndexBuffer)),
                  ResourceStateName(sg_query_buffer_state(solidBuffer)),
                  ResourceStateName(sg_query_buffer_state(solidPlaneBuffer)),
                  ResourceStateName(sg_query_buffer_state(repairSourcePolyBuffer)),
@@ -771,6 +1088,14 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
     occluderViewDesc.storage_buffer.buffer = occluderBuffer;
     occluderViewDesc.label = "lightmap-occluders-view";
     occluderView = sg_make_view(&occluderViewDesc);
+
+    bvhNodeViewDesc.storage_buffer.buffer = bvhNodeBuffer;
+    bvhNodeViewDesc.label = "lightmap-bvh-nodes-view";
+    bvhNodeView = sg_make_view(&bvhNodeViewDesc);
+
+    bvhTriIndexViewDesc.storage_buffer.buffer = bvhTriIndexBuffer;
+    bvhTriIndexViewDesc.label = "lightmap-bvh-tri-indices-view";
+    bvhTriIndexView = sg_make_view(&bvhTriIndexViewDesc);
 
     solidViewDesc.storage_buffer.buffer = solidBuffer;
     solidViewDesc.label = "lightmap-solids-view";
@@ -804,6 +1129,8 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         (sg_query_view_state(surfaceEmitterSampleView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(rectSurfaceEmitterIndexView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(occluderView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(bvhNodeView) != SG_RESOURCESTATE_VALID) ||
+        (sg_query_view_state(bvhTriIndexView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(solidView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(solidPlaneView) != SG_RESOURCESTATE_VALID) ||
         (sg_query_view_state(repairSourcePolyView) != SG_RESOURCESTATE_VALID) ||
@@ -813,12 +1140,14 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
         (sg_query_view_state(outputView) != SG_RESOURCESTATE_VALID))
     {
         SetError(error,
-                 "Failed to create compute buffer views: lights=%s surface_emitters=%s surface_samples=%s rect_surface_indices=%s occluders=%s solids=%s solid_planes=%s repair_polys=%s repair_neighbors=%s phong_polys=%s phong_neighbors=%s output=%s.",
+                 "Failed to create compute buffer views: lights=%s surface_emitters=%s surface_samples=%s rect_surface_indices=%s occluders=%s bvh_nodes=%s bvh_tri_indices=%s solids=%s solid_planes=%s repair_polys=%s repair_neighbors=%s phong_polys=%s phong_neighbors=%s output=%s.",
                  ResourceStateName(sg_query_view_state(lightsView)),
                  ResourceStateName(sg_query_view_state(surfaceEmitterView)),
                  ResourceStateName(sg_query_view_state(surfaceEmitterSampleView)),
                  ResourceStateName(sg_query_view_state(rectSurfaceEmitterIndexView)),
                  ResourceStateName(sg_query_view_state(occluderView)),
+                 ResourceStateName(sg_query_view_state(bvhNodeView)),
+                 ResourceStateName(sg_query_view_state(bvhTriIndexView)),
                  ResourceStateName(sg_query_view_state(solidView)),
                  ResourceStateName(sg_query_view_state(solidPlaneView)),
                  ResourceStateName(sg_query_view_state(repairSourcePolyView)),
@@ -835,6 +1164,8 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
 
     bindings.views[VIEW_warped_lightmap_bake_cs_lights] = lightsView;
     bindings.views[VIEW_warped_lightmap_bake_cs_occluders] = occluderView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_bvh_nodes] = bvhNodeView;
+    bindings.views[VIEW_warped_lightmap_bake_cs_bvh_tri_indices] = bvhTriIndexView;
     bindings.views[VIEW_warped_lightmap_bake_cs_solids] = solidView;
     bindings.views[VIEW_warped_lightmap_bake_cs_solid_planes] = solidPlaneView;
     bindings.views[VIEW_warped_lightmap_bake_cs_repair_source_polys] = repairSourcePolyView;
@@ -866,6 +1197,8 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             params.surface_emitter_sample_count_total = (int)surfaceEmitterSamples.size();
             params.rect_surface_emitter_index_count_total = (int)rectSurfaceEmitterIndices.size();
             params.tri_count = (int) occluders.size();
+            params.bvh_node_count = (int)bvh.nodes.size();
+            params.bvh_tri_index_count = (int)bvh.triIndices.size();
             params.solid_count = (int) brushSolids.size();
             params.solid_plane_count = (int) solidPlanes.size();
             params.repair_poly_count = (int) repairSourcePolys.size();
@@ -1010,6 +1343,12 @@ cleanup:
     if (solidView.id) {
         sg_destroy_view(solidView);
     }
+    if (bvhTriIndexView.id) {
+        sg_destroy_view(bvhTriIndexView);
+    }
+    if (bvhNodeView.id) {
+        sg_destroy_view(bvhNodeView);
+    }
     if (occluderView.id) {
         sg_destroy_view(occluderView);
     }
@@ -1045,6 +1384,12 @@ cleanup:
     }
     if (solidBuffer.id) {
         sg_destroy_buffer(solidBuffer);
+    }
+    if (bvhTriIndexBuffer.id) {
+        sg_destroy_buffer(bvhTriIndexBuffer);
+    }
+    if (bvhNodeBuffer.id) {
+        sg_destroy_buffer(bvhNodeBuffer);
     }
     if (occluderBuffer.id) {
         sg_destroy_buffer(occluderBuffer);

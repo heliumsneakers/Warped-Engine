@@ -4,6 +4,7 @@
 #include "lightmap_compute.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 enum LightmapTraceHitKind : uint8_t {
@@ -30,8 +31,11 @@ struct LightmapTraceTri {
     int materialId = -1;
 };
 
+class LightmapTraceAcceleration;
+
 struct LightmapTraceScene {
     std::vector<LightmapTraceTri> tris;
+    std::shared_ptr<LightmapTraceAcceleration> acceleration;
 };
 
 struct LightmapTraceQuery {
@@ -65,5 +69,7 @@ float LightmapTraceClosestHitDistance(const LightmapTraceScene& scene,
                                       const Vector3& rayOrigin,
                                       const Vector3& rayDirection,
                                       const LightmapTraceQuery& query);
+
+bool LightmapTraceBuildAcceleration(LightmapTraceScene* scene);
 
 std::vector<LightmapComputeOccluderTri> BuildLightmapComputeOccluders(const LightmapTraceScene& scene);

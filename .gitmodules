@@ -10,3 +10,6 @@
 [submodule "lib/clay"]
 	path = lib/clay
 	url = https://github.com/nicbarker/clay.git
+[submodule "lib/embree"]
+	path = lib/embree
+	url = https://github.com/RenderKit/embree.git

@@ -84,8 +84,33 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 #   ./build_mc/bin/compile_map assets/maps/test.map test
 # ----------------------------
 option(BUILD_MAP_COMPILER "Build only the compile_map CLI tool" OFF)
+option(WARPED_LIGHTMAP_USE_EMBREE "Use Intel Embree for accelerated lightmap tracing and GPU BVH building in compile_map" ON)
 
 if(BUILD_MAP_COMPILER)
+    if(WARPED_LIGHTMAP_USE_EMBREE)
+        if(EXISTS "${PROJECT_SOURCE_DIR}/lib/embree/CMakeLists.txt")
+            set(BUILD_TESTING OFF CACHE BOOL "Disable third-party tests" FORCE)
+            set(EMBREE_TUTORIALS OFF CACHE BOOL "Disable Embree tutorials" FORCE)
+            set(EMBREE_STATIC_LIB ON CACHE BOOL "Build Embree as a static library" FORCE)
+            set(EMBREE_TASKING_SYSTEM "INTERNAL" CACHE STRING "Use Embree internal tasking" FORCE)
+            set(EMBREE_ISPC_SUPPORT OFF CACHE BOOL "Disable Embree ISPC support" FORCE)
+            set(EMBREE_SYCL_SUPPORT OFF CACHE BOOL "Disable Embree SYCL support" FORCE)
+            set(EMBREE_GEOMETRY_TRIANGLE ON CACHE BOOL "Enable Embree triangle geometry" FORCE)
+            set(EMBREE_GEOMETRY_QUAD OFF CACHE BOOL "Disable Embree quad geometry" FORCE)
+            set(EMBREE_GEOMETRY_CURVE OFF CACHE BOOL "Disable Embree curve geometry" FORCE)
+            set(EMBREE_GEOMETRY_SUBDIVISION OFF CACHE BOOL "Disable Embree subdivision geometry" FORCE)
+            set(EMBREE_GEOMETRY_USER OFF CACHE BOOL "Disable Embree user geometry" FORCE)
+            set(EMBREE_GEOMETRY_INSTANCE OFF CACHE BOOL "Disable Embree instance geometry" FORCE)
+            set(EMBREE_GEOMETRY_INSTANCE_ARRAY OFF CACHE BOOL "Disable Embree instance array geometry" FORCE)
+            set(EMBREE_GEOMETRY_GRID OFF CACHE BOOL "Disable Embree grid geometry" FORCE)
+            set(EMBREE_GEOMETRY_POINT OFF CACHE BOOL "Disable Embree point geometry" FORCE)
+            add_subdirectory(lib/embree EXCLUDE_FROM_ALL)
+        else()
+            message(WARNING "WARPED_LIGHTMAP_USE_EMBREE=ON but lib/embree/CMakeLists.txt was not found; using scalar CPU lightmap tracing and brute-force GPU tracing.")
+            set(WARPED_LIGHTMAP_USE_EMBREE OFF CACHE BOOL "Use Intel Embree for accelerated lightmap tracing and GPU BVH building in compile_map" FORCE)
+        endif()
+    endif()
+
     if(APPLE)
         enable_language(OBJC)
         enable_language(OBJCXX)
@@ -111,6 +136,9 @@ if(BUILD_MAP_COMPILER)
         target_sources(compile_map PRIVATE src/compiler/lightmap_compute_metal.mm)
     endif()
     target_compile_definitions(compile_map PRIVATE WARPED_COMPILER_BUILD)
+    if(WARPED_LIGHTMAP_USE_EMBREE AND TARGET embree)
+        target_compile_definitions(compile_map PRIVATE WARPED_LIGHTMAP_USE_EMBREE EMBREE_STATIC_LIB)
+    endif()
     if(WARPED_SOKOL_BACKEND STREQUAL "METAL")
         target_compile_definitions(compile_map PRIVATE WARPED_SOKOL_BACKEND_METAL)
     elseif(WARPED_SOKOL_BACKEND STREQUAL "D3D11")
@@ -143,6 +171,7 @@ if(BUILD_MAP_COMPILER)
 
     target_link_libraries(compile_map PRIVATE
         ${COMPILER_PLATFORM_LIBS}
+        $<$<BOOL:${WARPED_LIGHTMAP_USE_EMBREE}>:embree>
         ${WARPED_LIBCXX_EXTRA_LIBS}
     )
     return()   # don't configure the engine target
