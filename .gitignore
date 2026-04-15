@@ -29,4 +29,5 @@
 # Ignore sensitive files
 .env
 secrets.txt
-*.md 
+*.md
+.gitignore

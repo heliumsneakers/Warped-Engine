@@ -281,8 +281,9 @@ int main(int argc, char** argv)
     };
 
     StructuralBSPData structural = BuildStructuralBSP(unionPolys, GetTex);
-    const std::vector<MapPolygon>& bspPolys =
-        structural.splitPolygons.empty() ? unionPolys : structural.splitPolygons;
+    // Geometry ownership stops at the parser CSG union. The BSP builder only
+    // indexes these polygons; it must not replace them with split fragments.
+    const std::vector<MapPolygon>& bspPolys = unionPolys;
     std::unordered_map<std::string, Vector3> textureBounceColors;
     for (const MapPolygon& poly : bspPolys) {
         textureBounceColors[poly.texture] = ProbeTextureAverageColor(mapDir, poly.texture, textureColorCache);

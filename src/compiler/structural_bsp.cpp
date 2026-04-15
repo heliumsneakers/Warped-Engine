@@ -9,7 +9,6 @@
 namespace {
 
 static constexpr float kPlaneEpsilon = 0.05f;
-static constexpr float kPointEpsilon = 0.01f;
 static constexpr int kMaxDepth = 64;
 
 struct BuildFace {
@@ -44,18 +43,6 @@ struct PlaneClassification {
     int spanningCount = 0;
 };
 
-struct PolygonSplit {
-    std::vector<Vector3> front;
-    std::vector<Vector3> back;
-};
-
-static Vector3 ComputeNormal(const std::vector<Vector3>& verts) {
-    if (verts.size() < 3) {
-        return Vector3Zero();
-    }
-    return CalculateNormal(verts[0], verts[1], verts[2]);
-}
-
 static void ExtendBounds(BuildBounds* bounds, const Vector3& p) {
     bounds->min.x = std::min(bounds->min.x, p.x);
     bounds->min.y = std::min(bounds->min.y, p.y);
@@ -79,65 +66,6 @@ static BuildBounds ComputeFaceBounds(const std::vector<BuildFace>& faces, const 
         }
     }
     return bounds;
-}
-
-static void RemoveConsecutiveDuplicatePoints(std::vector<Vector3>& points, float eps) {
-    if (points.empty()) {
-        return;
-    }
-    std::vector<Vector3> deduped;
-    deduped.reserve(points.size());
-    deduped.push_back(points[0]);
-    for (size_t i = 1; i < points.size(); ++i) {
-        const Vector3 d = Vector3Subtract(points[i], deduped.back());
-        if (Vector3LengthSq(d) <= eps * eps) {
-            continue;
-        }
-        deduped.push_back(points[i]);
-    }
-    if (deduped.size() >= 2) {
-        const Vector3 d = Vector3Subtract(deduped.front(), deduped.back());
-        if (Vector3LengthSq(d) <= eps * eps) {
-            deduped.pop_back();
-        }
-    }
-    points.swap(deduped);
-}
-
-static void CleanupPolygon(std::vector<Vector3>& verts, const Vector3& expectedNormal) {
-    RemoveConsecutiveDuplicatePoints(verts, kPointEpsilon);
-    if (verts.size() < 3) {
-        verts.clear();
-        return;
-    }
-    std::vector<Vector3> cleaned;
-    cleaned.reserve(verts.size());
-    const float collinearEpsSq = kPointEpsilon * kPointEpsilon;
-    for (size_t i = 0; i < verts.size(); ++i) {
-        const Vector3& prev = verts[(i + verts.size() - 1) % verts.size()];
-        const Vector3& curr = verts[i];
-        const Vector3& next = verts[(i + 1) % verts.size()];
-        const Vector3 e0 = Vector3Subtract(curr, prev);
-        const Vector3 e1 = Vector3Subtract(next, curr);
-        if (Vector3LengthSq(e0) <= collinearEpsSq || Vector3LengthSq(e1) <= collinearEpsSq) {
-            continue;
-        }
-        const Vector3 cross = Vector3CrossProduct(e0, e1);
-        if (Vector3LengthSq(cross) <= collinearEpsSq) {
-            continue;
-        }
-        cleaned.push_back(curr);
-    }
-    RemoveConsecutiveDuplicatePoints(cleaned, kPointEpsilon);
-    if (cleaned.size() < 3) {
-        verts.clear();
-        return;
-    }
-    Vector3 normal = ComputeNormal(cleaned);
-    if (Vector3DotProduct(normal, expectedNormal) < 0.0f) {
-        std::reverse(cleaned.begin(), cleaned.end());
-    }
-    verts.swap(cleaned);
 }
 
 static float PlaneDistance(const BSPPlane& plane, const Vector3& p) {
@@ -165,40 +93,6 @@ static FaceSide ClassifyFaceAgainstPlane(const BuildFace& face, const BSPPlane& 
         return FACE_BACK;
     }
     return FACE_COPLANAR;
-}
-
-static PolygonSplit SplitPolygonByPlane(const std::vector<Vector3>& verts, const BSPPlane& plane, const Vector3& expectedNormal) {
-    PolygonSplit split;
-    if (verts.size() < 3) {
-        return split;
-    }
-    for (size_t i = 0; i < verts.size(); ++i) {
-        const Vector3& a = verts[i];
-        const Vector3& b = verts[(i + 1) % verts.size()];
-        const float da = PlaneDistance(plane, a);
-        const float db = PlaneDistance(plane, b);
-        const bool aFront = da > kPlaneEpsilon;
-        const bool aBack = da < -kPlaneEpsilon;
-
-        if (!aBack) {
-            split.front.push_back(a);
-        }
-        if (!aFront) {
-            split.back.push_back(a);
-        }
-
-        if ((da > kPlaneEpsilon && db < -kPlaneEpsilon) ||
-            (da < -kPlaneEpsilon && db > kPlaneEpsilon))
-        {
-            const float t = da / (da - db);
-            const Vector3 hit = Vector3Add(a, Vector3Scale(Vector3Subtract(b, a), t));
-            split.front.push_back(hit);
-            split.back.push_back(hit);
-        }
-    }
-    CleanupPolygon(split.front, expectedNormal);
-    CleanupPolygon(split.back, expectedNormal);
-    return split;
 }
 
 class Builder {
@@ -346,22 +240,12 @@ private:
                 case FACE_BACK:
                     backFaces.push_back(faceId);
                     break;
-                case FACE_SPANNING: {
-                    PolygonSplit split = SplitPolygonByPlane(face.poly.verts, plane, face.poly.normal);
-                    if (split.front.size() >= 3) {
-                        BuildFace frontFace = face;
-                        frontFace.poly.verts = std::move(split.front);
-                        facePool.push_back(std::move(frontFace));
-                        frontFaces.push_back((uint32_t)facePool.size() - 1);
-                    }
-                    if (split.back.size() >= 3) {
-                        BuildFace backFace = face;
-                        backFace.poly.verts = std::move(split.back);
-                        facePool.push_back(std::move(backFace));
-                        backFaces.push_back((uint32_t)facePool.size() - 1);
-                    }
+                case FACE_SPANNING:
+                    // The map parser owns CSG and polygon clipping. The BSP
+                    // tree is only a spatial index, so spanning polygons stay
+                    // intact and are referenced from this node.
+                    nodeFaces.push_back(faceId);
                     break;
-                }
             }
         }
 
@@ -391,7 +275,6 @@ private:
     void SerializeFaces() {
         std::vector<int32_t> remap(facePool.size(), -1);
         out.faces.reserve(out.faceRefs.size());
-        out.splitPolygons.reserve(out.faceRefs.size());
         for (uint32_t& ref : out.faceRefs) {
             if ((size_t)ref >= facePool.size()) {
                 ref = 0;
@@ -402,21 +285,20 @@ private:
                 const BSPPlane& plane = out.planes[(size_t)std::max(face.planeIndex, 0)];
                 remap[ref] = (int32_t)out.faces.size();
 
-                MapPolygon splitPoly = face.poly;
-                splitPoly.normal = { plane.nx, plane.ny, plane.nz };
+                MapPolygon sourcePoly = face.poly;
+                sourcePoly.normal = { plane.nx, plane.ny, plane.nz };
 
                 BSPFace outFace{};
                 outFace.planeIndex = (uint32_t)std::max(0, face.planeIndex);
-                outFace.textureIndex = resolveTextureIndex(splitPoly.texture);
+                outFace.textureIndex = resolveTextureIndex(sourcePoly.texture);
                 outFace.firstVertex = (uint32_t)out.faceVerts.size();
-                outFace.vertexCount = (uint32_t)splitPoly.verts.size();
-                outFace.sourceEntityId = splitPoly.sourceEntityId;
-                outFace.sourceBrushId = splitPoly.sourceBrushId;
-                outFace.sourceFaceIndex = splitPoly.sourceFaceIndex;
+                outFace.vertexCount = (uint32_t)sourcePoly.verts.size();
+                outFace.sourceEntityId = sourcePoly.sourceEntityId;
+                outFace.sourceBrushId = sourcePoly.sourceBrushId;
+                outFace.sourceFaceIndex = sourcePoly.sourceFaceIndex;
                 outFace.flags = 0;
                 out.faces.push_back(outFace);
-                out.splitPolygons.push_back(splitPoly);
-                for (const Vector3& v : splitPoly.verts) {
+                for (const Vector3& v : sourcePoly.verts) {
                     out.faceVerts.push_back({ v.x, v.y, v.z });
                 }
             }

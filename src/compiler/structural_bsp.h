@@ -15,7 +15,6 @@ struct StructuralBSPData {
     std::vector<BSPNode>  nodes;
     std::vector<BSPLeaf>  leaves;
     std::vector<uint32_t> faceRefs;
-    std::vector<MapPolygon> splitPolygons;
 };
 
 StructuralBSPData BuildStructuralBSP(const std::vector<MapPolygon>& polys,
