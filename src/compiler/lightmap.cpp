@@ -923,6 +923,7 @@ struct RepairedSamplePoint {
     Vector3 ownerNormal{};
     Vector3 ownerAxisU{};
     Vector3 ownerAxisV{};
+    bool valid = false;
 };
 
 static bool InsidePoly2D(const std::vector<Vector2>& poly, float px, float py);
@@ -1002,6 +1003,61 @@ static bool PointInsideAnySolid(const std::vector<BrushSolid>& solids, const Vec
         }
     }
     return false;
+}
+
+static float RayBrushSolidHitDistance(const BrushSolid& solid,
+                                      const Vector3& rayOrigin,
+                                      const Vector3& rayDirection,
+                                      float minHitT,
+                                      float maxHitT)
+{
+    if (solid.planes.empty() || maxHitT <= minHitT) {
+        return maxHitT;
+    }
+
+    constexpr float kPlaneEpsilon = 0.01f;
+    constexpr float kParallelEpsilon = 1e-6f;
+    float enterT = minHitT;
+    float exitT = maxHitT;
+
+    // Convex brush slab test. Brush planes use outward normals; inside is
+    // plane distance <= 0. A hit here blocks cracks between snapped faces.
+    for (const BrushSolidPlane& plane : solid.planes) {
+        const float dist = Vector3DotProduct(plane.normal, Vector3Subtract(rayOrigin, plane.point));
+        const float denom = Vector3DotProduct(plane.normal, rayDirection);
+        if (fabsf(denom) <= kParallelEpsilon) {
+            if (dist > kPlaneEpsilon) {
+                return maxHitT;
+            }
+            continue;
+        }
+
+        const float t = -dist / denom;
+        if (denom < 0.0f) {
+            enterT = std::max(enterT, t);
+        } else {
+            exitT = std::min(exitT, t);
+        }
+
+        if (enterT >= exitT) {
+            return maxHitT;
+        }
+    }
+
+    return (enterT > minHitT && enterT < maxHitT) ? enterT : maxHitT;
+}
+
+static float ClosestBrushSolidHitDistance(const std::vector<BrushSolid>& solids,
+                                          const Vector3& rayOrigin,
+                                          const Vector3& rayDirection,
+                                          float minHitT,
+                                          float maxHitT)
+{
+    float closest = maxHitT;
+    for (const BrushSolid& solid : solids) {
+        closest = std::min(closest, RayBrushSolidHitDistance(solid, rayOrigin, rayDirection, minHitT, closest));
+    }
+    return closest;
 }
 
 static SurfaceVisibilityInfo AnalyzeSurfaceVisibility(const std::vector<MapPolygon>& polys) {
@@ -1291,16 +1347,14 @@ static bool PolygonCanEmitBounceForLighting(const MapPolygon& poly,
 
 static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
     OccluderSet o;
-    const SurfaceVisibilityInfo visibility = AnalyzeSurfaceVisibility(polys);
     int nonShadowCasterCount = 0;
+    int emitterOnlyCount = 0;
     for (size_t i = 0; i < polys.size(); ++i) {
-        if (visibility.emitterOnly[i]) {
-            continue;
-        }
-        if (visibility.hidden[i]) {
-            continue;
-        }
         const MapPolygon& p = polys[i];
+        if (p.occluderGroup >= 0) {
+            ++emitterOnlyCount;
+            continue;
+        }
         if (!PolygonCastsShadowForLighting(p)) {
             ++nonShadowCasterCount;
             continue;
@@ -1321,11 +1375,8 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
             o.tris.push_back(tr);
         }
     }
-    if (visibility.hiddenCount > 0) {
-        printf("[Lightmap] skipped %d hidden/internal brush faces from occluders.\n", visibility.hiddenCount);
-    }
-    if (visibility.emitterOnlyCount > 0) {
-        printf("[Lightmap] skipped %d light brush faces from occluders.\n", visibility.emitterOnlyCount);
+    if (emitterOnlyCount > 0) {
+        printf("[Lightmap] skipped %d light brush faces from occluders.\n", emitterOnlyCount);
     }
     if (nonShadowCasterCount > 0) {
         printf("[Lightmap] skipped %d non-shadow-casting utility faces from occluders.\n", nonShadowCasterCount);
@@ -3640,6 +3691,7 @@ static float ComputeDirtAttenuation(float occlusionRatio, float dirtScale, float
 }
 
 static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
+                                       const std::vector<BrushSolid>& shadowSolids,
                                        const Vector3& samplePoint,
                                        const Vector3& sampleNormal,
                                        const LightBakeSettings& settings)
@@ -3655,7 +3707,7 @@ static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
     for (int i = 0; i < DIRT_RAY_COUNT; ++i) {
         const Vector3 localDir = BuildEricwDirtVector(settings, i, seed);
         const Vector3 dir = Vector3Normalize(TransformToTangentSpace(normal, tangent, bitangent, localDir));
-        const float hitDistance = LightmapTraceClosestHitDistance(
+        const float triHitDistance = LightmapTraceClosestHitDistance(
             occ,
             samplePoint,
             dir,
@@ -3665,6 +3717,9 @@ static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
                 -1,
                 -1
             });
+        const float solidHitDistance = ClosestBrushSolidHitDistance(
+            shadowSolids, samplePoint, dir, OCCLUSION_NEAR_TMIN, depth);
+        const float hitDistance = std::min(triHitDistance, solidHitDistance);
         accumulatedDistance += std::min(depth, hitDistance);
     }
     const float avgHitDistance = accumulatedDistance / (float)DIRT_RAY_COUNT;
@@ -3681,9 +3736,11 @@ static bool TryRepairSampleCandidate(const std::vector<BrushSolid>& solids,
         return false;
     }
 
+    ioSample->valid = false;
     ioSample->planePoint = planePoint;
     ioSample->samplePoint = OffsetPointAlongSurfaceNormal(planePoint, faceNormal, offsetDistance);
     if (!PointInsideAnySolid(solids, ioSample->samplePoint, SOLID_REPAIR_EPSILON)) {
+        ioSample->valid = true;
         return true;
     }
 
@@ -3698,6 +3755,7 @@ static bool TryRepairSampleCandidate(const std::vector<BrushSolid>& solids,
                 const Vector3 jitteredPoint = Vector3Add(ioSample->samplePoint, jitter);
                 if (!PointInsideAnySolid(solids, jitteredPoint, SOLID_REPAIR_EPSILON)) {
                     ioSample->samplePoint = jitteredPoint;
+                    ioSample->valid = true;
                     return true;
                 }
             }
@@ -3914,6 +3972,7 @@ static RepairedSamplePoint RepairSamplePoint(const FaceRect& rect,
                                         &repaired);
     repaired.samplePoint = OffsetSamplePointOffSurface(planePoint, baseNormal, sampleOffset);
     if (!PointInsideAnySolid(solids, repaired.samplePoint, SOLID_REPAIR_EPSILON)) {
+        repaired.valid = true;
         return repaired;
     }
 
@@ -3949,6 +4008,7 @@ static bool SkyDomeUsesDirt(const LightBakeSettings& settings) {
 }
 
 static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
+                                          const std::vector<BrushSolid>& shadowSolids,
                                           uint32_t sourcePolyIndex,
                                           const Vector3& visibilityPlanePoint,
                                           const Vector3& visibilityFaceNormal,
@@ -3988,9 +4048,11 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
                 -1,
                 (int)sourcePolyIndex
             };
+            const float solidHitDistance = ClosestBrushSolidHitDistance(shadowSolids, ro, dir, nearHitT, skyTraceDistance);
+            const LightmapTraceHit hit = LightmapTraceClosestHit(occ, ro, dir, skyQuery);
             const bool visible = (settings.sunlightNoSky != 0)
-                ? !LightmapTraceOccluded(occ, ro, dir, skyQuery)
-                : (LightmapTraceClosestHit(occ, ro, dir, skyQuery).kind == LIGHTMAP_TRACE_HIT_SKY);
+                ? (hit.kind == LIGHTMAP_TRACE_HIT_NONE && solidHitDistance >= skyTraceDistance)
+                : (hit.kind == LIGHTMAP_TRACE_HIT_SKY && solidHitDistance >= hit.distance - 0.05f);
             if (visible) {
                 const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
                 const float scale = upperPerSample * incidence * dirtScale;
@@ -4006,9 +4068,11 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
                 -1,
                 (int)sourcePolyIndex
             };
+            const float solidHitDistance = ClosestBrushSolidHitDistance(shadowSolids, ro, dir, nearHitT, skyTraceDistance);
+            const LightmapTraceHit hit = LightmapTraceClosestHit(occ, ro, dir, skyQuery);
             const bool visible = (settings.sunlightNoSky != 0)
-                ? !LightmapTraceOccluded(occ, ro, dir, skyQuery)
-                : (LightmapTraceClosestHit(occ, ro, dir, skyQuery).kind == LIGHTMAP_TRACE_HIT_SKY);
+                ? (hit.kind == LIGHTMAP_TRACE_HIT_NONE && solidHitDistance >= skyTraceDistance)
+                : (hit.kind == LIGHTMAP_TRACE_HIT_SKY && solidHitDistance >= hit.distance - 0.05f);
             if (visible) {
                 const float incidence = EvaluateAngleScale(settings.sunlightAngleScale, Vector3DotProduct(sampleNormal, dir));
                 const float scale = lowerPerSample * incidence * dirtScale;
@@ -4023,6 +4087,7 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
 static Vector3 ComputeDirectLightContribution(const PointLight& light,
                                               const Vector3& lightPosition,
                                               const OccluderSet& occ,
+                                              const std::vector<BrushSolid>& shadowSolids,
                                               uint32_t ownerSourcePolyIndex,
                                               const Vector3& visibilityPlanePoint,
                                               const Vector3& visibilityFaceNormal,
@@ -4077,12 +4142,14 @@ static Vector3 ComputeDirectLightContribution(const PointLight& light,
         light.ignoreOccluderGroup,
         (int)ownerSourcePolyIndex
     };
+    const float solidHitDistance = ClosestBrushSolidHitDistance(
+        shadowSolids, ro, dir, shadowQuery.minHitT, shadowQuery.maxHitT);
     if (light.requiresSkyVisibility != 0) {
         const LightmapTraceHit hit = LightmapTraceClosestHit(occ, ro, dir, shadowQuery);
-        if (hit.kind != LIGHTMAP_TRACE_HIT_SKY) {
+        if (hit.kind != LIGHTMAP_TRACE_HIT_SKY || solidHitDistance < hit.distance - 0.05f) {
             return Vector3Zero();
         }
-    } else if (LightmapTraceOccluded(occ, ro, dir, shadowQuery)) {
+    } else if (solidHitDistance < shadowQuery.maxHitT || LightmapTraceOccluded(occ, ro, dir, shadowQuery)) {
         return Vector3Zero();
     }
 
@@ -4095,6 +4162,7 @@ static Vector3 ComputeDirectLightContribution(const PointLight& light,
 static Vector3 ComputeSurfaceEmitterContribution(const SurfaceLightEmitter& emitter,
                                                  const Vector3& emitterSamplePoint,
                                                  const OccluderSet& occ,
+                                                 const std::vector<BrushSolid>& shadowSolids,
                                                  uint32_t ownerSourcePolyIndex,
                                                  const Vector3& visibilityPlanePoint,
                                                  const Vector3& visibilityFaceNormal,
@@ -4158,12 +4226,14 @@ static Vector3 ComputeSurfaceEmitterContribution(const SurfaceLightEmitter& emit
         emitter.baseLight.ignoreOccluderGroup,
         (int)ownerSourcePolyIndex
     };
+    const float solidHitDistance = ClosestBrushSolidHitDistance(
+        shadowSolids, ro, dirToLight, shadowQuery.minHitT, shadowQuery.maxHitT);
     if (emitter.baseLight.requiresSkyVisibility != 0) {
         const LightmapTraceHit hit = LightmapTraceClosestHit(occ, ro, dirToLight, shadowQuery);
-        if (hit.kind != LIGHTMAP_TRACE_HIT_SKY) {
+        if (hit.kind != LIGHTMAP_TRACE_HIT_SKY || solidHitDistance < hit.distance - 0.05f) {
             return Vector3Zero();
         }
-    } else if (LightmapTraceOccluded(occ, ro, dirToLight, shadowQuery)) {
+    } else if (solidHitDistance < shadowQuery.maxHitT || LightmapTraceOccluded(occ, ro, dirToLight, shadowQuery)) {
         return Vector3Zero();
     }
 
@@ -4321,6 +4391,16 @@ static void ShadeRectOversampled(const FaceRect& rect,
                     const Vector3 faceSamplePoint = OffsetSamplePointOffSurface(
                         planePoint, rect.gpu.normal, settings.surfaceSampleOffset);
                     const bool faceSampleInsideSolid = PointInsideAnySolid(repairSolids, faceSamplePoint, SOLID_REPAIR_EPSILON);
+                    if (faceSampleInsideSolid && !repairedSample.valid) {
+                        const int hiX = lx * aaGrid + sx;
+                        const int hiY = ly * aaGrid + sy;
+                        const size_t hiIndex = (size_t)hiY * (size_t)hiW + (size_t)hiX;
+                        outBuffer->opaque[hiIndex] = 1;
+                        outBuffer->pixelsR[hiIndex] = std::max(0.0f, settings.ambientColor.x);
+                        outBuffer->pixelsG[hiIndex] = std::max(0.0f, settings.ambientColor.y);
+                        outBuffer->pixelsB[hiIndex] = std::max(0.0f, settings.ambientColor.z);
+                        continue;
+                    }
                     const uint32_t ownerSourcePolyIndex = faceSampleInsideSolid ? repairedSample.sourcePolyIndex : rect.sourcePolyIndex;
                     const Vector3 ownerPlanePoint = faceSampleInsideSolid ? repairedSample.planePoint : planePoint;
                     const Vector3 ownerNormal = (faceSampleInsideSolid && Vector3LengthSq(repairedSample.ownerNormal) > 1e-8f)
@@ -4337,7 +4417,7 @@ static void ShadeRectOversampled(const FaceRect& rect,
                     float cg = settings.ambientColor.y;
                     float cb = settings.ambientColor.z;
                     const float dirtOcclusion = usesDirt
-                        ? ComputeDirtOcclusionRatio(occ, samplePoint, sampleNormal, settings)
+                        ? ComputeDirtOcclusionRatio(occ, repairSolids, samplePoint, sampleNormal, settings)
                         : 0.0f;
                     for (uint32_t lightIndex : rectLightIndices) {
                         if (lightIndex >= lights.size()) {
@@ -4348,6 +4428,7 @@ static void ShadeRectOversampled(const FaceRect& rect,
                             light,
                             light.position,
                             occ,
+                            repairSolids,
                             ownerSourcePolyIndex,
                             ownerPlanePoint,
                             ownerNormal,
@@ -4371,6 +4452,7 @@ static void ShadeRectOversampled(const FaceRect& rect,
                                     emitter,
                                     emitterSamplePoint,
                                     occ,
+                                    repairSolids,
                                     ownerSourcePolyIndex,
                                     ownerPlanePoint,
                                     ownerNormal,
@@ -4386,7 +4468,7 @@ static void ShadeRectOversampled(const FaceRect& rect,
                         }
                     }
                     const Vector3 skyContrib = ComputeSkyDomeContribution(
-                        occ, ownerSourcePolyIndex, ownerPlanePoint, ownerNormal, samplePoint, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
+                        occ, repairSolids, ownerSourcePolyIndex, ownerPlanePoint, ownerNormal, samplePoint, sampleNormal, nearHitT, skyTraceDistance, dirtOcclusion, settings);
                     cr += skyContrib.x;
                     cg += skyContrib.y;
                     cb += skyContrib.z;
@@ -4972,6 +5054,7 @@ static void ApplyLightmapSoften(std::vector<LightmapPage>& pages,
 // --------------------------------------------------------------------------
 LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                            const std::vector<MapPolygon>& occluderPolys,
+                           const std::vector<MapPolygon>& solidPolys,
                            const std::vector<PointLight>& lights,
                            const std::vector<SurfaceLightTemplate>& surfaceLights,
                            const std::unordered_map<std::string, Vector3>& textureBounceColors,
@@ -4999,16 +5082,14 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
     // coverage-threshold check in this TU via the file-scope g_aaGrid.
     g_aaGrid = (settings.extraSamples <= 0) ? 1
              : (settings.extraSamples <= 2) ? 2 : 4;
-    const SurfaceVisibilityInfo sourceVisibility = AnalyzeSurfaceVisibility(polys);
-    const std::vector<MapPolygon> visiblePolys = FilterVisibleBakePolygons(polys, sourceVisibility);
-    if (sourceVisibility.hiddenCount > 0) {
-        printf("[Lightmap] skipped %d hidden/internal brush faces from bake surfaces.\n",
-               sourceVisibility.hiddenCount);
-        fflush(stdout);
-    }
+    // CSG union is responsible for removing true internal/contact geometry.
+    // The lightmap visibility heuristic can false-positive on valid clipped
+    // faces; because compile_map emits render geometry from atlas.patches, do
+    // not let the baker hide source polygons from the final mesh.
+    const std::vector<MapPolygon>& visiblePolys = polys;
     const std::vector<PhongSourcePoly> sourcePhongs = BuildPhongSourcePolys(visiblePolys);
     const std::vector<RepairSourcePoly> repairPolys = BuildRepairSourcePolys(visiblePolys, sourcePhongs);
-    const std::vector<BrushSolid> repairSolids = BuildBrushSolids(polys);
+    const std::vector<BrushSolid> repairSolids = BuildBrushSolids(solidPolys.empty() ? polys : solidPolys);
     const AABB visibleBounds = ComputeMapBounds(visiblePolys);
     const Vector3 mapCenter = Vector3Scale(Vector3Add(visibleBounds.min, visibleBounds.max), 0.5f);
     const float skyTraceDistance = std::max(2048.0f, sqrtf(Vector3LengthSq(Vector3Subtract(visibleBounds.max, visibleBounds.min))) * 2.0f + 1024.0f);

@@ -629,7 +629,13 @@ float closest_hit_distance_bvh(vec3 ro, vec3 rd, float min_hit_t, float dist, in
     return closest;
 }
 
+float closest_solid_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist);
+bool solid_occluded(vec3 ro, vec3 rd, float min_hit_t, float dist);
+
 bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
+    if (solid_occluded(ro, rd, min_hit_t, dist)) {
+        return true;
+    }
     if (bvh_node_count > 0) {
         return occluded_bvh(ro, rd, min_hit_t, dist, ignore_occluder_group, ignore_source_poly_index);
     }
@@ -637,10 +643,11 @@ bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder
 }
 
 float closest_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
+    float solid_hit = closest_solid_hit_distance(ro, rd, min_hit_t, dist);
     if (bvh_node_count > 0) {
-        return closest_hit_distance_bvh(ro, rd, min_hit_t, dist, ignore_occluder_group, ignore_source_poly_index);
+        return min(solid_hit, closest_hit_distance_bvh(ro, rd, min_hit_t, solid_hit, ignore_occluder_group, ignore_source_poly_index));
     }
-    return closest_hit_distance_bruteforce(ro, rd, min_hit_t, dist, ignore_occluder_group, ignore_source_poly_index);
+    return min(solid_hit, closest_hit_distance_bruteforce(ro, rd, min_hit_t, solid_hit, ignore_occluder_group, ignore_source_poly_index));
 }
 
 vec3 project_point_onto_plane(vec3 point, vec3 plane_point, vec3 plane_normal) {
@@ -667,6 +674,51 @@ bool point_inside_any_solid(vec3 point) {
         }
     }
     return false;
+}
+
+float ray_brush_solid_t(brush_solid solid, vec3 ro, vec3 rd, float min_hit_t, float dist) {
+    if ((solid.plane_count <= 0) || (dist <= min_hit_t)) {
+        return dist;
+    }
+
+    float enter_t = min_hit_t;
+    float exit_t = dist;
+    for (int i = 0; i < solid.plane_count; ++i) {
+        solid_plane plane = solid_planes[solid.first_plane + i];
+        float plane_dist = dot(plane.normal, ro - plane.point);
+        float denom = dot(plane.normal, rd);
+        if (abs(denom) <= 1e-6) {
+            if (plane_dist > 0.01) {
+                return dist;
+            }
+            continue;
+        }
+
+        float t = -plane_dist / denom;
+        if (denom < 0.0) {
+            enter_t = max(enter_t, t);
+        } else {
+            exit_t = min(exit_t, t);
+        }
+
+        if (enter_t >= exit_t) {
+            return dist;
+        }
+    }
+
+    return ((enter_t > min_hit_t) && (enter_t < dist)) ? enter_t : dist;
+}
+
+float closest_solid_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist) {
+    float closest = dist;
+    for (int i = 0; i < solid_count; ++i) {
+        closest = min(closest, ray_brush_solid_t(solids[i], ro, rd, min_hit_t, closest));
+    }
+    return closest;
+}
+
+bool solid_occluded(vec3 ro, vec3 rd, float min_hit_t, float dist) {
+    return closest_solid_hit_distance(ro, rd, min_hit_t, dist) < dist;
 }
 
 float evaluate_light_attenuation(point_light light, float dist) {
@@ -799,6 +851,7 @@ struct repaired_sample {
     vec3 plane_point;
     vec3 sample_point;
     int source_poly_index;
+    int valid;
 };
 
 bool repair_source_poly_valid(int source_poly_index) {
@@ -984,6 +1037,7 @@ bool try_recursive_repair_walk(int start_source_poly_index, vec3 start_seed_poin
                     result.plane_point = projected;
                     result.sample_point = repaired_point;
                     result.source_poly_index = source_poly_index;
+                    result.valid = 1;
                     return true;
                 }
             }
@@ -1074,6 +1128,7 @@ bool try_recursive_repair_walk(int start_source_poly_index, vec3 start_seed_poin
                 result.plane_point = snapped_point;
                 result.sample_point = repaired_point;
                 result.source_poly_index = source_poly_index;
+                result.valid = 1;
                 return true;
             }
         }
@@ -1089,11 +1144,14 @@ repaired_sample repair_sample_point(vec3 plane_point) {
     result.plane_point = plane_point;
     result.sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * surface_sample_offset;
     result.source_poly_index = repair_source_poly_index;
+    result.valid = 0;
     if (!point_inside_any_solid(result.sample_point)) {
+        result.valid = 1;
         return result;
     }
 
     if (try_repair_candidate(plane_point, normal, result.sample_point)) {
+        result.valid = 1;
         return result;
     }
 
@@ -1333,6 +1391,10 @@ bool shade_sample(float ju, float jv, out vec3 sample_rgb) {
     repaired_sample repaired = repair_sample_point(plane_point);
     vec3 face_sample_point = plane_point + safe_normalize(normal, vec3(0.0, 1.0, 0.0)) * surface_sample_offset;
     bool face_sample_inside_solid = point_inside_any_solid(face_sample_point);
+    if (face_sample_inside_solid && (repaired.valid == 0)) {
+        sample_rgb = ambient_color;
+        return true;
+    }
     int owner_source_poly_index = face_sample_inside_solid ? repaired.source_poly_index : repair_source_poly_index;
     vec3 owner_plane_point = face_sample_inside_solid ? repaired.plane_point : plane_point;
     vec3 owner_normal = face_sample_inside_solid

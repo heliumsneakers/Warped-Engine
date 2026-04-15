@@ -245,6 +245,11 @@ int main(int argc, char** argv)
 
     // ----- geometry + lights ----------------------------------------------
     std::vector<MapPolygon> rawPolys  = BuildMapPolygons(map, /*devMode=*/false);
+    std::vector<MapPolygon> unionPolys = BuildExteriorMapPolygons(map, /*devMode=*/false);
+    if (unionPolys.empty() && !rawPolys.empty()) {
+        printf("[compile_map] warning: union geometry produced no polygons; falling back to raw brush polygons\n");
+        unionPolys = rawPolys;
+    }
     std::vector<PointLight> lights = GetPointLights(map);
     std::vector<SurfaceLightTemplate> surfaceLights = GetSurfaceLightTemplates(map);
     LightBakeSettings lightSettings = GetLightBakeSettings(map);
@@ -275,18 +280,29 @@ int main(int argc, char** argv)
         texIdx[resolvedName]=idx; return idx;
     };
 
-    StructuralBSPData structural = BuildStructuralBSP(rawPolys, GetTex);
+    StructuralBSPData structural = BuildStructuralBSP(unionPolys, GetTex);
     const std::vector<MapPolygon>& bspPolys =
-        structural.splitPolygons.empty() ? rawPolys : structural.splitPolygons;
+        structural.splitPolygons.empty() ? unionPolys : structural.splitPolygons;
     std::unordered_map<std::string, Vector3> textureBounceColors;
     for (const MapPolygon& poly : bspPolys) {
         textureBounceColors[poly.texture] = ProbeTextureAverageColor(mapDir, poly.texture, textureColorCache);
     }
-    printf("[compile_map] structural bsp: %zu raw faces -> %zu bsp faces, %zu planes, %zu nodes, %zu leaves\n",
-           rawPolys.size(), bspPolys.size(), structural.planes.size(), structural.nodes.size(), structural.leaves.size());
+    printf("[compile_map] structural bsp: %zu raw faces -> %zu union faces -> %zu bsp faces, %zu planes, %zu nodes, %zu leaves\n",
+           rawPolys.size(), unionPolys.size(), bspPolys.size(), structural.planes.size(), structural.nodes.size(), structural.leaves.size());
 
     printf("[compile_map] baking lightmap...\n");
-    LightmapAtlas lm = BakeLightmap(bspPolys, bspPolys, lights, surfaceLights, textureBounceColors, lightSettings, backendMode);
+    // Leave occluderPolys empty so BakeLightmap builds the shadow scene from
+    // the filtered bake-surface list and source-poly indices stay aligned.
+    // Full raw brush polygons are still passed for point-in-solid sample repair.
+    const std::vector<MapPolygon> lightmapOccluderPolys;
+    LightmapAtlas lm = BakeLightmap(bspPolys,
+                                    lightmapOccluderPolys,
+                                    rawPolys,
+                                    lights,
+                                    surfaceLights,
+                                    textureBounceColors,
+                                    lightSettings,
+                                    backendMode);
 
     // ----- triangulate into buckets ---------------------------------------
     std::vector<BSPVertex>  vertices;

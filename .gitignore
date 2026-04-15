@@ -3,6 +3,7 @@
 *.swp
 *.a
 *.patch
+*.pdf
 .DS_Store
 
 # Ignore build artifacts
@@ -18,6 +19,7 @@
 /ericw-tools/
 /mc_build/
 /.cache/
+/map-files/
 
 # Ignore IDE/editor configurations
 .vscode/

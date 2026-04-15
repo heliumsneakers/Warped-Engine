@@ -38,6 +38,7 @@ enum LightmapBakeBackendMode : uint8_t {
 // LightmapAtlas::patches is only for lightmapped render emission.
 LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                            const std::vector<MapPolygon>& occluderPolys,
+                           const std::vector<MapPolygon>& solidPolys,
                            const std::vector<PointLight>& lights,
                            const std::vector<SurfaceLightTemplate>& surfaceLights,
                            const std::unordered_map<std::string, Vector3>& textureBounceColors,

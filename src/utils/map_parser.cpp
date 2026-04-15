@@ -124,6 +124,9 @@ struct BrushSolidPlane {
 
 struct BrushSolid {
     int sourceBrushId = -1;
+    Vector3 min = {0.0f, 0.0f, 0.0f};
+    Vector3 max = {0.0f, 0.0f, 0.0f};
+    bool hasBounds = false;
     std::vector<BrushSolidPlane> planes;
 };
 
@@ -133,8 +136,12 @@ struct PolygonPlaneSplit {
     bool hasStrictFront = false;
 };
 
+static constexpr float CSG_POLYGON_CLASSIFY_EPS = 0.001f;
+static constexpr float CSG_POINT_EPS = 1e-5f;
+static constexpr float CSG_NORMAL_EPS = 1e-5f;
+
 static void CleanupClippedPolygon(std::vector<Vector3>& poly, const Vector3& expectedNormal) {
-    RemoveDuplicatePoints(poly, (float)epsilon);
+    RemoveDuplicatePoints(poly, CSG_POLYGON_CLASSIFY_EPS);
     if (poly.size() < 3) {
         poly.clear();
         return;
@@ -142,7 +149,7 @@ static void CleanupClippedPolygon(std::vector<Vector3>& poly, const Vector3& exp
 
     std::vector<Vector3> cleaned;
     cleaned.reserve(poly.size());
-    const float collinearEpsSq = (float)(epsilon * epsilon);
+    const float collinearEpsSq = CSG_POINT_EPS * CSG_POINT_EPS;
     for (size_t i = 0; i < poly.size(); ++i) {
         const Vector3& prev = poly[(i + poly.size() - 1) % poly.size()];
         const Vector3& curr = poly[i];
@@ -159,7 +166,7 @@ static void CleanupClippedPolygon(std::vector<Vector3>& poly, const Vector3& exp
         cleaned.push_back(curr);
     }
 
-    RemoveDuplicatePoints(cleaned, (float)epsilon);
+    RemoveDuplicatePoints(cleaned, CSG_POLYGON_CLASSIFY_EPS);
     if (cleaned.size() < 3) {
         poly.clear();
         return;
@@ -170,6 +177,21 @@ static void CleanupClippedPolygon(std::vector<Vector3>& poly, const Vector3& exp
         std::reverse(cleaned.begin(), cleaned.end());
     }
     poly.swap(cleaned);
+}
+
+static float PolygonArea3D(const std::vector<Vector3>& poly) {
+    if (poly.size() < 3) {
+        return 0.0f;
+    }
+
+    const Vector3 origin = poly[0];
+    float area = 0.0f;
+    for (size_t i = 1; i + 1 < poly.size(); ++i) {
+        const Vector3 a = Vector3Subtract(poly[i], origin);
+        const Vector3 b = Vector3Subtract(poly[i + 1], origin);
+        area += 0.5f * Vector3Length(Vector3CrossProduct(a, b));
+    }
+    return area;
 }
 
 static PolygonPlaneSplit SplitPolygonByPlane(const std::vector<Vector3>& poly,
@@ -185,8 +207,8 @@ static PolygonPlaneSplit SplitPolygonByPlane(const std::vector<Vector3>& poly,
         const Vector3& b = poly[(i + 1) % poly.size()];
         const float da = Vector3DotProduct(planeNormal, Vector3Subtract(a, planePoint));
         const float db = Vector3DotProduct(planeNormal, Vector3Subtract(b, planePoint));
-        const bool aFront = da > (float)epsilon;
-        const bool aBack = da < -(float)epsilon;
+        const bool aFront = da > CSG_POINT_EPS;
+        const bool aBack = da < -CSG_POINT_EPS;
 
         if (aFront) {
             split.hasStrictFront = true;
@@ -198,8 +220,8 @@ static PolygonPlaneSplit SplitPolygonByPlane(const std::vector<Vector3>& poly,
             split.back.push_back(a);
         }
 
-        if ((da > (float)epsilon && db < -(float)epsilon) ||
-            (da < -(float)epsilon && db > (float)epsilon)) {
+        if ((da > CSG_POINT_EPS && db < -CSG_POINT_EPS) ||
+            (da < -CSG_POINT_EPS && db > CSG_POINT_EPS)) {
             const float t = da / (da - db);
             const Vector3 hit = Vector3Add(a, Vector3Scale(Vector3Subtract(b, a), t));
             split.front.push_back(hit);
@@ -213,52 +235,296 @@ static PolygonPlaneSplit SplitPolygonByPlane(const std::vector<Vector3>& poly,
 
 static std::vector<BrushSolid> BuildBrushSolids(const std::vector<MapPolygon>& polys) {
     std::vector<BrushSolid> solids;
+    solids.reserve(polys.size());
     std::unordered_map<int, size_t> solidIndexByBrushId;
     for (const MapPolygon& poly : polys) {
         if (poly.sourceBrushId < 0 || poly.verts.empty()) {
             continue;
         }
-        auto [it, inserted] = solidIndexByBrushId.emplace(poly.sourceBrushId, solids.size());
-        if (inserted) {
-            BrushSolid solid;
-            solid.sourceBrushId = poly.sourceBrushId;
-            solids.push_back(std::move(solid));
+        size_t solidIndex = 0;
+        auto it = solidIndexByBrushId.find(poly.sourceBrushId);
+        if (it == solidIndexByBrushId.end()) {
+            solidIndex = solids.size();
+            solidIndexByBrushId.emplace(poly.sourceBrushId, solidIndex);
+            solids.emplace_back();
+            solids.back().sourceBrushId = poly.sourceBrushId;
+        } else {
+            solidIndex = it->second;
         }
-        solids[it->second].planes.push_back({ poly.verts[0], Vector3Normalize(poly.normal) });
+
+        BrushSolid& solid = solids[solidIndex];
+        if (!solid.hasBounds) {
+            solid.min = poly.verts[0];
+            solid.max = poly.verts[0];
+            solid.hasBounds = true;
+        }
+        for (const Vector3& vert : poly.verts) {
+            solid.min.x = std::min(solid.min.x, vert.x);
+            solid.min.y = std::min(solid.min.y, vert.y);
+            solid.min.z = std::min(solid.min.z, vert.z);
+            solid.max.x = std::max(solid.max.x, vert.x);
+            solid.max.y = std::max(solid.max.y, vert.y);
+            solid.max.z = std::max(solid.max.z, vert.z);
+        }
+        solid.planes.push_back({ poly.verts[0], Vector3Normalize(poly.normal) });
     }
     return solids;
 }
 
-static std::vector<MapPolygon> SubtractSolidFromPolygon(const MapPolygon& poly, const BrushSolid& solid) {
-    std::vector<MapPolygon> pending;
-    std::vector<MapPolygon> kept;
-    pending.push_back(poly);
+static bool BrushBoundsIntersect(const BrushSolid& a, const BrushSolid& b) {
+    if (!a.hasBounds || !b.hasBounds) {
+        return true;
+    }
 
-    for (const BrushSolidPlane& plane : solid.planes) {
-        std::vector<MapPolygon> nextPending;
-        for (const MapPolygon& fragment : pending) {
-            PolygonPlaneSplit split = SplitPolygonByPlane(fragment.verts, plane.point, plane.normal);
-            CleanupClippedPolygon(split.front, fragment.normal);
-            CleanupClippedPolygon(split.back, fragment.normal);
+    const float eps = CSG_POINT_EPS;
+    if (a.min.x > b.max.x + eps || b.min.x > a.max.x + eps) {
+        return false;
+    }
+    if (a.min.y > b.max.y + eps || b.min.y > a.max.y + eps) {
+        return false;
+    }
+    if (a.min.z > b.max.z + eps || b.min.z > a.max.z + eps) {
+        return false;
+    }
+    return true;
+}
 
-            if (split.hasStrictFront && split.front.size() >= 3) {
-                MapPolygon outsideFragment = fragment;
-                outsideFragment.verts = std::move(split.front);
-                kept.push_back(std::move(outsideFragment));
-            }
-            if (split.back.size() >= 3) {
-                MapPolygon insideFragment = fragment;
-                insideFragment.verts = std::move(split.back);
-                nextPending.push_back(std::move(insideFragment));
-            }
+enum class PolygonPlaneClass {
+    Front,
+    Back,
+    OnPlane,
+    Spanning
+};
+
+static PolygonPlaneClass ClassifyPolygonAgainstPlane(const std::vector<Vector3>& poly,
+                                                     const BrushSolidPlane& plane) {
+    bool hasFront = false;
+    bool hasBack = false;
+
+    for (const Vector3& vert : poly) {
+        const float dist = Vector3DotProduct(plane.normal, Vector3Subtract(vert, plane.point));
+        if (dist > CSG_POLYGON_CLASSIFY_EPS) {
+            hasFront = true;
+        } else if (dist < -CSG_POLYGON_CLASSIFY_EPS) {
+            hasBack = true;
         }
-        pending.swap(nextPending);
-        if (pending.empty()) {
-            break;
+
+        if (hasFront && hasBack) {
+            return PolygonPlaneClass::Spanning;
         }
     }
 
-    return kept;
+    if (hasFront) {
+        return PolygonPlaneClass::Front;
+    }
+    if (hasBack) {
+        return PolygonPlaneClass::Back;
+    }
+    return PolygonPlaneClass::OnPlane;
+}
+
+static bool IntersectSolidPlanes(const BrushSolidPlane& a,
+                                 const BrushSolidPlane& b,
+                                 const BrushSolidPlane& c,
+                                 Vector3& out) {
+    const float da = -Vector3DotProduct(a.normal, a.point);
+    const float db = -Vector3DotProduct(b.normal, b.point);
+    const float dc = -Vector3DotProduct(c.normal, c.point);
+    const Vector3 crossBC = Vector3CrossProduct(b.normal, c.normal);
+    const float denom = Vector3DotProduct(a.normal, crossBC);
+    if (fabsf(denom) < CSG_POINT_EPS) {
+        return false;
+    }
+
+    const Vector3 termA = Vector3Scale(crossBC, -da);
+    const Vector3 termB = Vector3Scale(Vector3CrossProduct(c.normal, a.normal), -db);
+    const Vector3 termC = Vector3Scale(Vector3CrossProduct(a.normal, b.normal), -dc);
+    out = Vector3Scale(Vector3Add(Vector3Add(termA, termB), termC), 1.0f / denom);
+    return true;
+}
+
+static bool PointInsideBrushSolid(const Vector3& point, const BrushSolid& solid, float eps) {
+    for (const BrushSolidPlane& plane : solid.planes) {
+        const float dist = Vector3DotProduct(plane.normal, Vector3Subtract(point, plane.point));
+        if (dist > eps) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void AddUniqueIntersectionPoint(std::vector<Vector3>& points, const Vector3& point) {
+    const float epsSq = CSG_POLYGON_CLASSIFY_EPS * CSG_POLYGON_CLASSIFY_EPS;
+    for (const Vector3& existing : points) {
+        if (Vector3LengthSq(Vector3Subtract(existing, point)) <= epsSq) {
+            return;
+        }
+    }
+    points.push_back(point);
+}
+
+static bool PointsHavePositiveVolume(const std::vector<Vector3>& points) {
+    if (points.size() < 4) {
+        return false;
+    }
+
+    constexpr float volume6Eps = 1e-4f;
+    for (size_t i = 0; i + 3 < points.size(); ++i) {
+        for (size_t j = i + 1; j + 2 < points.size(); ++j) {
+            const Vector3 a = Vector3Subtract(points[j], points[i]);
+            for (size_t k = j + 1; k + 1 < points.size(); ++k) {
+                const Vector3 b = Vector3Subtract(points[k], points[i]);
+                const Vector3 cross = Vector3CrossProduct(a, b);
+                if (Vector3LengthSq(cross) <= CSG_POINT_EPS * CSG_POINT_EPS) {
+                    continue;
+                }
+                for (size_t l = k + 1; l < points.size(); ++l) {
+                    const Vector3 c = Vector3Subtract(points[l], points[i]);
+                    if (fabsf(Vector3DotProduct(cross, c)) > volume6Eps) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool BrushesHavePositiveIntersectionVolume(const BrushSolid& a, const BrushSolid& b) {
+    std::vector<BrushSolidPlane> planes;
+    planes.reserve(a.planes.size() + b.planes.size());
+    planes.insert(planes.end(), a.planes.begin(), a.planes.end());
+    planes.insert(planes.end(), b.planes.begin(), b.planes.end());
+
+    std::vector<Vector3> intersectionPoints;
+    for (size_t i = 0; i + 2 < planes.size(); ++i) {
+        for (size_t j = i + 1; j + 1 < planes.size(); ++j) {
+            for (size_t k = j + 1; k < planes.size(); ++k) {
+                Vector3 point{};
+                if (!IntersectSolidPlanes(planes[i], planes[j], planes[k], point)) {
+                    continue;
+                }
+                if (PointInsideBrushSolid(point, a, CSG_POLYGON_CLASSIFY_EPS) &&
+                    PointInsideBrushSolid(point, b, CSG_POLYGON_CLASSIFY_EPS)) {
+                    AddUniqueIntersectionPoint(intersectionPoints, point);
+                }
+            }
+        }
+    }
+
+    return PointsHavePositiveVolume(intersectionPoints);
+}
+
+static bool PolygonHasCoplanarBrushContact(const MapPolygon& poly,
+                                           const BrushSolid& solid,
+                                           bool clipOnPlane) {
+    const Vector3 polyNormal = Vector3Normalize(poly.normal);
+    for (const BrushSolidPlane& plane : solid.planes) {
+        if (ClassifyPolygonAgainstPlane(poly.verts, plane) != PolygonPlaneClass::OnPlane) {
+            continue;
+        }
+
+        const float normalDot = Vector3DotProduct(polyNormal, plane.normal);
+        const bool sameFacing = fabsf(normalDot - 1.0f) <= CSG_NORMAL_EPS;
+        const bool oppositeFacing = fabsf(normalDot + 1.0f) <= CSG_NORMAL_EPS;
+        if (oppositeFacing || (sameFacing && clipOnPlane)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint64_t BrushPairKey(int a, int b) {
+    const uint32_t lo = (uint32_t)std::min(a, b);
+    const uint32_t hi = (uint32_t)std::max(a, b);
+    return ((uint64_t)lo << 32) | (uint64_t)hi;
+}
+
+static bool PushValidFragment(const MapPolygon& source,
+                              std::vector<Vector3>&& verts,
+                              std::vector<MapPolygon>& out) {
+    CleanupClippedPolygon(verts, source.normal);
+    if (verts.size() < 3 || PolygonArea3D(verts) <= 1e-6f) {
+        return false;
+    }
+
+    MapPolygon fragment = source;
+    fragment.verts = std::move(verts);
+    out.push_back(std::move(fragment));
+    return true;
+}
+
+static bool SamePolygonVerts(const std::vector<Vector3>& a, const std::vector<Vector3>& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+
+    const float epsSq = CSG_POLYGON_CLASSIFY_EPS * CSG_POLYGON_CLASSIFY_EPS;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (Vector3LengthSq(Vector3Subtract(a[i], b[i])) > epsSq) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::vector<MapPolygon> ClipPolygonToBrushPlanes(const MapPolygon& poly,
+                                                        const BrushSolid& solid,
+                                                        size_t planeIndex,
+                                                        bool clipOnPlane) {
+    if (poly.verts.size() < 3) {
+        return {};
+    }
+    if (planeIndex >= solid.planes.size()) {
+        return {};
+    }
+
+    const BrushSolidPlane& plane = solid.planes[planeIndex];
+    switch (ClassifyPolygonAgainstPlane(poly.verts, plane)) {
+        case PolygonPlaneClass::Front:
+            return { poly };
+
+        case PolygonPlaneClass::Back:
+            return ClipPolygonToBrushPlanes(poly, solid, planeIndex + 1, clipOnPlane);
+
+        case PolygonPlaneClass::OnPlane: {
+            const float sameNormal = Vector3DotProduct(Vector3Normalize(poly.normal), plane.normal);
+            const float angle = sameNormal - 1.0f;
+            if (angle < CSG_NORMAL_EPS && angle > -CSG_NORMAL_EPS && !clipOnPlane) {
+                return { poly };
+            }
+            return ClipPolygonToBrushPlanes(poly, solid, planeIndex + 1, clipOnPlane);
+        }
+
+        case PolygonPlaneClass::Spanning: {
+            PolygonPlaneSplit split = SplitPolygonByPlane(poly.verts, plane.point, plane.normal);
+            std::vector<MapPolygon> out;
+
+            PushValidFragment(poly, std::move(split.front), out);
+
+            std::vector<MapPolygon> backFragments;
+            if (PushValidFragment(poly, std::move(split.back), backFragments)) {
+                std::vector<MapPolygon> clippedBack =
+                    ClipPolygonToBrushPlanes(backFragments[0], solid, planeIndex + 1, clipOnPlane);
+                if (clippedBack.size() == 1 && SamePolygonVerts(clippedBack[0].verts, backFragments[0].verts)) {
+                    return { poly };
+                }
+                out.insert(out.end(),
+                           std::make_move_iterator(clippedBack.begin()),
+                           std::make_move_iterator(clippedBack.end()));
+            }
+
+            return out;
+        }
+    }
+
+    return { poly };
+}
+
+static std::vector<MapPolygon> ClipPolygonToBrush(const MapPolygon& poly,
+                                                  const BrushSolid& solid,
+                                                  bool clipOnPlane) {
+    return ClipPolygonToBrushPlanes(poly, solid, 0, clipOnPlane);
 }
 
 static std::vector<MapPolygon> BuildExteriorPolygons(const std::vector<MapPolygon>& polys) {
@@ -267,8 +533,21 @@ static std::vector<MapPolygon> BuildExteriorPolygons(const std::vector<MapPolygo
     }
 
     const std::vector<BrushSolid> solids = BuildBrushSolids(polys);
+    std::unordered_map<int, const BrushSolid*> solidByBrushId;
+    solidByBrushId.reserve(solids.size());
+    for (const BrushSolid& solid : solids) {
+        solidByBrushId[solid.sourceBrushId] = &solid;
+    }
+
     std::vector<MapPolygon> exterior;
+    std::unordered_map<uint64_t, bool> positiveVolumeByBrushPair;
     for (const MapPolygon& poly : polys) {
+        const BrushSolid* sourceSolid = nullptr;
+        auto sourceSolidIt = solidByBrushId.find(poly.sourceBrushId);
+        if (sourceSolidIt != solidByBrushId.end()) {
+            sourceSolid = sourceSolidIt->second;
+        }
+
         std::vector<MapPolygon> fragments;
         fragments.push_back(poly);
 
@@ -276,10 +555,26 @@ static std::vector<MapPolygon> BuildExteriorPolygons(const std::vector<MapPolygo
             if (solid.sourceBrushId == poly.sourceBrushId) {
                 continue;
             }
+            if (sourceSolid && !BrushBoundsIntersect(*sourceSolid, solid)) {
+                continue;
+            }
 
             std::vector<MapPolygon> nextFragments;
+            const bool clipOnPlane = solid.sourceBrushId > poly.sourceBrushId;
+            if (sourceSolid) {
+                const uint64_t pairKey = BrushPairKey(sourceSolid->sourceBrushId, solid.sourceBrushId);
+                auto volumeIt = positiveVolumeByBrushPair.find(pairKey);
+                if (volumeIt == positiveVolumeByBrushPair.end()) {
+                    volumeIt = positiveVolumeByBrushPair.emplace(
+                        pairKey,
+                        BrushesHavePositiveIntersectionVolume(*sourceSolid, solid)).first;
+                }
+                if (!volumeIt->second && !PolygonHasCoplanarBrushContact(poly, solid, clipOnPlane)) {
+                    continue;
+                }
+            }
             for (const MapPolygon& fragment : fragments) {
-                std::vector<MapPolygon> kept = SubtractSolidFromPolygon(fragment, solid);
+                std::vector<MapPolygon> kept = ClipPolygonToBrush(fragment, solid, clipOnPlane);
                 nextFragments.insert(nextFragments.end(),
                                      std::make_move_iterator(kept.begin()),
                                      std::make_move_iterator(kept.end()));
@@ -1610,9 +1905,16 @@ std::vector<MapPolygon> BuildExteriorMapPolygons(const Map &map, bool devMode)
     int nextSourceBrushId = 0;
     size_t sourceFaceCount = 0;
     for (size_t entityIndex = 0; entityIndex < map.entities.size(); ++entityIndex) {
-        AppendBrushEntityPolygons(map.entities[entityIndex], (int)entityIndex, devMode, true, &nextLightBrushGroup, &nextSourceBrushId, &sourceFaceCount, out);
+        AppendBrushEntityPolygons(map.entities[entityIndex],
+                                  (int)entityIndex,
+                                  devMode,
+                                  true,
+                                  &nextLightBrushGroup,
+                                  &nextSourceBrushId,
+                                  &sourceFaceCount,
+                                  out);
     }
-    printf("[MapParser] Built %zu exterior occluder polygons from %zu brush faces.\n", out.size(), sourceFaceCount);
+    printf("[MapParser] Built %zu entity-local union/exterior polygons from %zu brush faces.\n", out.size(), sourceFaceCount);
     return out;
 }
 
@@ -1624,7 +1926,10 @@ std::vector<MapPolygon> BuildExteriorMapPolygons(const Map &map, bool devMode)
 */
 std::vector<MapMeshBucket> BuildMapGeometry(const Map &map, TextureManager &textureManager)
 {
-    std::vector<MapPolygon> polys = BuildMapPolygons(map, DEVMODE);
+    std::vector<MapPolygon> polys = BuildExteriorMapPolygons(map, DEVMODE);
+    if (polys.empty()) {
+        polys = BuildMapPolygons(map, DEVMODE);
+    }
 
     std::unordered_map<std::string, size_t> bucketIdx;
     std::vector<MapMeshBucket> buckets;
