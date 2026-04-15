@@ -24,13 +24,12 @@ static constexpr int   LM_PAD             = 2;      // border luxels (filled by 
 static constexpr int   LIGHTMAP_PAGE_SIZE = 1024;
 static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face luxel cap (interior only)
 static constexpr float SHADOW_BIAS        = 0.03125f;
-static constexpr float DIRECT_SHADOW_ORIGIN_BIAS = SHADOW_BIAS * 0.25f;
+static constexpr float RAY_TRACE_TMIN     = 1e-4f;
 static constexpr float SOLID_REPAIR_EPSILON = 0.05f;
 static constexpr float SAMPLE_REPAIR_JITTER = 0.5f;
 static constexpr float DARK_LUXEL_THRESHOLD = 8.0f / 255.0f;
-static constexpr float OCCLUSION_NEAR_TMIN = SHADOW_BIAS;
+static constexpr float OCCLUSION_NEAR_TMIN = RAY_TRACE_TMIN;
 static constexpr float EDGE_SEAM_GUARD_LUXELS = 0.75f;
-static constexpr float EDGE_SEAM_TMIN_BOOST   = SHADOW_BIAS * 3.0f;
 // Indirect bounce is emitted from lit patch surfaces. Keep the first radiosity
 // pass conservative so it lifts occluded regions without flattening direct
 // shadow contrast into an overcast look.
@@ -54,7 +53,7 @@ static int g_aaGrid = 4;
 // edge-propagation still works when extraSamples = 0 (g_aaGrid = 1).
 static constexpr int   STABILIZE_EDGE_PASSES = 4;
 static constexpr int   DILATE_PASSES      = 4;
-static constexpr int   ERICW_SUNSAMPLES   = 100;    // matches ericw-tools default sunsamples
+static constexpr int   ERICW_SUNSAMPLES   = 400;    // matches ericw-tools default sunsamples
 static constexpr int   DIRT_NUM_ANGLE_STEPS = 16;
 static constexpr int   DIRT_NUM_ELEVATION_STEPS = 3;
 static constexpr int   DIRT_RAY_COUNT = DIRT_NUM_ANGLE_STEPS * DIRT_NUM_ELEVATION_STEPS;
@@ -3616,42 +3615,22 @@ static Vector3 OffsetSamplePointOffSurface(const Vector3& planePoint,
 }
 
 static Vector3 BuildFaceLocalShadowRayOrigin(const Vector3& planePoint,
-                                             const Vector3& faceNormal,
-                                             const Vector3& dir)
+                                             const Vector3& faceNormal)
 {
     const Vector3 rayNormal = (Vector3LengthSq(faceNormal) > 1e-8f)
         ? Vector3Normalize(faceNormal)
         : Vector3Zero();
-    return Vector3Add(
-        Vector3Add(planePoint, Vector3Scale(rayNormal, SHADOW_BIAS)),
-        Vector3Scale(dir, SHADOW_BIAS));
-}
-
-static Vector3 BuildSampleShadowRayOrigin(const Vector3& samplePoint,
-                                          const Vector3& sampleNormal,
-                                          const Vector3& dir)
-{
-    Vector3 biasDir = dir;
-    if (Vector3LengthSq(biasDir) <= 1e-8f) {
-        biasDir = sampleNormal;
-    }
-    if (Vector3LengthSq(biasDir) <= 1e-8f) {
-        return samplePoint;
-    }
-    return Vector3Add(samplePoint,
-                      Vector3Scale(Vector3Normalize(biasDir), DIRECT_SHADOW_ORIGIN_BIAS));
+    return Vector3Add(planePoint, Vector3Scale(rayNormal, SHADOW_BIAS));
 }
 
 static float ComputeEdgeAwareNearHitT(const std::vector<Vector2>& poly2d,
                                       float ju,
                                       float jv)
 {
-    const float edgeDistLuxels = MinDistToPolyEdge2D(poly2d, ju, jv);
-    const float edgeFactor = std::clamp(
-        1.0f - edgeDistLuxels / EDGE_SEAM_GUARD_LUXELS,
-        0.0f,
-        1.0f);
-    return OCCLUSION_NEAR_TMIN + EDGE_SEAM_TMIN_BOOST * edgeFactor;
+    (void)poly2d;
+    (void)ju;
+    (void)jv;
+    return OCCLUSION_NEAR_TMIN;
 }
 
 static float ComputeDirtAttenuation(float occlusionRatio, float dirtScale, float dirtGain) {
@@ -3678,7 +3657,7 @@ static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
         const Vector3 dir = Vector3Normalize(TransformToTangentSpace(normal, tangent, bitangent, localDir));
         const float hitDistance = LightmapTraceClosestHitDistance(
             occ,
-            Vector3Add(samplePoint, Vector3Scale(dir, SHADOW_BIAS)),
+            samplePoint,
             dir,
             LightmapTraceQuery{
                 OCCLUSION_NEAR_TMIN,
@@ -4002,7 +3981,7 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
     for (int i = 0; i < sampleCount; ++i) {
         if (upperPerSample > 0.0f) {
             const Vector3 dir = EricwSkyDomeDirection(true, i, upperRotation);
-            const Vector3 ro = BuildFaceLocalShadowRayOrigin(visibilityPlanePoint, visibilityFaceNormal, dir);
+            const Vector3 ro = BuildFaceLocalShadowRayOrigin(visibilityPlanePoint, visibilityFaceNormal);
             const LightmapTraceQuery skyQuery{
                 nearHitT,
                 skyTraceDistance,
@@ -4020,7 +3999,7 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
         }
         if (lowerPerSample > 0.0f) {
             const Vector3 dir = EricwSkyDomeDirection(false, i, lowerRotation);
-            const Vector3 ro = BuildFaceLocalShadowRayOrigin(visibilityPlanePoint, visibilityFaceNormal, dir);
+            const Vector3 ro = BuildFaceLocalShadowRayOrigin(visibilityPlanePoint, visibilityFaceNormal);
             const LightmapTraceQuery skyQuery{
                 nearHitT,
                 skyTraceDistance,
@@ -4060,7 +4039,7 @@ static Vector3 ComputeDirectLightContribution(const PointLight& light,
         dir = Vector3Normalize(light.parallelDirection);
         dist = std::max(1.0f, light.intensity);
     } else {
-        const Vector3 toL = Vector3Subtract(lightPosition, visibilityPlanePoint);
+        const Vector3 toL = Vector3Subtract(lightPosition, samplePoint);
         dist = Vector3Length(toL);
         if (dist > light.intensity || dist < 1e-3f) {
             return Vector3Zero();
@@ -4091,7 +4070,7 @@ static Vector3 ComputeDirectLightContribution(const PointLight& light,
         return Vector3Zero();
     }
 
-    const Vector3 ro = BuildFaceLocalShadowRayOrigin(visibilityPlanePoint, visibilityFaceNormal, dir);
+    const Vector3 ro = BuildFaceLocalShadowRayOrigin(visibilityPlanePoint, visibilityFaceNormal);
     const LightmapTraceQuery shadowQuery{
         nearHitT,
         std::max(0.0f, dist - (SHADOW_BIAS * 2.0f)),
@@ -4117,6 +4096,8 @@ static Vector3 ComputeSurfaceEmitterContribution(const SurfaceLightEmitter& emit
                                                  const Vector3& emitterSamplePoint,
                                                  const OccluderSet& occ,
                                                  uint32_t ownerSourcePolyIndex,
+                                                 const Vector3& visibilityPlanePoint,
+                                                 const Vector3& visibilityFaceNormal,
                                                  const Vector3& samplePoint,
                                                  const Vector3& sampleNormal,
                                                  float nearHitT,
@@ -4170,7 +4151,7 @@ static Vector3 ComputeSurfaceEmitterContribution(const SurfaceLightEmitter& emit
         return Vector3Zero();
     }
 
-    const Vector3 ro = BuildSampleShadowRayOrigin(samplePoint, sampleNormal, dirToLight);
+    const Vector3 ro = BuildFaceLocalShadowRayOrigin(visibilityPlanePoint, visibilityFaceNormal);
     const LightmapTraceQuery shadowQuery{
         nearHitT,
         std::max(0.0f, dist - (SHADOW_BIAS * 2.0f)),
@@ -4391,6 +4372,8 @@ static void ShadeRectOversampled(const FaceRect& rect,
                                     emitterSamplePoint,
                                     occ,
                                     ownerSourcePolyIndex,
+                                    ownerPlanePoint,
+                                    ownerNormal,
                                     samplePoint,
                                     sampleNormal,
                                     nearHitT,

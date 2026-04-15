@@ -16,7 +16,7 @@
 /tools/
 /goldgdt/
 /ericw-tools/
-/build_mc/
+/mc_build/
 /.cache/
 
 # Ignore IDE/editor configurations

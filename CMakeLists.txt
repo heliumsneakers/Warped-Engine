@@ -80,7 +80,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 # ----------------------------
 # Map compiler (offline CLI) — built standalone, no app/runtime renderer/Jolt.
 # Uses sokol_gfx directly for the compute lightmap baker.
-#   cmake -B build_mc -DBUILD_MAP_COMPILER=ON && cmake --build build_mc
+#   cmake -B mc_build -DBUILD_MAP_COMPILER=ON && cmake --build mc_build
 #   ./build_mc/bin/compile_map assets/maps/test.map test
 # ----------------------------
 option(BUILD_MAP_COMPILER "Build only the compile_map CLI tool" OFF)

@@ -292,21 +292,8 @@ vec3 safe_normalize(vec3 v, vec3 fallback) {
     return v * inversesqrt(len_sq);
 }
 
-vec3 build_sample_shadow_ray_origin(vec3 sample_point, vec3 sample_normal, vec3 dir) {
-    vec3 bias_dir = dir;
-    if (dot(bias_dir, bias_dir) <= 1e-8) {
-        bias_dir = sample_normal;
-    }
-    if (dot(bias_dir, bias_dir) <= 1e-8) {
-        return sample_point;
-    }
-    return sample_point + safe_normalize(bias_dir, vec3(0.0, 1.0, 0.0)) * (shadow_bias * 0.25);
-}
-
-vec3 build_face_local_shadow_ray_origin(vec3 plane_point, vec3 face_normal, vec3 dir) {
-    return plane_point
-        + safe_normalize(face_normal, vec3(0.0, 1.0, 0.0)) * shadow_bias
-        + dir * shadow_bias;
+vec3 build_face_local_shadow_ray_origin(vec3 plane_point, vec3 face_normal) {
+    return plane_point + safe_normalize(face_normal, vec3(0.0, 1.0, 0.0)) * shadow_bias;
 }
 
 void face_basis(vec3 n, out vec3 u, out vec3 v) {
@@ -1217,7 +1204,7 @@ vec3 compute_skydome_lighting(int owner_source_poly_index,
     for (int i = 0; i < SKYDOME_SAMPLE_COUNT; ++i) {
         if (upper_per_sample > 0.0) {
             vec3 dir = ericw_skydome_direction(true, i, upper_rotation);
-            vec3 ro = build_face_local_shadow_ray_origin(visibility_plane_point, visibility_face_normal, dir);
+            vec3 ro = build_face_local_shadow_ray_origin(visibility_plane_point, visibility_face_normal);
             bool visible = (sunlight_nosky != 0)
                 ? !occluded(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index)
                 : (closest_hit_distance(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index) >= sky_trace_distance);
@@ -1228,7 +1215,7 @@ vec3 compute_skydome_lighting(int owner_source_poly_index,
         }
         if (lower_per_sample > 0.0) {
             vec3 dir = ericw_skydome_direction(false, i, lower_rotation);
-            vec3 ro = build_face_local_shadow_ray_origin(visibility_plane_point, visibility_face_normal, dir);
+            vec3 ro = build_face_local_shadow_ray_origin(visibility_plane_point, visibility_face_normal);
             bool visible = (sunlight_nosky != 0)
                 ? !occluded(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index)
                 : (closest_hit_distance(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index) >= sky_trace_distance);
@@ -1243,9 +1230,7 @@ vec3 compute_skydome_lighting(int owner_source_poly_index,
 }
 
 float compute_edge_aware_near_hit_t(float ju, float jv) {
-    float edge_dist_luxels = min_dist_to_poly_edge_2d(ju, jv);
-    float edge_factor = clamp(1.0 - edge_dist_luxels / EDGE_SEAM_GUARD_LUXELS, 0.0, 1.0);
-    return shadow_bias + (shadow_bias * EDGE_SEAM_TMIN_SCALE) * edge_factor;
+    return ray_eps;
 }
 
 float compute_dirt_occlusion_ratio(vec3 sample_point, vec3 sample_normal) {
@@ -1257,7 +1242,7 @@ float compute_dirt_occlusion_ratio(vec3 sample_point, vec3 sample_normal) {
     for (int i = 0; i < DIRT_RAY_COUNT; ++i) {
         vec3 local_dir = build_ericw_dirt_vector(i, seed);
         vec3 dir = safe_normalize(transform_to_tangent_space(sample_normal, tangent, bitangent, local_dir), sample_normal);
-        float hit_distance = closest_hit_distance(sample_point + dir * shadow_bias, dir, shadow_bias, max(1.0, dirt_depth), -1, -1);
+        float hit_distance = closest_hit_distance(sample_point, dir, ray_eps, max(1.0, dirt_depth), -1, -1);
         accumulated_distance += min(max(1.0, dirt_depth), hit_distance);
     }
     float avg_hit_distance = accumulated_distance / float(DIRT_RAY_COUNT);
@@ -1267,6 +1252,8 @@ float compute_dirt_occlusion_ratio(vec3 sample_point, vec3 sample_normal) {
 vec3 compute_surface_emitter_contribution(surface_emitter emitter,
                                           vec3 emitter_sample_point,
                                           int owner_source_poly_index,
+                                          vec3 visibility_plane_point,
+                                          vec3 visibility_face_normal,
                                           vec3 sample_point,
                                           vec3 sample_normal,
                                           float near_hit_t,
@@ -1318,7 +1305,7 @@ vec3 compute_surface_emitter_contribution(surface_emitter emitter,
         return vec3(0.0);
     }
 
-    vec3 ro = build_sample_shadow_ray_origin(sample_point, sample_normal, dir_to_light);
+    vec3 ro = build_face_local_shadow_ray_origin(visibility_plane_point, visibility_face_normal);
     if (occluded(ro,
                  dir_to_light,
                  near_hit_t,
@@ -1392,7 +1379,7 @@ bool shade_sample(float ju, float jv, out vec3 sample_rgb) {
             dir = safe_normalize(light.parallel_direction, vec3(0.0, 1.0, 0.0));
             dist = max(1.0, light.intensity);
         } else {
-            vec3 to_light = light.position - owner_plane_point;
+            vec3 to_light = light.position - sample_point;
             dist = length(to_light);
             if ((dist > light.intensity) || (dist < 1e-3)) {
                 continue;
@@ -1419,7 +1406,7 @@ bool shade_sample(float ju, float jv, out vec3 sample_rgb) {
         if (spotlight <= 0.0) {
             continue;
         }
-        vec3 ro = build_face_local_shadow_ray_origin(owner_plane_point, owner_normal, dir);
+        vec3 ro = build_face_local_shadow_ray_origin(owner_plane_point, owner_normal);
         if (occluded(ro, dir, near_hit_t, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group, owner_source_poly_index)) {
             continue;
         }
@@ -1446,6 +1433,8 @@ bool shade_sample(float ju, float jv, out vec3 sample_rgb) {
             sample_rgb += compute_surface_emitter_contribution(emitter,
                                                                surface_emitter_samples[sample_index].point,
                                                                owner_source_poly_index,
+                                                               owner_plane_point,
+                                                               owner_normal,
                                                                sample_point,
                                                                sample_normal,
                                                                near_hit_t,
