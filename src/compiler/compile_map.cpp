@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -240,7 +241,13 @@ int main(int argc, char** argv)
     if (slash != std::string::npos) mapDir = mapPath.substr(0, slash);
 
     printf("[compile_map] parsing %s\n", mapPath.c_str());
-    Map map = ParseMapFile(mapPath);
+    fflush(stdout);
+    MapParseResult parseResult = ParseMapFile(mapPath);
+    if (!parseResult.ok) {
+        fprintf(stderr, "[compile_map] parse failed: %s\n", parseResult.error.c_str());
+        return 1;
+    }
+    Map map = std::move(parseResult.map);
     if (map.entities.empty()) { fprintf(stderr,"No entities parsed.\n"); return 1; }
 
     // ----- geometry + lights ----------------------------------------------

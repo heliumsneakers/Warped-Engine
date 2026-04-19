@@ -7,12 +7,12 @@
 #include <string>
 #include <utility>
 
-Map ParseMapFile(const std::string& filePath) {
-    Map map;
+MapParseResult ParseMapFile(const std::string& filePath) {
+    MapParseResult result;
     std::ifstream file(filePath);
     if (!file.is_open()) {
-        printf("Failed to open map: %s\n", filePath.c_str());
-        return map;
+        result.error = "failed to open map: " + filePath;
+        return result;
     }
 
     MapTokenizer tokenizer(file);
@@ -27,17 +27,17 @@ Map ParseMapFile(const std::string& filePath) {
         if (!ParseEntity(tokenizer, entity)) {
             break;
         }
-        map.entities.push_back(std::move(entity));
+        result.map.entities.push_back(std::move(entity));
     }
 
     if (!tokenizer.error.empty()) {
-        printf("Failed to parse map %s: %s\n", filePath.c_str(), tokenizer.error.c_str());
-        map.entities.clear();
-        return map;
+        result.error = tokenizer.error;
+        result.map.entities.clear();
+        return result;
     }
 
     bool hasValve220Version = false;
-    for (const Entity& entity : map.entities) {
+    for (const Entity& entity : result.map.entities) {
         auto versionIt = entity.properties.find("mapversion");
         if (versionIt != entity.properties.end() && versionIt->second == "220") {
             hasValve220Version = true;
@@ -45,20 +45,21 @@ Map ParseMapFile(const std::string& filePath) {
         }
     }
     if (!hasValve220Version) {
-        printf("Failed to parse map %s: missing required mapversion 220\n", filePath.c_str());
-        map.entities.clear();
-        return map;
+        result.error = "missing required mapversion 220";
+        result.map.entities.clear();
+        return result;
     }
 
     size_t brushCount = 0;
     size_t faceCount = 0;
-    for (const Entity& entity : map.entities) {
+    for (const Entity& entity : result.map.entities) {
         brushCount += entity.brushes.size();
         for (const Brush& brush : entity.brushes) {
             faceCount += brush.faces.size();
         }
     }
     printf("Parsed map: Entities=%zu, Brushes=%zu, Faces=%zu\n",
-           map.entities.size(), brushCount, faceCount);
-    return map;
+           result.map.entities.size(), brushCount, faceCount);
+    result.ok = true;
+    return result;
 }

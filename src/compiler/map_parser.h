@@ -7,7 +7,13 @@
 
 struct TextureManager;
 
-Map ParseMapFile(const std::string& filePath);
+struct MapParseResult {
+    Map map;
+    bool ok = false;
+    std::string error;
+};
+
+MapParseResult ParseMapFile(const std::string& filePath);
 std::vector<PlayerStart> GetPlayerStarts(const Map& map);
 std::vector<PointLight> GetPointLights(const Map& map);
 std::vector<SurfaceLightTemplate> GetSurfaceLightTemplates(const Map& map);

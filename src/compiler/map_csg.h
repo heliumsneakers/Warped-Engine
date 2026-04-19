@@ -5,17 +5,18 @@
 #include <cstddef>
 #include <vector>
 
-struct BrushSolidPlane {
+struct CsgBrushPlane {
     Vector3 point;
     Vector3 normal;
 };
 
-struct BrushSolid {
+struct CsgBrush {
     int sourceBrushId = -1;
     Vector3 min = {0.0f, 0.0f, 0.0f};
     Vector3 max = {0.0f, 0.0f, 0.0f};
     bool hasBounds = false;
-    std::vector<BrushSolidPlane> planes;
+    std::vector<CsgBrushPlane> planes;
+    std::vector<MapPolygon> polygons;
 };
 
 enum class PolygonPlaneClass {
@@ -25,11 +26,12 @@ enum class PolygonPlaneClass {
     Spanning
 };
 
-std::vector<BrushSolid> BuildBrushSolids(const std::vector<MapPolygon>& polys);
-bool BrushBoundsIntersect(const BrushSolid& a, const BrushSolid& b);
-PolygonPlaneClass ClassifyPolygonAgainstPlane(const std::vector<Vector3>& poly, const BrushSolidPlane& plane);
+std::vector<CsgBrush> BuildCsgBrushes(const std::vector<MapPolygon>& polys);
+bool BrushBoundsIntersect(const CsgBrush& a, const CsgBrush& b);
+PolygonPlaneClass ClassifyPolygonAgainstPlane(const std::vector<Vector3>& poly, const CsgBrushPlane& plane);
 bool PushValidFragment(const MapPolygon& source, std::vector<Vector3>&& verts, std::vector<MapPolygon>& out);
 bool SamePolygonVerts(const std::vector<Vector3>& a, const std::vector<Vector3>& b);
-std::vector<MapPolygon> ClipPolygonToBrushPlanes(const MapPolygon& poly, const BrushSolid& solid, size_t planeIndex, bool clipOnPlane);
-std::vector<MapPolygon> ClipPolygonToBrush(const MapPolygon& poly, const BrushSolid& solid, bool clipOnPlane);
+std::vector<MapPolygon> ClipPolygonToBrushPlanes(const MapPolygon& poly, const CsgBrush& brush, size_t planeIndex, bool clipOnPlane);
+std::vector<MapPolygon> ClipPolygonToBrush(const MapPolygon& poly, const CsgBrush& brush, bool clipOnPlane);
+void ClipBrushToBrush(CsgBrush& brush, const CsgBrush& clipBrush, bool clipOnPlane);
 std::vector<MapPolygon> BuildExteriorPolygons(const std::vector<MapPolygon>& polys);
