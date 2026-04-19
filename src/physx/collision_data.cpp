@@ -1,6 +1,6 @@
 #include "../math/wmath.h"
 #include "collision_data.h"
-#include "../utils/map_parser.h"
+#include "../compiler/map_parser.h"
 #include <vector>
 #include <string>
 #include <algorithm>

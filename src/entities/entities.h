@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../math/wmath.h"
-#include "../utils/map_parser.h"
+#include "../utils/map_types.h"
 #include "Jolt/Jolt.h"
 #include "Jolt/Physics/Body/BodyID.h"
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../utils/bsp_format.h"
-#include "../utils/map_parser.h"
+#include "map_parser.h"
 
 #include <cstdint>
 #include <functional>

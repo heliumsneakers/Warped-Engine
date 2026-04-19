@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../math/wmath.h"
-#include "../utils/map_parser.h"
+#include "map_parser.h"
 
 #include <cstdint>
 #include <string>

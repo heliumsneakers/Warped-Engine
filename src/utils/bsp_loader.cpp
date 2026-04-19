@@ -2,6 +2,7 @@
 #include "bsp_loader.h"
 #include "bsp_format.h"
 #include "asset_pack.h"
+#include "../compiler/map_parser.h"
 #include <cstdio>
 #include <cstring>
 #include <sstream>

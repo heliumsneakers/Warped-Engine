@@ -412,6 +412,8 @@ static void frame(void) {
     FrameRateLimiter();
 
     float frameDt = (float)sapp_frame_duration();
+    static float postTime = 0.0f;
+    postTime += frameDt;
     static double accumulator = 0.0;
 
     if (G.mode == AppMode::MainMenu) {
@@ -483,6 +485,7 @@ static void frame(void) {
     Matrix vp    = MatrixMultiply(proj, view);
     Matrix model = MatrixIdentity();
     Matrix mvp   = MatrixMultiply(vp, model);
+    Matrix normalModel = MatrixMultiply(view, model);
     Frustum frustum = FrustumFromVP(vp);
 
     Debug_NewFrame();
@@ -510,14 +513,46 @@ static void frame(void) {
     DebugDrawPlayerPos(&G.player, 0, 3);
     DebugDrawPlayerVel(0, 5);
 
-    sg_pass pass = {};
-    pass.action = G.gamePassAction;
-    pass.swapchain = sglue_swapchain();
-    sg_begin_pass(&pass);
+    bool usePost = Renderer_BeginScenePostPass(G.gamePassAction,
+                                               sapp_width(),
+                                               sapp_height(),
+                                               sapp_sample_count());
+    if (usePost) {
         Renderer_DrawMap(G.mapModel, mvp, model, frustum);
-        Debug_Flush();
-        sdtx_draw();
-    sg_end_pass();
+        Renderer_EndScenePostPass();
+        if (usePost) {
+            usePost = Renderer_BeginNormalPostPass(sapp_width(), sapp_height());
+            if (usePost) {
+                Renderer_DrawMapNormals(G.mapModel, mvp, normalModel, frustum);
+                Renderer_EndNormalPostPass();
+            }
+        }
+    }
+
+    if (usePost) {
+        sg_pass_action presentAction = {};
+        presentAction.colors[0].load_action = SG_LOADACTION_DONTCARE;
+        presentAction.depth.load_action = SG_LOADACTION_CLEAR;
+        presentAction.depth.clear_value = 1.0f;
+
+        sg_pass pass = {};
+        pass.action = presentAction;
+        pass.swapchain = sglue_swapchain();
+        sg_begin_pass(&pass);
+            Renderer_DrawPencilPostProcess(postTime);
+            Debug_Flush();
+            sdtx_draw();
+        sg_end_pass();
+    } else {
+        sg_pass pass = {};
+        pass.action = G.gamePassAction;
+        pass.swapchain = sglue_swapchain();
+        sg_begin_pass(&pass);
+            Renderer_DrawMap(G.mapModel, mvp, model, frustum);
+            Debug_Flush();
+            sdtx_draw();
+        sg_end_pass();
+    }
     sg_commit();
 }
 

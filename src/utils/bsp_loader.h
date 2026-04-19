@@ -1,7 +1,7 @@
 // bsp_loader.h  —  runtime .bsp reader.
 #pragma once
 #include "bsp_format.h"
-#include "map_parser.h"              // MapMeshBucket, Entity, PlayerStart
+#include "map_types.h"               // MapMeshBucket, Entity, PlayerStart
 #include "../physx/collision_data.h" // MeshCollisionData
 #include <vector>
 #include <cstdint>

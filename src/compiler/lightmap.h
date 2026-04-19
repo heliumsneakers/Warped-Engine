@@ -1,6 +1,6 @@
 // lightmap.h  —  offline lightmap baker for compile_map.
 #pragma once
-#include "../utils/map_parser.h"
+#include "map_parser.h"
 #include <vector>
 #include <cstdint>
 

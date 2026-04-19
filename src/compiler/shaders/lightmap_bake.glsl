@@ -629,11 +629,11 @@ float closest_hit_distance_bvh(vec3 ro, vec3 rd, float min_hit_t, float dist, in
     return closest;
 }
 
-float closest_solid_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist);
-bool solid_occluded(vec3 ro, vec3 rd, float min_hit_t, float dist);
+float closest_solid_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, vec3 self_contact_point);
+bool solid_occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, vec3 self_contact_point);
 
-bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
-    if (solid_occluded(ro, rd, min_hit_t, dist)) {
+bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index, vec3 self_contact_point) {
+    if (solid_occluded(ro, rd, min_hit_t, dist, self_contact_point)) {
         return true;
     }
     if (bvh_node_count > 0) {
@@ -642,8 +642,8 @@ bool occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder
     return occluded_bruteforce(ro, rd, min_hit_t, dist, ignore_occluder_group, ignore_source_poly_index);
 }
 
-float closest_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index) {
-    float solid_hit = closest_solid_hit_distance(ro, rd, min_hit_t, dist);
+float closest_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, int ignore_occluder_group, int ignore_source_poly_index, vec3 self_contact_point) {
+    float solid_hit = closest_solid_hit_distance(ro, rd, min_hit_t, dist, self_contact_point);
     if (bvh_node_count > 0) {
         return min(solid_hit, closest_hit_distance_bvh(ro, rd, min_hit_t, solid_hit, ignore_occluder_group, ignore_source_poly_index));
     }
@@ -656,15 +656,19 @@ vec3 project_point_onto_plane(vec3 point, vec3 plane_point, vec3 plane_normal) {
     return point - n * plane_dist;
 }
 
-bool point_inside_brush_solid(brush_solid solid, vec3 point) {
+bool point_inside_brush_solid_epsilon(brush_solid solid, vec3 point, float epsilon) {
     for (int i = 0; i < solid.plane_count; ++i) {
         solid_plane plane = solid_planes[solid.first_plane + i];
         float plane_dist = dot(plane.normal, point - plane.point);
-        if (plane_dist > 0.05) {
+        if (plane_dist > epsilon) {
             return false;
         }
     }
     return solid.plane_count > 0;
+}
+
+bool point_inside_brush_solid(brush_solid solid, vec3 point) {
+    return point_inside_brush_solid_epsilon(solid, point, 0.05);
 }
 
 bool point_inside_any_solid(vec3 point) {
@@ -709,16 +713,21 @@ float ray_brush_solid_t(brush_solid solid, vec3 ro, vec3 rd, float min_hit_t, fl
     return ((enter_t > min_hit_t) && (enter_t < dist)) ? enter_t : dist;
 }
 
-float closest_solid_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist) {
+float closest_solid_hit_distance(vec3 ro, vec3 rd, float min_hit_t, float dist, vec3 self_contact_point) {
     float closest = dist;
     for (int i = 0; i < solid_count; ++i) {
+        // Raw brush solids plug cracks, but solids touching the receiver's
+        // own surface are part of the same CSG contact and must not self-shadow.
+        if (point_inside_brush_solid_epsilon(solids[i], self_contact_point, 0.01)) {
+            continue;
+        }
         closest = min(closest, ray_brush_solid_t(solids[i], ro, rd, min_hit_t, closest));
     }
     return closest;
 }
 
-bool solid_occluded(vec3 ro, vec3 rd, float min_hit_t, float dist) {
-    return closest_solid_hit_distance(ro, rd, min_hit_t, dist) < dist;
+bool solid_occluded(vec3 ro, vec3 rd, float min_hit_t, float dist, vec3 self_contact_point) {
+    return closest_solid_hit_distance(ro, rd, min_hit_t, dist, self_contact_point) < dist;
 }
 
 float evaluate_light_attenuation(point_light light, float dist) {
@@ -1264,8 +1273,8 @@ vec3 compute_skydome_lighting(int owner_source_poly_index,
             vec3 dir = ericw_skydome_direction(true, i, upper_rotation);
             vec3 ro = build_face_local_shadow_ray_origin(visibility_plane_point, visibility_face_normal);
             bool visible = (sunlight_nosky != 0)
-                ? !occluded(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index)
-                : (closest_hit_distance(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index) >= sky_trace_distance);
+                ? !occluded(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index, visibility_plane_point)
+                : (closest_hit_distance(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index, visibility_plane_point) >= sky_trace_distance);
             if (visible) {
                 float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
                 result += sunlight2_color * (upper_per_sample * incidence * dirt);
@@ -1275,8 +1284,8 @@ vec3 compute_skydome_lighting(int owner_source_poly_index,
             vec3 dir = ericw_skydome_direction(false, i, lower_rotation);
             vec3 ro = build_face_local_shadow_ray_origin(visibility_plane_point, visibility_face_normal);
             bool visible = (sunlight_nosky != 0)
-                ? !occluded(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index)
-                : (closest_hit_distance(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index) >= sky_trace_distance);
+                ? !occluded(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index, visibility_plane_point)
+                : (closest_hit_distance(ro, dir, near_hit_t, sky_trace_distance, -1, owner_source_poly_index, visibility_plane_point) >= sky_trace_distance);
             if (visible) {
                 float incidence = evaluate_angle_scale(skylight_angle_scale, dot(sample_normal, dir));
                 result += sunlight3_color * (lower_per_sample * incidence * dirt);
@@ -1291,7 +1300,7 @@ float compute_edge_aware_near_hit_t(float ju, float jv) {
     return ray_eps;
 }
 
-float compute_dirt_occlusion_ratio(vec3 sample_point, vec3 sample_normal) {
+float compute_dirt_occlusion_ratio(vec3 self_contact_point, vec3 sample_point, vec3 sample_normal) {
     vec3 tangent;
     vec3 bitangent;
     face_basis(sample_normal, tangent, bitangent);
@@ -1300,7 +1309,7 @@ float compute_dirt_occlusion_ratio(vec3 sample_point, vec3 sample_normal) {
     for (int i = 0; i < DIRT_RAY_COUNT; ++i) {
         vec3 local_dir = build_ericw_dirt_vector(i, seed);
         vec3 dir = safe_normalize(transform_to_tangent_space(sample_normal, tangent, bitangent, local_dir), sample_normal);
-        float hit_distance = closest_hit_distance(sample_point, dir, ray_eps, max(1.0, dirt_depth), -1, -1);
+        float hit_distance = closest_hit_distance(sample_point, dir, ray_eps, max(1.0, dirt_depth), -1, -1, self_contact_point);
         accumulated_distance += min(max(1.0, dirt_depth), hit_distance);
     }
     float avg_hit_distance = accumulated_distance / float(DIRT_RAY_COUNT);
@@ -1369,7 +1378,8 @@ vec3 compute_surface_emitter_contribution(surface_emitter emitter,
                  near_hit_t,
                  max(0.0, dist - (shadow_bias * 2.0)),
                  emitter.ignore_occluder_group,
-                 owner_source_poly_index)) {
+                 owner_source_poly_index,
+                 visibility_plane_point)) {
         return vec3(0.0);
     }
 
@@ -1431,7 +1441,7 @@ bool shade_sample(float ju, float jv, out vec3 sample_rgb) {
             }
         }
     }
-    float dirt_occlusion = uses_dirt ? compute_dirt_occlusion_ratio(sample_point, sample_normal) : 0.0;
+    float dirt_occlusion = uses_dirt ? compute_dirt_occlusion_ratio(owner_plane_point, sample_point, sample_normal) : 0.0;
     for (int li = 0; li < light_count; ++li) {
         point_light light = lights[li];
         vec3 dir;
@@ -1469,7 +1479,7 @@ bool shade_sample(float ju, float jv, out vec3 sample_rgb) {
             continue;
         }
         vec3 ro = build_face_local_shadow_ray_origin(owner_plane_point, owner_normal);
-        if (occluded(ro, dir, near_hit_t, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group, owner_source_poly_index)) {
+        if (occluded(ro, dir, near_hit_t, max(0.0, dist - (shadow_bias * 2.0)), light.ignore_occluder_group, owner_source_poly_index, owner_plane_point)) {
             continue;
         }
         float dirt = light_uses_dirt(light)

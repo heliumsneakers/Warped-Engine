@@ -18,9 +18,12 @@
 #endif
 
 #include "shaders/generated/map.metal_dx11.h"
-#include "../utils/map_parser.h"
+#include "shaders/generated/normal.metal_dx11.h"
+#include "shaders/generated/pencil.metal_dx11.h"
+#include "../compiler/map_parser.h"
 #include "../utils/bsp_loader.h"
 #include "sokol_gfx.h"
+#include "sokol_glue.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -39,6 +42,41 @@ static sg_sampler  g_lmSampler = {};   // clamp, for lightmap
 static sg_image    g_whiteLm   = {};   // 1×1 white fallback lightmap
 static sg_view     g_whiteLmV  = {};
 static bool        g_logged_bind_diagnostics = false;
+
+struct PencilPostVertex {
+    float x;
+    float y;
+    float u;
+    float v;
+};
+
+static sg_shader   g_pencilShader        = {};
+static sg_pipeline g_pencilPipeline      = {};
+static sg_buffer   g_pencilVertexBuffer  = {};
+static sg_shader   g_normalShader        = {};
+static sg_pipeline g_normalPipeline      = {};
+static sg_sampler  g_postSceneSampler    = {};
+static sg_sampler  g_postNormalSampler   = {};
+
+static sg_image g_sceneColor = {};
+static sg_image g_sceneResolve = {};
+static sg_image g_sceneDepth = {};
+static sg_view  g_sceneColorAttView = {};
+static sg_view  g_sceneResolveAttView = {};
+static sg_view  g_sceneDepthAttView = {};
+static sg_view  g_sceneTextureView = {};
+static int      g_sceneWidth = 0;
+static int      g_sceneHeight = 0;
+static int      g_sceneSampleCount = 0;
+
+static sg_image g_normalColor = {};
+static sg_image g_normalDepth = {};
+static sg_image g_normalDepthColor = {};
+static sg_view  g_normalColorAttView = {};
+static sg_view  g_normalDepthAttView = {};
+static sg_view  g_normalDepthColorAttView = {};
+static sg_view  g_normalTextureView = {};
+static sg_view  g_normalDepthTextureView = {};
 
 static const char* RendererBackendName(sg_backend backend) {
     switch (backend) {
@@ -166,6 +204,290 @@ static sg_shader Renderer_MakePlatformMapShader(sg_backend backend) {
 #else
     (void)backend;
     printf("[Renderer] No shader path configured for this platform build.\n");
+    return {};
+#endif
+}
+
+static sg_shader Renderer_MakeGeneratedPencilShader(sg_backend backend) {
+    const sg_shader_desc* desc = warped_pencil_shader_pencil_post_shader_desc(backend);
+    if (!desc) {
+        printf("[Renderer] No generated pencil shader descriptor for backend %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    return sg_make_shader(desc);
+}
+
+static const char* WARPED_PENCIL_VS_SRC =
+    "#version 330\n"
+    "layout(location=0) in vec2 a_pos;\n"
+    "layout(location=1) in vec2 a_uv;\n"
+    "out vec2 v_uv;\n"
+    "void main() {\n"
+    "    v_uv = a_uv;\n"
+    "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+    "}\n";
+
+static const char* WARPED_PENCIL_FS_SRC =
+    "#version 330\n"
+    "uniform fs_params {\n"
+    "    vec4 u_resolution_time;\n"
+    "    vec4 u_effect_params;\n"
+    "};\n"
+    "\n"
+    "uniform sampler2D u_scene;\n"
+    "uniform sampler2D u_normals;\n"
+    "uniform sampler2D u_depth;\n"
+    "\n"
+    "in vec2 v_uv;\n"
+    "out vec4 frag_color;\n"
+    "\n"
+    "float luminance(vec3 c) {\n"
+    "    return dot(c, vec3(0.299, 0.587, 0.114));\n"
+    "}\n"
+    "\n"
+    "vec4 normal_sample(vec2 uv) {\n"
+    "    vec4 n = texture(u_normals, uv);\n"
+    "    return vec4(n.xyz * 2.0 - 1.0, n.a);\n"
+    "}\n"
+    "\n"
+    "float depth_sample(vec2 uv) {\n"
+    "    return texture(u_depth, uv).r;\n"
+    "}\n"
+    "\n"
+    "float normal_delta(vec4 center, vec4 sample_n) {\n"
+    "    float center_occ = step(0.0001, center.a);\n"
+    "    float sample_occ = step(0.0001, sample_n.a);\n"
+    "    float silhouette = abs(center_occ - sample_occ);\n"
+    "    float crease = length(center.xyz - sample_n.xyz) * center_occ * sample_occ;\n"
+    "    return max(silhouette, crease);\n"
+    "}\n"
+    "\n"
+    "float geometry_edge(vec2 uv, vec2 texel, float radius, vec4 center_n, float center_d) {\n"
+    "    float center_occ = step(0.0001, center_n.a);\n"
+    "\n"
+    "    vec4 s0 = normal_sample(uv + texel * vec2( radius, 0.0));\n"
+    "    vec4 s1 = normal_sample(uv + texel * vec2(-radius, 0.0));\n"
+    "    vec4 s2 = normal_sample(uv + texel * vec2(0.0,  radius));\n"
+    "    vec4 s3 = normal_sample(uv + texel * vec2(0.0, -radius));\n"
+    "\n"
+    "    float nd0 = normal_delta(center_n, s0);\n"
+    "    float nd1 = normal_delta(center_n, s1);\n"
+    "    float nd2 = normal_delta(center_n, s2);\n"
+    "    float nd3 = normal_delta(center_n, s3);\n"
+    "\n"
+    "    float support = step(0.12, nd0) + step(0.12, nd1) + step(0.12, nd2) + step(0.12, nd3);\n"
+    "    float normal_e = max(max(nd0, nd1), max(nd2, nd3)) * step(1.0, support);\n"
+    "\n"
+    "    float d0 = depth_sample(uv + texel * vec2( radius, 0.0));\n"
+    "    float d1 = depth_sample(uv + texel * vec2(-radius, 0.0));\n"
+    "    float d2 = depth_sample(uv + texel * vec2(0.0,  radius));\n"
+    "    float d3 = depth_sample(uv + texel * vec2(0.0, -radius));\n"
+    "\n"
+    "    float laplacian_h = abs(d0 + d1 - 2.0 * center_d);\n"
+    "    float laplacian_v = abs(d2 + d3 - 2.0 * center_d);\n"
+    "    float depth_e = smoothstep(0.008, 0.03, max(laplacian_h, laplacian_v) / max(center_d, 0.0001));\n"
+    "    float max_rel_depth = max(max(abs(d0 - center_d), abs(d1 - center_d)),\n"
+    "                              max(abs(d2 - center_d), abs(d3 - center_d))) / max(center_d, 0.0001);\n"
+    "    float max_normal_delta = max(max(nd0, nd1), max(nd2, nd3));\n"
+    "    float same_surface_noise = (1.0 - step(0.08, max_normal_delta)) *\n"
+    "                               (1.0 - smoothstep(0.015, 0.08, max_rel_depth));\n"
+    "    depth_e *= 1.0 - same_surface_noise;\n"
+    "\n"
+    "    return max(normal_e, depth_e) * center_occ;\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    vec2 resolution = max(u_resolution_time.xy, vec2(1.0));\n"
+    "    vec2 texel = 1.0 / resolution;\n"
+    "    vec2 uv = clamp(v_uv, texel, 1.0 - texel);\n"
+    "\n"
+    "    vec4 scene = texture(u_scene, uv);\n"
+    "    vec4 center_n = normal_sample(uv);\n"
+    "    float center_d = depth_sample(uv);\n"
+    "    float lum = luminance(scene.rgb);\n"
+    "\n"
+    "    float edge_gain = max(u_effect_params.x, 0.01);\n"
+    "    float far_radius = max(u_effect_params.y, 0.25);\n"
+    "    float near_radius = max(u_effect_params.z, far_radius);\n"
+    "    float scene_mix = clamp(u_effect_params.w, 0.0, 1.0);\n"
+    "\n"
+    "    float view_dist = center_d * 4096.0;\n"
+    "    float near_factor = clamp(1.0 - smoothstep(96.0, 896.0, view_dist), 0.0, 1.0);\n"
+    "    float radius = mix(far_radius, near_radius, near_factor);\n"
+    "    float edge_response = geometry_edge(uv, texel, radius, center_n, center_d);\n"
+    "    float edge = smoothstep(0.16, 0.42, edge_response * edge_gain);\n"
+    "\n"
+    "    vec3 paper_color = vec3(0.965, 0.935, 0.865);\n"
+    "    vec3 graphite = vec3(0.105, 0.092, 0.082);\n"
+    "    vec3 washed_scene = mix(vec3(lum), scene.rgb, 0.34);\n"
+    "    vec3 base = mix(paper_color, washed_scene, scene_mix);\n"
+    "\n"
+    "    float pencil = clamp(edge * 0.95, 0.0, 1.0) * step(0.0001, center_n.a);\n"
+    "    vec3 color = mix(base, graphite, pencil);\n"
+    "\n"
+    "    frag_color = vec4(color, scene.a);\n"
+    "}\n";
+
+
+static sg_shader Renderer_MakeGLPencilShader(void) {
+    sg_shader_desc sd = {};
+    sd.label = "pencil-post-shader";
+    sd.vertex_func.source = WARPED_PENCIL_VS_SRC;
+    sd.fragment_func.source = WARPED_PENCIL_FS_SRC;
+
+    sd.attrs[ATTR_warped_pencil_shader_pencil_post_a_pos].glsl_name = "a_pos";
+    sd.attrs[ATTR_warped_pencil_shader_pencil_post_a_uv].glsl_name = "a_uv";
+
+    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].stage = SG_SHADERSTAGE_FRAGMENT;
+    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].size = sizeof(warped_pencil_shader_fs_params_t);
+    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].layout = SG_UNIFORMLAYOUT_NATIVE;
+    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].glsl_uniforms[0].type = SG_UNIFORMTYPE_FLOAT4;
+    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].glsl_uniforms[0].glsl_name = "u_resolution_time";
+    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].glsl_uniforms[1].type = SG_UNIFORMTYPE_FLOAT4;
+    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].glsl_uniforms[1].glsl_name = "u_effect_params";
+
+    sd.views[VIEW_warped_pencil_shader_u_scene].texture.stage = SG_SHADERSTAGE_FRAGMENT;
+    sd.views[VIEW_warped_pencil_shader_u_scene].texture.image_type = SG_IMAGETYPE_2D;
+    sd.views[VIEW_warped_pencil_shader_u_scene].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
+    sd.views[VIEW_warped_pencil_shader_u_normals].texture.stage = SG_SHADERSTAGE_FRAGMENT;
+    sd.views[VIEW_warped_pencil_shader_u_normals].texture.image_type = SG_IMAGETYPE_2D;
+    sd.views[VIEW_warped_pencil_shader_u_normals].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
+    sd.views[VIEW_warped_pencil_shader_u_depth].texture.stage = SG_SHADERSTAGE_FRAGMENT;
+    sd.views[VIEW_warped_pencil_shader_u_depth].texture.image_type = SG_IMAGETYPE_2D;
+    sd.views[VIEW_warped_pencil_shader_u_depth].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
+
+    sd.samplers[SMP_warped_pencil_shader_u_scene_smp].stage = SG_SHADERSTAGE_FRAGMENT;
+    sd.samplers[SMP_warped_pencil_shader_u_scene_smp].sampler_type = SG_SAMPLERTYPE_FILTERING;
+    sd.samplers[SMP_warped_pencil_shader_u_normal_smp].stage = SG_SHADERSTAGE_FRAGMENT;
+    sd.samplers[SMP_warped_pencil_shader_u_normal_smp].sampler_type = SG_SAMPLERTYPE_FILTERING;
+    sd.samplers[SMP_warped_pencil_shader_u_depth_smp].stage = SG_SHADERSTAGE_FRAGMENT;
+    sd.samplers[SMP_warped_pencil_shader_u_depth_smp].sampler_type = SG_SAMPLERTYPE_FILTERING;
+
+    sd.texture_sampler_pairs[0].stage = SG_SHADERSTAGE_FRAGMENT;
+    sd.texture_sampler_pairs[0].view_slot = VIEW_warped_pencil_shader_u_scene;
+    sd.texture_sampler_pairs[0].sampler_slot = SMP_warped_pencil_shader_u_scene_smp;
+    sd.texture_sampler_pairs[0].glsl_name = "u_scene";
+    sd.texture_sampler_pairs[1].stage = SG_SHADERSTAGE_FRAGMENT;
+    sd.texture_sampler_pairs[1].view_slot = VIEW_warped_pencil_shader_u_normals;
+    sd.texture_sampler_pairs[1].sampler_slot = SMP_warped_pencil_shader_u_normal_smp;
+    sd.texture_sampler_pairs[1].glsl_name = "u_normals";
+    sd.texture_sampler_pairs[2].stage = SG_SHADERSTAGE_FRAGMENT;
+    sd.texture_sampler_pairs[2].view_slot = VIEW_warped_pencil_shader_u_depth;
+    sd.texture_sampler_pairs[2].sampler_slot = SMP_warped_pencil_shader_u_depth_smp;
+    sd.texture_sampler_pairs[2].glsl_name = "u_depth";
+    return sg_make_shader(&sd);
+}
+
+static sg_shader Renderer_MakePlatformPencilShader(sg_backend backend) {
+#if defined(WARPED_SOKOL_BACKEND_METAL)
+    if (backend != SG_BACKEND_METAL_MACOS) {
+        printf("[Renderer] Backend mismatch: expected METAL_MACOS, got %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    return Renderer_MakeGeneratedPencilShader(backend);
+#elif defined(WARPED_SOKOL_BACKEND_D3D11)
+    if (backend != SG_BACKEND_D3D11) {
+        printf("[Renderer] Backend mismatch: expected D3D11, got %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    return Renderer_MakeGeneratedPencilShader(backend);
+#elif defined(WARPED_SOKOL_BACKEND_GLCORE)
+    if (backend != SG_BACKEND_GLCORE) {
+        printf("[Renderer] Backend mismatch: expected GLCORE, got %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    return Renderer_MakeGLPencilShader();
+#else
+    (void)backend;
+    return {};
+#endif
+}
+
+static sg_shader Renderer_MakeGeneratedNormalShader(sg_backend backend) {
+    const sg_shader_desc* desc = warped_normal_shader_normal_pass_shader_desc(backend);
+    if (!desc) {
+        printf("[Renderer] No generated normal shader descriptor for backend %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    return sg_make_shader(desc);
+}
+
+static const char* WARPED_NORMAL_VS_SRC =
+    "#version 330\n"
+    "uniform mat4 u_mvp;\n"
+    "uniform mat4 u_normal_model;\n"
+    "layout(location=0) in vec3 a_pos;\n"
+    "layout(location=1) in vec3 a_nrm;\n"
+    "out vec3 v_nrm;\n"
+    "out float v_view_dist;\n"
+    "void main() {\n"
+    "    v_nrm = normalize(mat3(u_normal_model) * a_nrm);\n"
+    "    vec4 view_pos = u_normal_model * vec4(a_pos, 1.0);\n"
+    "    v_view_dist = max(-view_pos.z, 0.0);\n"
+    "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+    "}\n";
+
+static const char* WARPED_NORMAL_FS_SRC =
+    "#version 330\n"
+    "in vec3 v_nrm;\n"
+    "in float v_view_dist;\n"
+    "layout(location=0) out vec4 frag_color;\n"
+    "layout(location=1) out vec4 frag_depth_out;\n"
+    "void main() {\n"
+    "    vec3 n = normalize(v_nrm) * 0.5 + 0.5;\n"
+    "    frag_color = vec4(n, 1.0);\n"
+    "    frag_depth_out = vec4(v_view_dist / 4096.0, 0.0, 0.0, 0.0);\n"
+    "}\n";
+
+static sg_shader Renderer_MakeGLNormalShader(void) {
+    sg_shader_desc sd = {};
+    sd.label = "normal-post-shader";
+    sd.vertex_func.source = WARPED_NORMAL_VS_SRC;
+    sd.fragment_func.source = WARPED_NORMAL_FS_SRC;
+
+    sd.attrs[ATTR_warped_normal_shader_normal_pass_a_pos].glsl_name = "a_pos";
+    sd.attrs[ATTR_warped_normal_shader_normal_pass_a_nrm].glsl_name = "a_nrm";
+
+    sd.uniform_blocks[UB_warped_normal_shader_vs_params].stage = SG_SHADERSTAGE_VERTEX;
+    sd.uniform_blocks[UB_warped_normal_shader_vs_params].size = sizeof(warped_normal_shader_vs_params_t);
+    sd.uniform_blocks[UB_warped_normal_shader_vs_params].layout = SG_UNIFORMLAYOUT_NATIVE;
+    sd.uniform_blocks[UB_warped_normal_shader_vs_params].glsl_uniforms[0].type = SG_UNIFORMTYPE_MAT4;
+    sd.uniform_blocks[UB_warped_normal_shader_vs_params].glsl_uniforms[0].glsl_name = "u_mvp";
+    sd.uniform_blocks[UB_warped_normal_shader_vs_params].glsl_uniforms[1].type = SG_UNIFORMTYPE_MAT4;
+    sd.uniform_blocks[UB_warped_normal_shader_vs_params].glsl_uniforms[1].glsl_name = "u_normal_model";
+
+    return sg_make_shader(&sd);
+}
+
+static sg_shader Renderer_MakePlatformNormalShader(sg_backend backend) {
+#if defined(WARPED_SOKOL_BACKEND_METAL)
+    if (backend != SG_BACKEND_METAL_MACOS) {
+        printf("[Renderer] Backend mismatch: expected METAL_MACOS, got %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    return Renderer_MakeGeneratedNormalShader(backend);
+#elif defined(WARPED_SOKOL_BACKEND_D3D11)
+    if (backend != SG_BACKEND_D3D11) {
+        printf("[Renderer] Backend mismatch: expected D3D11, got %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    return Renderer_MakeGeneratedNormalShader(backend);
+#elif defined(WARPED_SOKOL_BACKEND_GLCORE)
+    if (backend != SG_BACKEND_GLCORE) {
+        printf("[Renderer] Backend mismatch: expected GLCORE, got %s.\n",
+               RendererBackendName(backend));
+        return {};
+    }
+    return Renderer_MakeGLNormalShader();
+#else
+    (void)backend;
     return {};
 #endif
 }
@@ -341,6 +663,357 @@ void UnloadAllTextures(TextureManager& mgr) {
     mgr.textures.clear();
 }
 
+static void Renderer_DestroyScenePostTargets(void) {
+    if (g_sceneTextureView.id) {
+        sg_destroy_view(g_sceneTextureView);
+    }
+    if (g_sceneDepthAttView.id) {
+        sg_destroy_view(g_sceneDepthAttView);
+    }
+    if (g_sceneResolveAttView.id) {
+        sg_destroy_view(g_sceneResolveAttView);
+    }
+    if (g_sceneColorAttView.id) {
+        sg_destroy_view(g_sceneColorAttView);
+    }
+    if (g_normalTextureView.id) {
+        sg_destroy_view(g_normalTextureView);
+    }
+    if (g_normalDepthTextureView.id) {
+        sg_destroy_view(g_normalDepthTextureView);
+    }
+    if (g_normalDepthColorAttView.id) {
+        sg_destroy_view(g_normalDepthColorAttView);
+    }
+    if (g_normalDepthAttView.id) {
+        sg_destroy_view(g_normalDepthAttView);
+    }
+    if (g_normalColorAttView.id) {
+        sg_destroy_view(g_normalColorAttView);
+    }
+    if (g_sceneDepth.id) {
+        sg_destroy_image(g_sceneDepth);
+    }
+    if (g_sceneResolve.id) {
+        sg_destroy_image(g_sceneResolve);
+    }
+    if (g_sceneColor.id) {
+        sg_destroy_image(g_sceneColor);
+    }
+    if (g_normalDepthColor.id) {
+        sg_destroy_image(g_normalDepthColor);
+    }
+    if (g_normalDepth.id) {
+        sg_destroy_image(g_normalDepth);
+    }
+    if (g_normalColor.id) {
+        sg_destroy_image(g_normalColor);
+    }
+
+    g_sceneTextureView = {};
+    g_sceneDepthAttView = {};
+    g_sceneResolveAttView = {};
+    g_sceneColorAttView = {};
+    g_sceneDepth = {};
+    g_sceneResolve = {};
+    g_sceneColor = {};
+    g_normalTextureView = {};
+    g_normalDepthTextureView = {};
+    g_normalDepthColorAttView = {};
+    g_normalDepthAttView = {};
+    g_normalColorAttView = {};
+    g_normalDepthColor = {};
+    g_normalDepth = {};
+    g_normalColor = {};
+    g_sceneWidth = 0;
+    g_sceneHeight = 0;
+    g_sceneSampleCount = 0;
+}
+
+static bool Renderer_EnsureScenePostTargets(int width, int height, int sampleCount) {
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    sampleCount = std::max(1, sampleCount);
+
+    if (g_sceneWidth == width &&
+        g_sceneHeight == height &&
+        g_sceneSampleCount == sampleCount &&
+        sg_query_view_state(g_sceneTextureView) == SG_RESOURCESTATE_VALID &&
+        sg_query_view_state(g_normalTextureView) == SG_RESOURCESTATE_VALID &&
+        sg_query_view_state(g_normalDepthTextureView) == SG_RESOURCESTATE_VALID) {
+        return true;
+    }
+
+    Renderer_DestroyScenePostTargets();
+
+    const sg_environment env = sglue_environment();
+
+    sg_image_desc colorDesc = {};
+    colorDesc.usage.color_attachment = true;
+    colorDesc.width = width;
+    colorDesc.height = height;
+    colorDesc.pixel_format = env.defaults.color_format;
+    colorDesc.sample_count = sampleCount;
+    colorDesc.label = "scene-post-color";
+    g_sceneColor = sg_make_image(&colorDesc);
+
+    if (sampleCount > 1) {
+        sg_image_desc resolveDesc = {};
+        resolveDesc.usage.resolve_attachment = true;
+        resolveDesc.width = width;
+        resolveDesc.height = height;
+        resolveDesc.pixel_format = env.defaults.color_format;
+        resolveDesc.sample_count = 1;
+        resolveDesc.label = "scene-post-resolve";
+        g_sceneResolve = sg_make_image(&resolveDesc);
+    }
+
+    sg_image_desc depthDesc = {};
+    depthDesc.usage.depth_stencil_attachment = true;
+    depthDesc.width = width;
+    depthDesc.height = height;
+    depthDesc.pixel_format = env.defaults.depth_format;
+    depthDesc.sample_count = sampleCount;
+    depthDesc.label = "scene-post-depth";
+    g_sceneDepth = sg_make_image(&depthDesc);
+
+    sg_view_desc colorViewDesc = {};
+    colorViewDesc.color_attachment.image = g_sceneColor;
+    colorViewDesc.label = "scene-post-color-view";
+    g_sceneColorAttView = sg_make_view(&colorViewDesc);
+
+    if (sampleCount > 1) {
+        sg_view_desc resolveViewDesc = {};
+        resolveViewDesc.resolve_attachment.image = g_sceneResolve;
+        resolveViewDesc.label = "scene-post-resolve-view";
+        g_sceneResolveAttView = sg_make_view(&resolveViewDesc);
+    }
+
+    sg_view_desc depthViewDesc = {};
+    depthViewDesc.depth_stencil_attachment.image = g_sceneDepth;
+    depthViewDesc.label = "scene-post-depth-view";
+    g_sceneDepthAttView = sg_make_view(&depthViewDesc);
+
+    sg_view_desc textureViewDesc = {};
+    textureViewDesc.texture.image = (sampleCount > 1) ? g_sceneResolve : g_sceneColor;
+    textureViewDesc.label = "scene-post-texture-view";
+    g_sceneTextureView = sg_make_view(&textureViewDesc);
+
+    sg_image_desc normalColorDesc = {};
+    normalColorDesc.usage.color_attachment = true;
+    normalColorDesc.width = width;
+    normalColorDesc.height = height;
+    normalColorDesc.pixel_format = env.defaults.color_format;
+    normalColorDesc.sample_count = 1;
+    normalColorDesc.label = "normal-post-color";
+    g_normalColor = sg_make_image(&normalColorDesc);
+
+    sg_image_desc normalDepthColorDesc = {};
+    normalDepthColorDesc.usage.color_attachment = true;
+    normalDepthColorDesc.width = width;
+    normalDepthColorDesc.height = height;
+    normalDepthColorDesc.pixel_format = SG_PIXELFORMAT_R16F;
+    normalDepthColorDesc.sample_count = 1;
+    normalDepthColorDesc.label = "normal-depth-color";
+    g_normalDepthColor = sg_make_image(&normalDepthColorDesc);
+
+    sg_image_desc normalDepthDesc = {};
+    normalDepthDesc.usage.depth_stencil_attachment = true;
+    normalDepthDesc.width = width;
+    normalDepthDesc.height = height;
+    normalDepthDesc.pixel_format = env.defaults.depth_format;
+    normalDepthDesc.sample_count = 1;
+    normalDepthDesc.label = "normal-post-depth";
+    g_normalDepth = sg_make_image(&normalDepthDesc);
+
+    sg_view_desc normalColorViewDesc = {};
+    normalColorViewDesc.color_attachment.image = g_normalColor;
+    normalColorViewDesc.label = "normal-post-color-view";
+    g_normalColorAttView = sg_make_view(&normalColorViewDesc);
+
+    sg_view_desc normalDepthColorViewDesc = {};
+    normalDepthColorViewDesc.color_attachment.image = g_normalDepthColor;
+    normalDepthColorViewDesc.label = "normal-depth-color-view";
+    g_normalDepthColorAttView = sg_make_view(&normalDepthColorViewDesc);
+
+    sg_view_desc normalDepthViewDesc = {};
+    normalDepthViewDesc.depth_stencil_attachment.image = g_normalDepth;
+    normalDepthViewDesc.label = "normal-post-depth-view";
+    g_normalDepthAttView = sg_make_view(&normalDepthViewDesc);
+
+    sg_view_desc normalTextureViewDesc = {};
+    normalTextureViewDesc.texture.image = g_normalColor;
+    normalTextureViewDesc.label = "normal-post-texture-view";
+    g_normalTextureView = sg_make_view(&normalTextureViewDesc);
+
+    sg_view_desc normalDepthTextureViewDesc = {};
+    normalDepthTextureViewDesc.texture.image = g_normalDepthColor;
+    normalDepthTextureViewDesc.label = "normal-depth-texture-view";
+    g_normalDepthTextureView = sg_make_view(&normalDepthTextureViewDesc);
+
+    const bool ok =
+        (sg_query_image_state(g_sceneColor) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_image_state(g_sceneDepth) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_image_state(g_normalColor) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_image_state(g_normalDepthColor) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_image_state(g_normalDepth) == SG_RESOURCESTATE_VALID) &&
+        (sampleCount <= 1 || sg_query_image_state(g_sceneResolve) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_view_state(g_sceneColorAttView) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_view_state(g_sceneDepthAttView) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_view_state(g_normalColorAttView) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_view_state(g_normalDepthColorAttView) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_view_state(g_normalDepthAttView) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_view_state(g_normalTextureView) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_view_state(g_normalDepthTextureView) == SG_RESOURCESTATE_VALID) &&
+        (sampleCount <= 1 || sg_query_view_state(g_sceneResolveAttView) == SG_RESOURCESTATE_VALID) &&
+        (sg_query_view_state(g_sceneTextureView) == SG_RESOURCESTATE_VALID);
+
+    if (!ok) {
+        printf("[Renderer] Failed to create post targets: color=%s resolve=%s depth=%s textureView=%s normal=%s normalView=%s depthColor=%s.\n",
+               RendererResourceStateName(sg_query_image_state(g_sceneColor)),
+               (sampleCount > 1) ? RendererResourceStateName(sg_query_image_state(g_sceneResolve)) : "unused",
+               RendererResourceStateName(sg_query_image_state(g_sceneDepth)),
+               RendererResourceStateName(sg_query_view_state(g_sceneTextureView)),
+               RendererResourceStateName(sg_query_image_state(g_normalColor)),
+               RendererResourceStateName(sg_query_view_state(g_normalTextureView)),
+               RendererResourceStateName(sg_query_image_state(g_normalDepthColor)));
+        Renderer_DestroyScenePostTargets();
+        return false;
+    }
+
+    g_sceneWidth = width;
+    g_sceneHeight = height;
+    g_sceneSampleCount = sampleCount;
+    return true;
+}
+
+static void Renderer_InitPencilPostProcess(sg_backend backend) {
+    sg_sampler_desc sceneSamplerDesc = {};
+    sceneSamplerDesc.min_filter = SG_FILTER_LINEAR;
+    sceneSamplerDesc.mag_filter = SG_FILTER_LINEAR;
+    sceneSamplerDesc.wrap_u = SG_WRAP_CLAMP_TO_EDGE;
+    sceneSamplerDesc.wrap_v = SG_WRAP_CLAMP_TO_EDGE;
+    sceneSamplerDesc.label = "post-scene-sampler";
+    g_postSceneSampler = sg_make_sampler(&sceneSamplerDesc);
+
+    sg_sampler_desc normalSamplerDesc = {};
+    normalSamplerDesc.min_filter = SG_FILTER_NEAREST;
+    normalSamplerDesc.mag_filter = SG_FILTER_NEAREST;
+    normalSamplerDesc.wrap_u = SG_WRAP_CLAMP_TO_EDGE;
+    normalSamplerDesc.wrap_v = SG_WRAP_CLAMP_TO_EDGE;
+    normalSamplerDesc.label = "post-normal-sampler";
+    g_postNormalSampler = sg_make_sampler(&normalSamplerDesc);
+
+    g_pencilShader = Renderer_MakePlatformPencilShader(backend);
+    if (!g_pencilShader.id) {
+        printf("[Renderer] Failed to create pencil post shader for backend %s.\n",
+               RendererBackendName(backend));
+        return;
+    }
+
+    static const PencilPostVertex kFullscreenVerts[] = {
+        { -1.0f, -1.0f, 0.0f, 1.0f },
+        {  1.0f, -1.0f, 1.0f, 1.0f },
+        { -1.0f,  1.0f, 0.0f, 0.0f },
+        { -1.0f,  1.0f, 0.0f, 0.0f },
+        {  1.0f, -1.0f, 1.0f, 1.0f },
+        {  1.0f,  1.0f, 1.0f, 0.0f },
+    };
+
+    sg_buffer_desc vbd = {};
+    vbd.data = { kFullscreenVerts, sizeof(kFullscreenVerts) };
+    vbd.label = "pencil-post-vbuf";
+    g_pencilVertexBuffer = sg_make_buffer(&vbd);
+
+    const sg_environment env = sglue_environment();
+    sg_pipeline_desc pd = {};
+    pd.label = "pencil-post-pipeline";
+    pd.shader = g_pencilShader;
+    pd.layout.buffers[0].stride = sizeof(PencilPostVertex);
+    pd.layout.attrs[ATTR_warped_pencil_shader_pencil_post_a_pos].format = SG_VERTEXFORMAT_FLOAT2;
+    pd.layout.attrs[ATTR_warped_pencil_shader_pencil_post_a_pos].offset = offsetof(PencilPostVertex, x);
+    pd.layout.attrs[ATTR_warped_pencil_shader_pencil_post_a_uv].format = SG_VERTEXFORMAT_FLOAT2;
+    pd.layout.attrs[ATTR_warped_pencil_shader_pencil_post_a_uv].offset = offsetof(PencilPostVertex, u);
+    pd.color_count = 1;
+    pd.colors[0].pixel_format = env.defaults.color_format;
+    pd.depth.pixel_format = env.defaults.depth_format;
+    pd.depth.compare = SG_COMPAREFUNC_ALWAYS;
+    pd.depth.write_enabled = false;
+    pd.sample_count = env.defaults.sample_count;
+    pd.primitive_type = SG_PRIMITIVETYPE_TRIANGLES;
+    pd.cull_mode = SG_CULLMODE_NONE;
+    g_pencilPipeline = sg_make_pipeline(&pd);
+
+    printf("[Renderer] Pencil post pipeline state: %s\n",
+           RendererResourceStateName(sg_query_pipeline_state(g_pencilPipeline)));
+
+    g_normalShader = Renderer_MakePlatformNormalShader(backend);
+    if (!g_normalShader.id) {
+        printf("[Renderer] Failed to create normal post shader for backend %s.\n",
+               RendererBackendName(backend));
+        return;
+    }
+
+    sg_pipeline_desc npd = {};
+    npd.label = "normal-post-pipeline";
+    npd.shader = g_normalShader;
+    npd.layout.buffers[0].stride = sizeof(MapVertex);
+    npd.layout.attrs[ATTR_warped_normal_shader_normal_pass_a_pos].format = SG_VERTEXFORMAT_FLOAT3;
+    npd.layout.attrs[ATTR_warped_normal_shader_normal_pass_a_pos].offset = offsetof(MapVertex, x);
+    npd.layout.attrs[ATTR_warped_normal_shader_normal_pass_a_nrm].format = SG_VERTEXFORMAT_FLOAT3;
+    npd.layout.attrs[ATTR_warped_normal_shader_normal_pass_a_nrm].offset = offsetof(MapVertex, nx);
+    npd.index_type = SG_INDEXTYPE_UINT32;
+    npd.cull_mode = SG_CULLMODE_BACK;
+    npd.face_winding = SG_FACEWINDING_CCW;
+    npd.color_count = 2;
+    npd.colors[0].pixel_format = env.defaults.color_format;
+    npd.colors[1].pixel_format = SG_PIXELFORMAT_R16F;
+    npd.depth.pixel_format = env.defaults.depth_format;
+    npd.depth.compare = SG_COMPAREFUNC_LESS_EQUAL;
+    npd.depth.write_enabled = true;
+    npd.sample_count = 1;
+    npd.primitive_type = SG_PRIMITIVETYPE_TRIANGLES;
+    g_normalPipeline = sg_make_pipeline(&npd);
+
+    printf("[Renderer] Normal post pipeline state: %s\n",
+           RendererResourceStateName(sg_query_pipeline_state(g_normalPipeline)));
+}
+
+static void Renderer_DestroyPencilPostProcess(void) {
+    Renderer_DestroyScenePostTargets();
+
+    if (g_pencilPipeline.id) {
+        sg_destroy_pipeline(g_pencilPipeline);
+    }
+    if (g_pencilShader.id) {
+        sg_destroy_shader(g_pencilShader);
+    }
+    if (g_pencilVertexBuffer.id) {
+        sg_destroy_buffer(g_pencilVertexBuffer);
+    }
+    if (g_normalPipeline.id) {
+        sg_destroy_pipeline(g_normalPipeline);
+    }
+    if (g_normalShader.id) {
+        sg_destroy_shader(g_normalShader);
+    }
+    if (g_postSceneSampler.id) {
+        sg_destroy_sampler(g_postSceneSampler);
+    }
+    if (g_postNormalSampler.id) {
+        sg_destroy_sampler(g_postNormalSampler);
+    }
+
+    g_pencilPipeline = {};
+    g_pencilShader = {};
+    g_pencilVertexBuffer = {};
+    g_normalPipeline = {};
+    g_normalShader = {};
+    g_postSceneSampler = {};
+    g_postNormalSampler = {};
+}
+
 // ---------------------------------------------------------------------------
 //  Renderer init / shutdown
 // ---------------------------------------------------------------------------
@@ -407,8 +1080,8 @@ void Renderer_Init(void) {
     lsmp.mag_filter = SG_FILTER_LINEAR;
     lsmp.mipmap_filter = SG_FILTER_LINEAR;
     lsmp.max_anisotropy = 16;
-    lsmp.wrap_u     = SG_WRAP_CLAMP_TO_EDGE;
-    lsmp.wrap_v     = SG_WRAP_CLAMP_TO_EDGE;
+    lsmp.wrap_u     = SG_WRAP_REPEAT;
+    lsmp.wrap_v     = SG_WRAP_REPEAT;
     lsmp.label      = "lightmap-sampler";
     g_lmSampler = sg_make_sampler(&lsmp);
 
@@ -456,9 +1129,12 @@ void Renderer_Init(void) {
     g_pipeline = sg_make_pipeline(&pd);
     printf("[Renderer] Pipeline state: %s\n",
            RendererResourceStateName(sg_query_pipeline_state(g_pipeline)));
+
+    Renderer_InitPencilPostProcess(backend);
 }
 
 void Renderer_Shutdown(void) {
+    Renderer_DestroyPencilPostProcess();
     if (g_pipeline.id)  sg_destroy_pipeline(g_pipeline);
     if (g_shader.id)    sg_destroy_shader(g_shader);
     if (g_sampler.id)   sg_destroy_sampler(g_sampler);
@@ -470,6 +1146,109 @@ void Renderer_Shutdown(void) {
 }
 
 sg_sampler Renderer_DefaultSampler(void) { return g_sampler; }
+
+bool Renderer_PencilPostProcessReady(void) {
+    return (sg_query_pipeline_state(g_pencilPipeline) == SG_RESOURCESTATE_VALID) &&
+           (sg_query_pipeline_state(g_normalPipeline) == SG_RESOURCESTATE_VALID) &&
+           (sg_query_buffer_state(g_pencilVertexBuffer) == SG_RESOURCESTATE_VALID) &&
+           (sg_query_sampler_state(g_postSceneSampler) == SG_RESOURCESTATE_VALID) &&
+           (sg_query_sampler_state(g_postNormalSampler) == SG_RESOURCESTATE_VALID);
+}
+
+bool Renderer_BeginScenePostPass(const sg_pass_action& action,
+                                 int width,
+                                 int height,
+                                 int sampleCount)
+{
+    if (!Renderer_PencilPostProcessReady()) {
+        return false;
+    }
+    if (!Renderer_EnsureScenePostTargets(width, height, sampleCount)) {
+        return false;
+    }
+
+    sg_pass pass = {};
+    pass.action = action;
+    pass.attachments.colors[0] = g_sceneColorAttView;
+    if (g_sceneResolveAttView.id) {
+        pass.attachments.resolves[0] = g_sceneResolveAttView;
+    }
+    pass.attachments.depth_stencil = g_sceneDepthAttView;
+    pass.label = "scene-post-pass";
+    sg_begin_pass(&pass);
+    return true;
+}
+
+void Renderer_EndScenePostPass(void) {
+    sg_end_pass();
+}
+
+bool Renderer_BeginNormalPostPass(int width, int height) {
+    if (!Renderer_PencilPostProcessReady() ||
+        width != g_sceneWidth ||
+        height != g_sceneHeight ||
+        sg_query_view_state(g_normalColorAttView) != SG_RESOURCESTATE_VALID ||
+        sg_query_view_state(g_normalDepthColorAttView) != SG_RESOURCESTATE_VALID ||
+        sg_query_view_state(g_normalDepthAttView) != SG_RESOURCESTATE_VALID ||
+        sg_query_view_state(g_normalTextureView) != SG_RESOURCESTATE_VALID ||
+        sg_query_view_state(g_normalDepthTextureView) != SG_RESOURCESTATE_VALID) {
+        return false;
+    }
+
+    sg_pass_action action = {};
+    action.colors[0].load_action = SG_LOADACTION_CLEAR;
+    action.colors[0].clear_value = { 0.5f, 0.5f, 1.0f, 0.0f };
+    action.colors[1].load_action = SG_LOADACTION_CLEAR;
+    action.colors[1].clear_value = { 0.0f, 0.0f, 0.0f, 0.0f };
+    action.depth.load_action = SG_LOADACTION_CLEAR;
+    action.depth.clear_value = 1.0f;
+
+    sg_pass pass = {};
+    pass.action = action;
+    pass.attachments.colors[0] = g_normalColorAttView;
+    pass.attachments.colors[1] = g_normalDepthColorAttView;
+    pass.attachments.depth_stencil = g_normalDepthAttView;
+    pass.label = "normal-post-pass";
+    sg_begin_pass(&pass);
+    return true;
+}
+
+void Renderer_EndNormalPostPass(void) {
+    sg_end_pass();
+}
+
+void Renderer_DrawPencilPostProcess(float timeSeconds) {
+    if (!Renderer_PencilPostProcessReady() ||
+        sg_query_view_state(g_sceneTextureView) != SG_RESOURCESTATE_VALID ||
+        sg_query_view_state(g_normalTextureView) != SG_RESOURCESTATE_VALID ||
+        sg_query_view_state(g_normalDepthTextureView) != SG_RESOURCESTATE_VALID) {
+        return;
+    }
+
+    warped_pencil_shader_fs_params_t fs = {};
+    fs.u_resolution_time[0] = (float)g_sceneWidth;
+    fs.u_resolution_time[1] = (float)g_sceneHeight;
+    fs.u_resolution_time[2] = timeSeconds;
+    fs.u_resolution_time[3] = 0.0f;
+    fs.u_effect_params[0] = 2.85f;
+    fs.u_effect_params[1] = 0.70f;
+    fs.u_effect_params[2] = 3.35f;
+    fs.u_effect_params[3] = 0.58f;
+
+    sg_bindings bnd = {};
+    bnd.vertex_buffers[0] = g_pencilVertexBuffer;
+    bnd.views[VIEW_warped_pencil_shader_u_scene] = g_sceneTextureView;
+    bnd.views[VIEW_warped_pencil_shader_u_normals] = g_normalTextureView;
+    bnd.views[VIEW_warped_pencil_shader_u_depth] = g_normalDepthTextureView;
+    bnd.samplers[SMP_warped_pencil_shader_u_scene_smp] = g_postSceneSampler;
+    bnd.samplers[SMP_warped_pencil_shader_u_normal_smp] = g_postNormalSampler;
+    bnd.samplers[SMP_warped_pencil_shader_u_depth_smp] = g_postNormalSampler;
+
+    sg_apply_pipeline(g_pencilPipeline);
+    sg_apply_bindings(&bnd);
+    sg_apply_uniforms(UB_warped_pencil_shader_fs_params, { &fs, sizeof(fs) });
+    sg_draw(0, 6, 1);
+}
 
 // ---------------------------------------------------------------------------
 //  Bucket upload (shared by .map and .bsp paths)
@@ -608,6 +1387,40 @@ void Renderer_DrawMap(const MapModel& mdl,
 
         sg_apply_bindings(&bnd);
         sg_apply_uniforms(UB_warped_map_shader_vs_params, { &vs, sizeof(vs) });
+        sg_draw(0, sm.index_count, 1);
+    }
+}
+
+void Renderer_DrawMapNormals(const MapModel& mdl,
+                             const Matrix&   mvp,
+                             const Matrix&   normalModel,
+                             const Frustum&  frustum)
+{
+    if (!g_normalPipeline.id) {
+        return;
+    }
+
+    warped_normal_shader_vs_params_t vs = {};
+    float16 m = MatrixToFloat16(mvp);
+    float16 n = MatrixToFloat16(normalModel);
+    for (int i = 0; i < 16; ++i) {
+        vs.u_mvp[i] = m.v[i];
+        vs.u_normal_model[i] = n.v[i];
+    }
+
+    sg_apply_pipeline(g_normalPipeline);
+
+    for (auto& sm : mdl.meshes) {
+        if (!FrustumAABB(&frustum, sm.bounds)) {
+            continue;
+        }
+
+        sg_bindings bnd = {};
+        bnd.vertex_buffers[0] = sm.vbuf;
+        bnd.index_buffer = sm.ibuf;
+
+        sg_apply_bindings(&bnd);
+        sg_apply_uniforms(UB_warped_normal_shader_vs_params, { &vs, sizeof(vs) });
         sg_draw(0, sm.index_count, 1);
     }
 }

@@ -6,7 +6,7 @@
 // geometry with baked lightmap UVs, convex-hull collision data, the
 // entity text block, and the lightmap atlas pixels.
 
-#include "../utils/map_parser.h"
+#include "map_parser.h"
 #include "../utils/bsp_format.h"
 #include "../utils/asset_pack.h"
 #include "../physx/collision_data.h"

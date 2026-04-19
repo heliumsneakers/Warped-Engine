@@ -2,7 +2,7 @@
 
 #include <vector>
 #include "../math/wmath.h"
-#include "../utils/map_parser.h"
+#include "../utils/map_types.h"
 
 enum class CollisionType {
     STATIC,

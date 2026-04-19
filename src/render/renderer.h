@@ -3,11 +3,11 @@
 
 #include "sokol_gfx.h"
 #include "../math/wmath.h"
+#include "../utils/map_types.h"
 #include <vector>
 #include <string>
 #include <unordered_map>
 
-struct Map;          // forward (from map_parser.h)
 struct BSPData;      // forward (from bsp_loader.h)
 
 // ---------------------------------------------------------------------------
@@ -60,6 +60,20 @@ void      Renderer_DrawMap(const MapModel& mdl,
                            const Matrix&   mvp,
                            const Matrix&   model,
                            const Frustum&  frustum);
+void      Renderer_DrawMapNormals(const MapModel& mdl,
+                                  const Matrix&   mvp,
+                                  const Matrix&   normalModel,
+                                  const Frustum&  frustum);
 void      Renderer_DestroyMap(MapModel& mdl);
 
 sg_sampler Renderer_DefaultSampler(void);
+
+bool      Renderer_BeginScenePostPass(const sg_pass_action& action,
+                                      int width,
+                                      int height,
+                                      int sampleCount);
+void      Renderer_EndScenePostPass(void);
+bool      Renderer_BeginNormalPostPass(int width, int height);
+void      Renderer_EndNormalPostPass(void);
+void      Renderer_DrawPencilPostProcess(float timeSeconds);
+bool      Renderer_PencilPostProcessReady(void);

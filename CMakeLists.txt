@@ -86,6 +86,19 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 option(BUILD_MAP_COMPILER "Build only the compile_map CLI tool" OFF)
 option(WARPED_LIGHTMAP_USE_EMBREE "Use Intel Embree for accelerated lightmap tracing and GPU BVH building in compile_map" ON)
 
+set(WARPED_MAP_PARSER_SOURCES
+    src/compiler/map_parser.cpp
+    src/compiler/map_tokenizer.cpp
+    src/compiler/map_entities.cpp
+    src/compiler/map_brushes.cpp
+    src/compiler/map_entity_props.cpp
+    src/compiler/map_geometry.cpp
+    src/compiler/map_csg.cpp
+    src/compiler/map_polygons.cpp
+    src/compiler/map_lights.cpp
+    src/compiler/map_render.cpp
+)
+
 if(BUILD_MAP_COMPILER)
     if(WARPED_LIGHTMAP_USE_EMBREE)
         if(EXISTS "${PROJECT_SOURCE_DIR}/lib/embree/CMakeLists.txt")
@@ -127,8 +140,8 @@ if(BUILD_MAP_COMPILER)
         src/compiler/structural_bsp.cpp
         src/compiler/lightmap_compute.cpp
         src/compiler/sokol_compute_impl.c
+        ${WARPED_MAP_PARSER_SOURCES}
         src/utils/asset_pack.cpp
-        src/utils/map_parser.cpp
         src/utils/parameters.cpp
         src/physx/collision_data.cpp
     )
@@ -206,6 +219,7 @@ endif()
 
 add_executable(WarpedGame
     ${WARPED_CXX_SOURCES}
+    ${WARPED_MAP_PARSER_SOURCES}
     ${SOKOL_IMPL_SRC}
 )
 

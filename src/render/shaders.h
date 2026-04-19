@@ -31,5 +31,5 @@ static const char* WARPED_FS_SRC =
     "void main() {\n"
     "    vec4 c  = texture(u_tex, v_uv);\n"
     "    vec3 lm = texture(u_lm,  v_lmuv).rgb;\n"
-    "    frag_color = vec4(c.rgb * lm * 2.0, c.a);\n"   // ×2 so 0.5 grey = fullbright
+    "    frag_color = vec4(c.rgb * lm * 2.0, c.a);\n"
     "}\n";

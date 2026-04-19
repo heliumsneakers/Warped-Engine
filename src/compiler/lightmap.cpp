@@ -26,6 +26,7 @@ static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face lux
 static constexpr float SHADOW_BIAS        = 0.03125f;
 static constexpr float RAY_TRACE_TMIN     = 1e-4f;
 static constexpr float SOLID_REPAIR_EPSILON = 0.05f;
+static constexpr float SOLID_SHADOW_CONTACT_EPSILON = 0.01f;
 static constexpr float SAMPLE_REPAIR_JITTER = 0.5f;
 static constexpr float DARK_LUXEL_THRESHOLD = 8.0f / 255.0f;
 static constexpr float OCCLUSION_NEAR_TMIN = RAY_TRACE_TMIN;
@@ -1051,10 +1052,16 @@ static float ClosestBrushSolidHitDistance(const std::vector<BrushSolid>& solids,
                                           const Vector3& rayOrigin,
                                           const Vector3& rayDirection,
                                           float minHitT,
-                                          float maxHitT)
+                                          float maxHitT,
+                                          const Vector3* selfContactPoint = nullptr)
 {
     float closest = maxHitT;
     for (const BrushSolid& solid : solids) {
+        // Raw brush solids plug cracks, but solids touching the receiver's
+        // own surface are part of the same CSG contact and must not self-shadow.
+        if (selfContactPoint && PointInsideBrushSolid(solid, *selfContactPoint, SOLID_SHADOW_CONTACT_EPSILON)) {
+            continue;
+        }
         closest = std::min(closest, RayBrushSolidHitDistance(solid, rayOrigin, rayDirection, minHitT, closest));
     }
     return closest;
@@ -3692,6 +3699,7 @@ static float ComputeDirtAttenuation(float occlusionRatio, float dirtScale, float
 
 static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
                                        const std::vector<BrushSolid>& shadowSolids,
+                                       const Vector3& selfContactPoint,
                                        const Vector3& samplePoint,
                                        const Vector3& sampleNormal,
                                        const LightBakeSettings& settings)
@@ -3718,7 +3726,7 @@ static float ComputeDirtOcclusionRatio(const OccluderSet& occ,
                 -1
             });
         const float solidHitDistance = ClosestBrushSolidHitDistance(
-            shadowSolids, samplePoint, dir, OCCLUSION_NEAR_TMIN, depth);
+            shadowSolids, samplePoint, dir, OCCLUSION_NEAR_TMIN, depth, &selfContactPoint);
         const float hitDistance = std::min(triHitDistance, solidHitDistance);
         accumulatedDistance += std::min(depth, hitDistance);
     }
@@ -4048,7 +4056,8 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
                 -1,
                 (int)sourcePolyIndex
             };
-            const float solidHitDistance = ClosestBrushSolidHitDistance(shadowSolids, ro, dir, nearHitT, skyTraceDistance);
+            const float solidHitDistance = ClosestBrushSolidHitDistance(
+                shadowSolids, ro, dir, nearHitT, skyTraceDistance, &visibilityPlanePoint);
             const LightmapTraceHit hit = LightmapTraceClosestHit(occ, ro, dir, skyQuery);
             const bool visible = (settings.sunlightNoSky != 0)
                 ? (hit.kind == LIGHTMAP_TRACE_HIT_NONE && solidHitDistance >= skyTraceDistance)
@@ -4068,7 +4077,8 @@ static Vector3 ComputeSkyDomeContribution(const OccluderSet& occ,
                 -1,
                 (int)sourcePolyIndex
             };
-            const float solidHitDistance = ClosestBrushSolidHitDistance(shadowSolids, ro, dir, nearHitT, skyTraceDistance);
+            const float solidHitDistance = ClosestBrushSolidHitDistance(
+                shadowSolids, ro, dir, nearHitT, skyTraceDistance, &visibilityPlanePoint);
             const LightmapTraceHit hit = LightmapTraceClosestHit(occ, ro, dir, skyQuery);
             const bool visible = (settings.sunlightNoSky != 0)
                 ? (hit.kind == LIGHTMAP_TRACE_HIT_NONE && solidHitDistance >= skyTraceDistance)
@@ -4143,7 +4153,7 @@ static Vector3 ComputeDirectLightContribution(const PointLight& light,
         (int)ownerSourcePolyIndex
     };
     const float solidHitDistance = ClosestBrushSolidHitDistance(
-        shadowSolids, ro, dir, shadowQuery.minHitT, shadowQuery.maxHitT);
+        shadowSolids, ro, dir, shadowQuery.minHitT, shadowQuery.maxHitT, &visibilityPlanePoint);
     if (light.requiresSkyVisibility != 0) {
         const LightmapTraceHit hit = LightmapTraceClosestHit(occ, ro, dir, shadowQuery);
         if (hit.kind != LIGHTMAP_TRACE_HIT_SKY || solidHitDistance < hit.distance - 0.05f) {
@@ -4227,7 +4237,7 @@ static Vector3 ComputeSurfaceEmitterContribution(const SurfaceLightEmitter& emit
         (int)ownerSourcePolyIndex
     };
     const float solidHitDistance = ClosestBrushSolidHitDistance(
-        shadowSolids, ro, dirToLight, shadowQuery.minHitT, shadowQuery.maxHitT);
+        shadowSolids, ro, dirToLight, shadowQuery.minHitT, shadowQuery.maxHitT, &visibilityPlanePoint);
     if (emitter.baseLight.requiresSkyVisibility != 0) {
         const LightmapTraceHit hit = LightmapTraceClosestHit(occ, ro, dirToLight, shadowQuery);
         if (hit.kind != LIGHTMAP_TRACE_HIT_SKY || solidHitDistance < hit.distance - 0.05f) {
@@ -4417,7 +4427,7 @@ static void ShadeRectOversampled(const FaceRect& rect,
                     float cg = settings.ambientColor.y;
                     float cb = settings.ambientColor.z;
                     const float dirtOcclusion = usesDirt
-                        ? ComputeDirtOcclusionRatio(occ, repairSolids, samplePoint, sampleNormal, settings)
+                        ? ComputeDirtOcclusionRatio(occ, repairSolids, ownerPlanePoint, samplePoint, sampleNormal, settings)
                         : 0.0f;
                     for (uint32_t lightIndex : rectLightIndices) {
                         if (lightIndex >= lights.size()) {
