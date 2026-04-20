@@ -9,9 +9,12 @@ https://heliumsneakers.itch.io/mini-quake-demo
 
 The original project was compiled with emscripten for web, but I've reverted to local builds to accommodate the physics library, the web build version of this project is split into a separate project folder locally. I plan on uploading it in the future.
 
- The engine is structured around **2 libraries, and 1 external map editor**.
-- **Sokol**: Graphics library used for rendering, I plan to add full compatibility with Metal, DX11, and Vulkan.
+ The engine is structured around **5 libraries, and 1 external map editor**.
+- **Sokol**: Graphics library used for rendering, the engine supports Metal, DX11, and GL 3.3.
+- **Clay**: CSS style immediate mode UI library.
 - **Jolt Physics**: The physics library used in the project.
+- **Embree**: Used for accelerating the CPU and Compute shader lightmap bake using SIMD and BVH trees.
+- **RRes**: Binary format used for packing assets for individual maps. 
 - **Trench Broom**: Quake map editor for creating convex geometry (maps) and entities. The format used in this project is Valve 220.
 
 ## Engine Structure
