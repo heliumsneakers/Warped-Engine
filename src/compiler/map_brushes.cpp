@@ -51,7 +51,7 @@ bool ParseTextureAxis(MapTokenizer& tokenizer, Vector3& axis, float& offset) {
         !ParseFloatToken(tokenizer, offset)) {
         return false;
     }
-    axis = ConvertTBtoRaylib(axis);
+    axis = ConvertTBTextureAxisToWorld(axis);
     return ExpectToken(tokenizer, "]");
 }
 
@@ -77,13 +77,13 @@ bool ParseFace(MapTokenizer& tokenizer, Face& out) {
         return false;
     }
 
-    out.normal = CalculateNormal(out.vertices[0], out.vertices[1], out.vertices[2]);
+    out.normal = Vector3Scale(CalculateNormal(out.vertices[0], out.vertices[1], out.vertices[2]), -1.0f);
     if (Vector3LengthSq(out.normal) <= 1.0e-8f) {
         SetTokenizerError(tokenizer, "degenerate face plane");
         return false;
     }
     out.plane.normal = out.normal;
-    out.plane.d = Vector3DotProduct(out.normal, out.vertices[0]);
+    out.plane.d = -Vector3DotProduct(out.normal, out.vertices[0]);
     return true;
 }
 

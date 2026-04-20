@@ -92,22 +92,19 @@ void AppendBrushEntityPolygons(const Entity& entity,
 
             Vector3 nTB = brush.faces[i].normal;
             SortPolygonVertices(polys[i], nTB);
-            for (auto& p : polys[i]) p = ConvertTBtoRaylib(p);
-            const Vector3 expectedNormalRL = ConvertTBtoRaylib(nTB);
-            SortPolygonVertices(polys[i], expectedNormalRL);
-            RemoveDuplicatePoints(polys[i], 0.1f);
-            CleanupClippedPolygon(polys[i], expectedNormalRL);
+            RemoveDuplicatePoints(polys[i], CSG_POINT_EPS);
+            CleanupClippedPolygon(polys[i], nTB);
             if (polys[i].size() < 3) continue;
 
-            Vector3 nRL = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
-            if (Vector3DotProduct(nRL, expectedNormalRL) < 0.f) {
+            Vector3 n = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
+            if (Vector3DotProduct(n, nTB) < 0.f) {
                 std::reverse(polys[i].begin(), polys[i].end());
-                nRL = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
+                n = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
             }
 
             MapPolygon mp;
             mp.verts      = std::move(polys[i]);
-            mp.normal     = nRL;
+            mp.normal     = n;
             mp.facePlaneD = (float)planes[i].d;
             mp.texture    = isLightBrush ? lightBrushTexture : brush.faces[i].texture;
             mp.occluderGroup = lightBrushGroup;
@@ -138,10 +135,13 @@ void AppendBrushEntityPolygons(const Entity& entity,
 
     if (exteriorOnly) {
         std::vector<MapPolygon> exteriorPolys = BuildExteriorPolygons(entityPolys);
+        HealTJunctions(exteriorPolys, CSG_POINT_EPS);
+        ConvertMapPolygonsTBToWorld(exteriorPolys);
         out.insert(out.end(),
                    std::make_move_iterator(exteriorPolys.begin()),
                    std::make_move_iterator(exteriorPolys.end()));
     } else {
+        ConvertMapPolygonsTBToWorld(entityPolys);
         out.insert(out.end(),
                    std::make_move_iterator(entityPolys.begin()),
                    std::make_move_iterator(entityPolys.end()));

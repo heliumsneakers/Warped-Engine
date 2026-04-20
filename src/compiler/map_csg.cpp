@@ -41,9 +41,8 @@ std::vector<CsgBrush> BuildCsgBrushes(const std::vector<MapPolygon>& polys) {
         }
         // Use an exact plane point derived from the original face-defining data
         // rather than poly.verts[0], which carries floating-point error from the
-        // 3-plane intersection.  In RL world space n_RL·v_RL == -facePlaneD for
-        // all vertices on this face, so the exact point on the plane is:
-        //   exactPoint = n_RL * (-facePlaneD)
+        // 3-plane intersection.  With plane.d = -n·v, -facePlaneD gives n·v,
+        // so n * (-facePlaneD) is the nearest point to the origin on the plane.
         const Vector3 exactNormal = Vector3Normalize(poly.normal);
         const Vector3 exactPoint  = Vector3Scale(exactNormal, -poly.facePlaneD);
         brush.planes.push_back({ exactPoint, exactNormal });

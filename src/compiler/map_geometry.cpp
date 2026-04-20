@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <numeric>
+#include <utility>
 #include <vector>
 
 // Calculate normal vector from 3 points
@@ -115,6 +118,106 @@ void CleanupClippedPolygon(std::vector<Vector3>& poly, const Vector3& expectedNo
     poly.swap(cleaned);
 }
 
+namespace {
+
+bool PointsNearlyEqual(const Vector3& a, const Vector3& b, float epsSq) {
+    return Vector3LengthSq(Vector3Subtract(a, b)) <= epsSq;
+}
+
+bool TriangleIsUsable(const std::vector<Vector3>& poly,
+                      uint32_t ia,
+                      uint32_t ib,
+                      uint32_t ic,
+                      const Vector3& normal,
+                      float epsSq) {
+    const Vector3 ab = Vector3Subtract(poly[ib], poly[ia]);
+    const Vector3 bc = Vector3Subtract(poly[ic], poly[ib]);
+    const Vector3 cross = Vector3CrossProduct(ab, bc);
+    if (Vector3LengthSq(cross) <= epsSq) {
+        return false;
+    }
+    return Vector3DotProduct(cross, normal) > 0.0f;
+}
+
+} // namespace
+
+void HealTJunctions(std::vector<MapPolygon>& polys, float eps) {
+    if (polys.size() < 2) {
+        return;
+    }
+
+    const float epsSq = eps * eps;
+    std::vector<std::vector<Vector3>> sourceVerts;
+    sourceVerts.reserve(polys.size());
+    for (const MapPolygon& poly : polys) {
+        sourceVerts.push_back(poly.verts);
+    }
+
+    for (size_t polyIndex = 0; polyIndex < polys.size(); ++polyIndex) {
+        MapPolygon& poly = polys[polyIndex];
+        if (poly.verts.size() < 2) {
+            continue;
+        }
+
+        std::vector<Vector3> healed;
+        healed.reserve(poly.verts.size());
+
+        for (size_t i = 0; i < poly.verts.size(); ++i) {
+            const Vector3& v0 = poly.verts[i];
+            const Vector3& v1 = poly.verts[(i + 1) % poly.verts.size()];
+            const Vector3 edge = Vector3Subtract(v1, v0);
+            const float edgeLenSq = Vector3LengthSq(edge);
+
+            healed.push_back(v0);
+            if (edgeLenSq <= epsSq) {
+                continue;
+            }
+
+            std::vector<std::pair<float, Vector3>> onEdge;
+            for (size_t otherIndex = 0; otherIndex < polys.size(); ++otherIndex) {
+                if (otherIndex == polyIndex) {
+                    continue;
+                }
+                for (const Vector3& p : sourceVerts[otherIndex]) {
+                    if (PointsNearlyEqual(p, v0, epsSq) || PointsNearlyEqual(p, v1, epsSq)) {
+                        continue;
+                    }
+
+                    const float t = Vector3DotProduct(Vector3Subtract(p, v0), edge) / edgeLenSq;
+                    if (t <= 0.0f || t >= 1.0f) {
+                        continue;
+                    }
+
+                    const Vector3 projected = Vector3Add(v0, Vector3Scale(edge, t));
+                    if (Vector3LengthSq(Vector3Subtract(p, projected)) > epsSq) {
+                        continue;
+                    }
+
+                    bool duplicate = false;
+                    for (const auto& existing : onEdge) {
+                        if (fabsf(existing.first - t) <= eps ||
+                            PointsNearlyEqual(existing.second, p, epsSq)) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) {
+                        onEdge.push_back({ t, p });
+                    }
+                }
+            }
+
+            std::sort(onEdge.begin(), onEdge.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& inserted : onEdge) {
+                healed.push_back(inserted.second);
+            }
+        }
+
+        poly.verts.swap(healed);
+    }
+}
+
 float PolygonArea3D(const std::vector<Vector3>& poly) {
     if (poly.size() < 3) {
         return 0.0f;
@@ -128,6 +231,61 @@ float PolygonArea3D(const std::vector<Vector3>& poly) {
         area += 0.5f * Vector3Length(Vector3CrossProduct(a, b));
     }
     return area;
+}
+
+std::vector<uint32_t> TriangulatePolygonIndices(const std::vector<Vector3>& poly,
+                                                const Vector3& normal,
+                                                float eps) {
+    std::vector<uint32_t> indices;
+    if (poly.size() < 3) {
+        return indices;
+    }
+
+    const float epsSq = eps * eps;
+    std::vector<uint32_t> remaining(poly.size());
+    std::iota(remaining.begin(), remaining.end(), 0u);
+    indices.reserve((poly.size() - 2) * 3);
+
+    size_t guard = poly.size() * poly.size();
+    while (remaining.size() > 3 && guard-- > 0) {
+        bool clipped = false;
+        for (size_t i = 0; i < remaining.size(); ++i) {
+            const uint32_t prev = remaining[(i + remaining.size() - 1) % remaining.size()];
+            const uint32_t curr = remaining[i];
+            const uint32_t next = remaining[(i + 1) % remaining.size()];
+            if (!TriangleIsUsable(poly, prev, curr, next, normal, epsSq)) {
+                continue;
+            }
+
+            indices.push_back(prev);
+            indices.push_back(curr);
+            indices.push_back(next);
+            remaining.erase(remaining.begin() + (std::ptrdiff_t)i);
+            clipped = true;
+            break;
+        }
+
+        if (!clipped) {
+            indices.clear();
+            for (size_t t = 1; t + 1 < poly.size(); ++t) {
+                if (TriangleIsUsable(poly, 0u, (uint32_t)t, (uint32_t)t + 1u, normal, epsSq)) {
+                    indices.push_back(0u);
+                    indices.push_back((uint32_t)t);
+                    indices.push_back((uint32_t)t + 1u);
+                }
+            }
+            return indices;
+        }
+    }
+
+    if (remaining.size() == 3 &&
+        TriangleIsUsable(poly, remaining[0], remaining[1], remaining[2], normal, epsSq)) {
+        indices.push_back(remaining[0]);
+        indices.push_back(remaining[1]);
+        indices.push_back(remaining[2]);
+    }
+
+    return indices;
 }
 
 PolygonPlaneSplit SplitPolygonByPlane(const std::vector<Vector3>& poly,
@@ -191,10 +349,18 @@ bool GetIntersection(const Plane& p1, const Plane& p2, const Plane& p3, Vector3&
     return true;
 }
 
-// Convert coordinates for brush defined entities, this conversion ONLY works for brushes defined by the plane intersection logic.
-Vector3 ConvertTBtoRaylib(const Vector3& in) {
-    //  TB: (x,  y,  z) = (right, forward, up)
-    //  GL: (x,  y,  z) = (right, up, forward)
+// Convert TrenchBroom coordinates (X right, Y forward, Z up) to engine world
+// coordinates (X right, Y up, Z backward/forward axis negated).
+Vector3 ConvertTBtoWorld(const Vector3& in) {
+    Vector3 out = {
+         in.x,
+         in.z,
+        -in.y
+    };
+    return out;
+}
+
+Vector3 ConvertTBTextureAxisToWorld(const Vector3& in) {
     Vector3 out = {
         -in.x,
         -in.z,
@@ -203,14 +369,23 @@ Vector3 ConvertTBtoRaylib(const Vector3& in) {
     return out;
 }
 
+void ConvertMapPolygonTBToWorld(MapPolygon& poly) {
+    for (Vector3& vert : poly.verts) {
+        vert = ConvertTBtoWorld(vert);
+    }
+
+    poly.normal = Vector3Normalize(ConvertTBtoWorld(poly.normal));
+}
+
+void ConvertMapPolygonsTBToWorld(std::vector<MapPolygon>& polys) {
+    for (MapPolygon& poly : polys) {
+        ConvertMapPolygonTBToWorld(poly);
+    }
+}
+
 // Convert coordinates for point entities authored directly in TrenchBroom.
 Vector3 ConvertTBPointEntityToWorld(const Vector3& in) {
-    Vector3 out = {
-         in.x,
-         in.z,
-        -in.y
-    };
-    return out;
+    return ConvertTBtoWorld(in);
 }
 
 Vector3 PolygonCentroid(const std::vector<Vector3>& verts) {

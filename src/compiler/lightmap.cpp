@@ -59,6 +59,12 @@ static constexpr int   DIRT_NUM_ANGLE_STEPS = 16;
 static constexpr int   DIRT_NUM_ELEVATION_STEPS = 3;
 static constexpr int   DIRT_RAY_COUNT = DIRT_NUM_ANGLE_STEPS * DIRT_NUM_ELEVATION_STEPS;
 
+Vector3 CalculateNormal(const Vector3& v1, const Vector3& v2, const Vector3& v3);
+void RemoveDuplicatePoints(std::vector<Vector3>& points, float eps);
+std::vector<uint32_t> TriangulatePolygonIndices(const std::vector<Vector3>& poly,
+                                                const Vector3& normal,
+                                                float eps = 1e-3f);
+
 static bool ForceLightmapCPUFromEnv()
 {
     const char* value = std::getenv("WARPED_LIGHTMAP_FORCE_CPU");
@@ -1366,11 +1372,12 @@ static OccluderSet BuildOccluders(const std::vector<MapPolygon>& polys) {
             ++nonShadowCasterCount;
             continue;
         }
-        for (size_t t = 1; t + 1 < p.verts.size(); ++t) {
+        const std::vector<uint32_t> triIndices = TriangulatePolygonIndices(p.verts, p.normal);
+        for (size_t t = 0; t + 2 < triIndices.size(); t += 3) {
             LightmapTraceTri tr{};
-            tr.a = p.verts[0];
-            tr.b = p.verts[t];
-            tr.c = p.verts[t + 1];
+            tr.a = p.verts[triIndices[t]];
+            tr.b = p.verts[triIndices[t + 1]];
+            tr.c = p.verts[triIndices[t + 2]];
             tr.bounds = AABBInvalid();
             tr.occluderGroup = p.occluderGroup;
             tr.sourcePolyIndex = (int)i;

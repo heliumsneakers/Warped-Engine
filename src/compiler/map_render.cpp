@@ -39,11 +39,12 @@ std::vector<MapMeshBucket> BuildMapGeometry(const Map &map, TextureManager &text
         float tW=(float)tex->width, tH=(float)tex->height;
 
         MapMeshBucket& b = GetBucket(texName);
-        Vector3 v0 = p.verts[0];
-        Vector2 uv0 = ComputeFaceUV(v0,p.texAxisU,p.texAxisV,p.offU,p.offV,p.rot,p.scaleU,p.scaleV,tW,tH);
-
-        for (size_t t=1; t+1<p.verts.size(); ++t) {
-            Vector3 v1=p.verts[t], v2=p.verts[t+1];
+        const std::vector<uint32_t> triIndices = TriangulatePolygonIndices(p.verts, p.normal);
+        for (size_t t=0; t+2<triIndices.size(); t += 3) {
+            Vector3 v0 = p.verts[triIndices[t]];
+            Vector3 v1 = p.verts[triIndices[t + 1]];
+            Vector3 v2 = p.verts[triIndices[t + 2]];
+            Vector2 uv0 = ComputeFaceUV(v0,p.texAxisU,p.texAxisV,p.offU,p.offV,p.rot,p.scaleU,p.scaleV,tW,tH);
             Vector2 uv1 = ComputeFaceUV(v1,p.texAxisU,p.texAxisV,p.offU,p.offV,p.rot,p.scaleU,p.scaleV,tW,tH);
             Vector2 uv2 = ComputeFaceUV(v2,p.texAxisU,p.texAxisV,p.offU,p.offV,p.rot,p.scaleU,p.scaleV,tW,tH);
             uint32_t base=(uint32_t)b.vertices.size();

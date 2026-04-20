@@ -1,6 +1,6 @@
 #include "../math/wmath.h"
 #include "collision_data.h"
-#include "../compiler/map_parser.h"
+#include "../compiler/map_geometry.h"
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -45,7 +45,7 @@ static CollisionType GetEntityCollisionType(const Entity &ent) {
 static std::vector<Vector3> BuildBrushGeometry(const Brush &brush) {
     std::vector<Vector3> finalPoints; 
 
-    // 1) Gather all planes in "TB" coords
+    // 1) Gather all planes in TB coords
     int numFaces = (int)brush.faces.size();
     if (numFaces < 3) {
         // If not enough planes, return empty
@@ -55,10 +55,7 @@ static std::vector<Vector3> BuildBrushGeometry(const Brush &brush) {
     std::vector<Plane> planes;
     planes.reserve(numFaces);
     for (auto &face : brush.faces) {
-        Plane p;
-        p.normal = face.normal;  //from .map parser (TrenchBroom coords)
-        p.d      = Vector3DotProduct(face.normal, face.vertices[0]);
-        planes.push_back(p);
+        planes.push_back(face.plane);
     }
 
     // 2) Build polygons per face by intersecting planes:
@@ -91,7 +88,7 @@ static std::vector<Vector3> BuildBrushGeometry(const Brush &brush) {
         }
     }
 
-    // 3) For each face, remove duplicates, optionally sort polygon, convert coords
+    // 3) For each face, remove duplicates and sort in TB coords
     for (int i = 0; i < numFaces; ++i) {
         // remove duplicates
         RemoveDuplicatePoints(polys[i], (float)epsilon);
@@ -107,19 +104,11 @@ static std::vector<Vector3> BuildBrushGeometry(const Brush &brush) {
         // Sort face's polygon by angle around centroid (like in MapToMesh)
         SortPolygonVertices(polys[i], faceNormalTB);
 
-        // Convert each point from TB -> Raylib coords
-        for (auto &pt : polys[i]) {
-            pt = ConvertTBtoRaylib(pt);
-        }
-
-        // Now check if the polygon normal lines up with the original face normal
-        // in Raylib coords. If it's flipped, reverse the polygon.
+        // Check if the polygon normal lines up with the original face normal.
         Vector3 polyNormal = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
-        Vector3 faceNormalRL = ConvertTBtoRaylib(faceNormalTB);
 
-        if (Vector3DotProduct(polyNormal, faceNormalRL) < 0.f) {
+        if (Vector3DotProduct(polyNormal, faceNormalTB) < 0.f) {
             std::reverse(polys[i].begin(), polys[i].end());
-            // recalc normal
             polyNormal = CalculateNormal(polys[i][0], polys[i][1], polys[i][2]);
         }
 
@@ -131,7 +120,12 @@ static std::vector<Vector3> BuildBrushGeometry(const Brush &brush) {
         }
     }
 
-    // 5) Remove duplicates *again* in finalPoints to avoid overlap across faces
+    // 5) Remove duplicates *again* in finalPoints to avoid overlap across faces,
+    // then convert the solved TB point cloud once into engine world coords.
+    RemoveDuplicatePoints(finalPoints, (float)epsilon);
+    for (Vector3& point : finalPoints) {
+        point = ConvertTBtoWorld(point);
+    }
     RemoveDuplicatePoints(finalPoints, (float)epsilon);
 
     // Return the final point set

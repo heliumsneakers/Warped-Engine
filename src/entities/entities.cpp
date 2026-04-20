@@ -1,5 +1,6 @@
 #include "entities.h"
 
+#include "../compiler/map_geometry.h"
 #include "../compiler/map_parser.h"
 #include "../physx/physics.h"
 

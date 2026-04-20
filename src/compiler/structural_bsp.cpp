@@ -69,7 +69,7 @@ static BuildBounds ComputeFaceBounds(const std::vector<BuildFace>& faces, const 
 }
 
 static float PlaneDistance(const BSPPlane& plane, const Vector3& p) {
-    return plane.nx * p.x + plane.ny * p.y + plane.nz * p.z - plane.d;
+    return plane.nx * p.x + plane.ny * p.y + plane.nz * p.z + plane.d;
 }
 
 static FaceSide ClassifyFaceAgainstPlane(const BuildFace& face, const BSPPlane& plane) {
@@ -129,7 +129,7 @@ private:
             }
             BuildFace face;
             face.poly = poly;
-            face.planeIndex = FindOrAddPlane(poly.normal, Vector3DotProduct(poly.normal, poly.verts[0]));
+            face.planeIndex = FindOrAddPlane(poly.normal, -Vector3DotProduct(poly.normal, poly.verts[0]));
             facePool.push_back(std::move(face));
         }
     }

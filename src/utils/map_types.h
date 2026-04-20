@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
-inline constexpr double epsilon = 1e-2;
+inline constexpr double epsilon = 1e-4;
 
 struct Vertex {
     Vector3 position;

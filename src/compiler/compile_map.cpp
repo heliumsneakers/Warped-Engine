@@ -11,6 +11,7 @@
 #include "../utils/asset_pack.h"
 #include "../physx/collision_data.h"
 #include "lightmap.h"
+#include "map_geometry.h"
 #include "structural_bsp.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -341,10 +342,9 @@ int main(int argc, char** argv)
 
         uint32_t base = (uint32_t)b.v.size();
         for (size_t vi=0; vi<p.verts.size(); ++vi) b.v.push_back(MakeV(vi));
-        for (size_t t=1; t+1<p.verts.size(); ++t) {
-            b.i.push_back(base);
-            b.i.push_back(base+(uint32_t)t);
-            b.i.push_back(base+(uint32_t)t+1);
+        const std::vector<uint32_t> triIndices = TriangulatePolygonIndices(p.verts, p.normal);
+        for (uint32_t triIndex : triIndices) {
+            b.i.push_back(base + triIndex);
         }
     }
 

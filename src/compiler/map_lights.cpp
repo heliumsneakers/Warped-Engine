@@ -427,10 +427,10 @@ std::vector<PointLight> GetPointLights(const Map &map) {
 
                 Vector3 nTB = brush.faces[i].normal;
                 SortPolygonVertices(facePolys[i], nTB);
-                for (auto& p : facePolys[i]) p = ConvertTBtoRaylib(p);
+                for (auto& p : facePolys[i]) p = ConvertTBtoWorld(p);
 
                 Vector3 nRL = CalculateNormal(facePolys[i][0], facePolys[i][1], facePolys[i][2]);
-                if (Vector3DotProduct(nRL, ConvertTBtoRaylib(nTB)) < 0.f) {
+                if (Vector3DotProduct(nRL, ConvertTBtoWorld(nTB)) < 0.f) {
                     std::reverse(facePolys[i].begin(), facePolys[i].end());
                     nRL = CalculateNormal(facePolys[i][0], facePolys[i][1], facePolys[i][2]);
                 }
