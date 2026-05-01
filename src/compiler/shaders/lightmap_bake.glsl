@@ -96,10 +96,7 @@ layout(binding=0) uniform cs_face_params {
     float skylight_angle_scale;
     float sky_trace_distance;
     int sunlight_nosky;
-    // Super-sampling grid size for the bake (worldspawn `_extra_samples`
-    // key). Valid values: 1 (off), 2 (2x2), 4 (4x4). The CPU path uses the
-    // same derivation from settings.extraSamples via g_aaGrid.
-    int extra_samples;
+    int aa_grid;
     int oversampled_output;
     float surface_sample_offset;
     float _pad_scalar0;
@@ -266,6 +263,7 @@ layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
 
 const int AA_GRID = 4;
 const int SAMPLES = AA_GRID * AA_GRID;
+const int LM_PAD = 2;
 const float EDGE_SEAM_GUARD_LUXELS = 0.75;
 const float EDGE_SEAM_TMIN_SCALE = 3.0;
 const int POINT_LIGHT_ATTEN_QUADRATIC = 0;
@@ -302,24 +300,6 @@ void face_basis(vec3 n, out vec3 u, out vec3 v) {
     v = cross(n, u);
 }
 
-bool inside_poly_array(float px, float py, int count, vec4 verts[32]) {
-    for (int i = 0; i < count; ++i) {
-        int j = (i + 1) % count;
-        vec2 a = verts[i].xy;
-        vec2 b = verts[j].xy;
-        vec2 edge = b - a;
-        vec2 rel = vec2(px, py) - a;
-        if ((edge.x * rel.y - edge.y * rel.x) < -1e-3) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool inside_poly_2d(float px, float py) {
-    return inside_poly_array(px, py, poly_count, poly_verts);
-}
-
 float dist_sq_point_segment_2d(vec2 p, vec2 a, vec2 b) {
     vec2 ab = b - a;
     float ab_len_sq = dot(ab, ab);
@@ -331,6 +311,38 @@ float dist_sq_point_segment_2d(vec2 p, vec2 a, vec2 b) {
     vec2 q = a + ab * t;
     vec2 d = p - q;
     return dot(d, d);
+}
+
+bool inside_poly_array(float px, float py, int count, vec4 verts[32]) {
+    if (count < 3) {
+        return false;
+    }
+
+    vec2 p = vec2(px, py);
+    for (int i = 0; i < count; ++i) {
+        int j = (i + 1) % count;
+        if (dist_sq_point_segment_2d(p, verts[i].xy, verts[j].xy) <= 1e-8) {
+            return true;
+        }
+    }
+
+    bool inside = false;
+    for (int i = 0, j = count - 1; i < count; j = i, ++i) {
+        vec2 a = verts[i].xy;
+        vec2 b = verts[j].xy;
+        if ((a.y > py) == (b.y > py)) {
+            continue;
+        }
+        float x_intersect = (b.x - a.x) * (py - a.y) / (b.y - a.y) + a.x;
+        if (px < x_intersect) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+bool inside_poly_2d(float px, float py) {
+    return inside_poly_array(px, py, poly_count, poly_verts);
 }
 
 float min_dist_to_poly_edge_2d(float px, float py) {
@@ -1297,7 +1309,9 @@ vec3 compute_skydome_lighting(int owner_source_poly_index,
 }
 
 float compute_edge_aware_near_hit_t(float ju, float jv) {
-    return ray_eps;
+    float edge_dist = min_dist_to_poly_edge_2d(ju, jv);
+    float edge_factor = clamp(1.0 - edge_dist / max(1e-3, 0.75), 0.0, 1.0);
+    return ray_eps + edge_factor * 0.0625;
 }
 
 float compute_dirt_occlusion_ratio(vec3 self_contact_point, vec3 sample_point, vec3 sample_normal) {
@@ -1525,27 +1539,22 @@ void main() {
 
     vec3 accum = vec3(0.0);
     int used_samples = 0;
-    // Runtime grid size from the worldspawn `_extra_samples` key. 0 -> 1x1
-    // (off), 2 -> 2x2, 4 -> 4x4 (historical default). Any unexpected value
-    // falls back to 4 via the ternary below so older compiled maps still bake
-    // at full quality.
-    int aa_grid = (extra_samples <= 0) ? 1
-               : (extra_samples <= 2) ? 2 : 4;
-    float inv_grid = 1.0 / float(aa_grid);
+    int sample_grid = max(1, aa_grid);
+    float inv_grid = 1.0 / float(sample_grid);
     ivec2 atlas_xy = ivec2(rect_x + local_xy.x, rect_y + local_xy.y);
     uint out_index = uint(atlas_xy.y * atlas_width + atlas_xy.x);
     if (oversampled_output != 0) {
         vec3 sample_rgb;
-        float ju = (float(local_xy.x) + 0.5) * inv_grid;
-        float jv = (float(local_xy.y) + 0.5) * inv_grid;
+        float ju = -0.5 + (float(local_xy.x) + 0.5) * inv_grid;
+        float jv = -0.5 + (float(local_xy.y) + 0.5) * inv_grid;
         bool valid = shade_sample(ju, jv, sample_rgb);
         pixels[out_index].value = valid ? vec4(max(sample_rgb, vec3(0.0)), 1.0) : vec4(0.0);
         return;
     }
-    for (int sy = 0; sy < aa_grid; ++sy) {
-        for (int sx = 0; sx < aa_grid; ++sx) {
-            float ju = float(local_xy.x - 2) + (float(sx) + 0.5) * inv_grid;
-            float jv = float(local_xy.y - 2) + (float(sy) + 0.5) * inv_grid;
+    for (int sy = 0; sy < sample_grid; ++sy) {
+        for (int sx = 0; sx < sample_grid; ++sx) {
+            float ju = float(local_xy.x - LM_PAD) - 0.5 + (float(sx) + 0.5) * inv_grid;
+            float jv = float(local_xy.y - LM_PAD) - 0.5 + (float(sy) + 0.5) * inv_grid;
             vec3 sample_rgb;
             if (!shade_sample(ju, jv, sample_rgb)) {
                 continue;

@@ -6,7 +6,6 @@
 // textured-diffuse pipeline.
 
 #include "renderer.h"
-#include "shaders.h"
 #include "../utils/asset_pack.h"
 
 #if defined(WARPED_SOKOL_BACKEND_METAL) && !defined(SOKOL_METAL)
@@ -120,95 +119,17 @@ static void Renderer_LogTextureState(const char* label, const TextureEntry& entr
            entry.width, entry.height);
 }
 
-static sg_shader Renderer_MakeGeneratedMapShader(sg_backend backend) {
+static sg_shader Renderer_MakePlatformMapShader(sg_backend backend) {
     const sg_shader_desc* desc = warped_map_shader_map_shader_desc(backend);
     if (!desc) {
-        printf("[Renderer] No generated shader descriptor for backend %s.\n",
+        printf("[Renderer] No generated map shader descriptor for backend %s.\n",
                RendererBackendName(backend));
         return {};
     }
     return sg_make_shader(desc);
 }
 
-static sg_shader Renderer_MakeGLMapShader(void) {
-    sg_shader_desc sd = {};
-    sd.label = "map-shader";
-    sd.vertex_func.source   = WARPED_VS_SRC;
-    sd.fragment_func.source = WARPED_FS_SRC;
-
-    sd.attrs[ATTR_warped_map_shader_map_a_pos].glsl_name  = "a_pos";
-    sd.attrs[ATTR_warped_map_shader_map_a_nrm].glsl_name  = "a_nrm";
-    sd.attrs[ATTR_warped_map_shader_map_a_uv].glsl_name   = "a_uv";
-    sd.attrs[ATTR_warped_map_shader_map_a_lmuv].glsl_name = "a_lmuv";
-
-    sd.uniform_blocks[UB_warped_map_shader_vs_params].stage  = SG_SHADERSTAGE_VERTEX;
-    sd.uniform_blocks[UB_warped_map_shader_vs_params].size   = sizeof(warped_map_shader_vs_params_t);
-    sd.uniform_blocks[UB_warped_map_shader_vs_params].layout = SG_UNIFORMLAYOUT_NATIVE;
-    sd.uniform_blocks[UB_warped_map_shader_vs_params].glsl_uniforms[0].type      = SG_UNIFORMTYPE_MAT4;
-    sd.uniform_blocks[UB_warped_map_shader_vs_params].glsl_uniforms[0].glsl_name = "u_mvp";
-    sd.uniform_blocks[UB_warped_map_shader_vs_params].glsl_uniforms[1].type      = SG_UNIFORMTYPE_MAT4;
-    sd.uniform_blocks[UB_warped_map_shader_vs_params].glsl_uniforms[1].glsl_name = "u_model";
-
-    sd.views[VIEW_warped_map_shader_u_tex].texture.stage       = SG_SHADERSTAGE_FRAGMENT;
-    sd.views[VIEW_warped_map_shader_u_tex].texture.image_type  = SG_IMAGETYPE_2D;
-    sd.views[VIEW_warped_map_shader_u_tex].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
-    sd.views[VIEW_warped_map_shader_u_lm].texture.stage        = SG_SHADERSTAGE_FRAGMENT;
-    sd.views[VIEW_warped_map_shader_u_lm].texture.image_type   = SG_IMAGETYPE_2D;
-    sd.views[VIEW_warped_map_shader_u_lm].texture.sample_type  = SG_IMAGESAMPLETYPE_FLOAT;
-
-    sd.samplers[SMP_warped_map_shader_u_tex_smp].stage        = SG_SHADERSTAGE_FRAGMENT;
-    sd.samplers[SMP_warped_map_shader_u_tex_smp].sampler_type = SG_SAMPLERTYPE_FILTERING;
-    sd.samplers[SMP_warped_map_shader_u_lm_smp].stage         = SG_SHADERSTAGE_FRAGMENT;
-    sd.samplers[SMP_warped_map_shader_u_lm_smp].sampler_type  = SG_SAMPLERTYPE_FILTERING;
-
-    sd.texture_sampler_pairs[0].stage        = SG_SHADERSTAGE_FRAGMENT;
-    sd.texture_sampler_pairs[0].view_slot    = VIEW_warped_map_shader_u_tex;
-    sd.texture_sampler_pairs[0].sampler_slot = SMP_warped_map_shader_u_tex_smp;
-    sd.texture_sampler_pairs[0].glsl_name    = "u_tex";
-    sd.texture_sampler_pairs[1].stage        = SG_SHADERSTAGE_FRAGMENT;
-    sd.texture_sampler_pairs[1].view_slot    = VIEW_warped_map_shader_u_lm;
-    sd.texture_sampler_pairs[1].sampler_slot = SMP_warped_map_shader_u_lm_smp;
-    sd.texture_sampler_pairs[1].glsl_name    = "u_lm";
-
-    return sg_make_shader(&sd);
-}
-
-static sg_shader Renderer_MakePlatformMapShader(sg_backend backend) {
-#if defined(WARPED_SOKOL_BACKEND_METAL)
-    if (backend != SG_BACKEND_METAL_MACOS) {
-        printf("[Renderer] Backend mismatch: expected METAL_MACOS, got %s.\n",
-               RendererBackendName(backend));
-        return {};
-    }
-    printf("[Renderer] Using generated Metal shader for backend %s.\n",
-           RendererBackendName(backend));
-    return Renderer_MakeGeneratedMapShader(backend);
-#elif defined(WARPED_SOKOL_BACKEND_D3D11)
-    if (backend != SG_BACKEND_D3D11) {
-        printf("[Renderer] Backend mismatch: expected D3D11, got %s.\n",
-               RendererBackendName(backend));
-        return {};
-    }
-    printf("[Renderer] Using generated HLSL shader for backend %s.\n",
-           RendererBackendName(backend));
-    return Renderer_MakeGeneratedMapShader(backend);
-#elif defined(WARPED_SOKOL_BACKEND_GLCORE)
-    if (backend != SG_BACKEND_GLCORE) {
-        printf("[Renderer] Backend mismatch: expected GLCORE, got %s.\n",
-               RendererBackendName(backend));
-        return {};
-    }
-    printf("[Renderer] Using GLSL shader for backend %s.\n",
-           RendererBackendName(backend));
-    return Renderer_MakeGLMapShader();
-#else
-    (void)backend;
-    printf("[Renderer] No shader path configured for this platform build.\n");
-    return {};
-#endif
-}
-
-static sg_shader Renderer_MakeGeneratedPencilShader(sg_backend backend) {
+static sg_shader Renderer_MakePlatformPencilShader(sg_backend backend) {
     const sg_shader_desc* desc = warped_pencil_shader_pencil_post_shader_desc(backend);
     if (!desc) {
         printf("[Renderer] No generated pencil shader descriptor for backend %s.\n",
@@ -218,196 +139,7 @@ static sg_shader Renderer_MakeGeneratedPencilShader(sg_backend backend) {
     return sg_make_shader(desc);
 }
 
-static const char* WARPED_PENCIL_VS_SRC =
-    "#version 330\n"
-    "layout(location=0) in vec2 a_pos;\n"
-    "layout(location=1) in vec2 a_uv;\n"
-    "out vec2 v_uv;\n"
-    "void main() {\n"
-    "    v_uv = a_uv;\n"
-    "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
-    "}\n";
-
-static const char* WARPED_PENCIL_FS_SRC =
-    "#version 330\n"
-    "uniform fs_params {\n"
-    "    vec4 u_resolution_time;\n"
-    "    vec4 u_effect_params;\n"
-    "};\n"
-    "\n"
-    "uniform sampler2D u_scene;\n"
-    "uniform sampler2D u_normals;\n"
-    "uniform sampler2D u_depth;\n"
-    "\n"
-    "in vec2 v_uv;\n"
-    "out vec4 frag_color;\n"
-    "\n"
-    "float luminance(vec3 c) {\n"
-    "    return dot(c, vec3(0.299, 0.587, 0.114));\n"
-    "}\n"
-    "\n"
-    "vec4 normal_sample(vec2 uv) {\n"
-    "    vec4 n = texture(u_normals, uv);\n"
-    "    return vec4(n.xyz * 2.0 - 1.0, n.a);\n"
-    "}\n"
-    "\n"
-    "float depth_sample(vec2 uv) {\n"
-    "    return texture(u_depth, uv).r;\n"
-    "}\n"
-    "\n"
-    "float normal_delta(vec4 center, vec4 sample_n) {\n"
-    "    float center_occ = step(0.0001, center.a);\n"
-    "    float sample_occ = step(0.0001, sample_n.a);\n"
-    "    float silhouette = abs(center_occ - sample_occ);\n"
-    "    float crease = length(center.xyz - sample_n.xyz) * center_occ * sample_occ;\n"
-    "    return max(silhouette, crease);\n"
-    "}\n"
-    "\n"
-    "float geometry_edge(vec2 uv, vec2 texel, float radius, vec4 center_n, float center_d) {\n"
-    "    float center_occ = step(0.0001, center_n.a);\n"
-    "\n"
-    "    vec4 s0 = normal_sample(uv + texel * vec2( radius, 0.0));\n"
-    "    vec4 s1 = normal_sample(uv + texel * vec2(-radius, 0.0));\n"
-    "    vec4 s2 = normal_sample(uv + texel * vec2(0.0,  radius));\n"
-    "    vec4 s3 = normal_sample(uv + texel * vec2(0.0, -radius));\n"
-    "\n"
-    "    float nd0 = normal_delta(center_n, s0);\n"
-    "    float nd1 = normal_delta(center_n, s1);\n"
-    "    float nd2 = normal_delta(center_n, s2);\n"
-    "    float nd3 = normal_delta(center_n, s3);\n"
-    "\n"
-    "    float support = step(0.12, nd0) + step(0.12, nd1) + step(0.12, nd2) + step(0.12, nd3);\n"
-    "    float normal_e = max(max(nd0, nd1), max(nd2, nd3)) * step(1.0, support);\n"
-    "\n"
-    "    float d0 = depth_sample(uv + texel * vec2( radius, 0.0));\n"
-    "    float d1 = depth_sample(uv + texel * vec2(-radius, 0.0));\n"
-    "    float d2 = depth_sample(uv + texel * vec2(0.0,  radius));\n"
-    "    float d3 = depth_sample(uv + texel * vec2(0.0, -radius));\n"
-    "\n"
-    "    float laplacian_h = abs(d0 + d1 - 2.0 * center_d);\n"
-    "    float laplacian_v = abs(d2 + d3 - 2.0 * center_d);\n"
-    "    float depth_e = smoothstep(0.008, 0.03, max(laplacian_h, laplacian_v) / max(center_d, 0.0001));\n"
-    "    float max_rel_depth = max(max(abs(d0 - center_d), abs(d1 - center_d)),\n"
-    "                              max(abs(d2 - center_d), abs(d3 - center_d))) / max(center_d, 0.0001);\n"
-    "    float max_normal_delta = max(max(nd0, nd1), max(nd2, nd3));\n"
-    "    float same_surface_noise = (1.0 - step(0.08, max_normal_delta)) *\n"
-    "                               (1.0 - smoothstep(0.015, 0.08, max_rel_depth));\n"
-    "    depth_e *= 1.0 - same_surface_noise;\n"
-    "\n"
-    "    return max(normal_e, depth_e) * center_occ;\n"
-    "}\n"
-    "\n"
-    "void main() {\n"
-    "    vec2 resolution = max(u_resolution_time.xy, vec2(1.0));\n"
-    "    vec2 texel = 1.0 / resolution;\n"
-    "    vec2 uv = clamp(v_uv, texel, 1.0 - texel);\n"
-    "\n"
-    "    vec4 scene = texture(u_scene, uv);\n"
-    "    vec4 center_n = normal_sample(uv);\n"
-    "    float center_d = depth_sample(uv);\n"
-    "    float lum = luminance(scene.rgb);\n"
-    "\n"
-    "    float edge_gain = max(u_effect_params.x, 0.01);\n"
-    "    float far_radius = max(u_effect_params.y, 0.25);\n"
-    "    float near_radius = max(u_effect_params.z, far_radius);\n"
-    "    float scene_mix = clamp(u_effect_params.w, 0.0, 1.0);\n"
-    "\n"
-    "    float view_dist = center_d * 4096.0;\n"
-    "    float near_factor = clamp(1.0 - smoothstep(96.0, 896.0, view_dist), 0.0, 1.0);\n"
-    "    float radius = mix(far_radius, near_radius, near_factor);\n"
-    "    float edge_response = geometry_edge(uv, texel, radius, center_n, center_d);\n"
-    "    float edge = smoothstep(0.16, 0.42, edge_response * edge_gain);\n"
-    "\n"
-    "    vec3 paper_color = vec3(0.965, 0.935, 0.865);\n"
-    "    vec3 graphite = vec3(0.105, 0.092, 0.082);\n"
-    "    vec3 washed_scene = mix(vec3(lum), scene.rgb, 0.34);\n"
-    "    vec3 base = mix(paper_color, washed_scene, scene_mix);\n"
-    "\n"
-    "    float pencil = clamp(edge * 0.95, 0.0, 1.0) * step(0.0001, center_n.a);\n"
-    "    vec3 color = mix(base, graphite, pencil);\n"
-    "\n"
-    "    frag_color = vec4(color, scene.a);\n"
-    "}\n";
-
-
-static sg_shader Renderer_MakeGLPencilShader(void) {
-    sg_shader_desc sd = {};
-    sd.label = "pencil-post-shader";
-    sd.vertex_func.source = WARPED_PENCIL_VS_SRC;
-    sd.fragment_func.source = WARPED_PENCIL_FS_SRC;
-
-    sd.attrs[ATTR_warped_pencil_shader_pencil_post_a_pos].glsl_name = "a_pos";
-    sd.attrs[ATTR_warped_pencil_shader_pencil_post_a_uv].glsl_name = "a_uv";
-
-    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].stage = SG_SHADERSTAGE_FRAGMENT;
-    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].size = sizeof(warped_pencil_shader_fs_params_t);
-    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].layout = SG_UNIFORMLAYOUT_NATIVE;
-    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].glsl_uniforms[0].type = SG_UNIFORMTYPE_FLOAT4;
-    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].glsl_uniforms[0].glsl_name = "u_resolution_time";
-    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].glsl_uniforms[1].type = SG_UNIFORMTYPE_FLOAT4;
-    sd.uniform_blocks[UB_warped_pencil_shader_fs_params].glsl_uniforms[1].glsl_name = "u_effect_params";
-
-    sd.views[VIEW_warped_pencil_shader_u_scene].texture.stage = SG_SHADERSTAGE_FRAGMENT;
-    sd.views[VIEW_warped_pencil_shader_u_scene].texture.image_type = SG_IMAGETYPE_2D;
-    sd.views[VIEW_warped_pencil_shader_u_scene].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
-    sd.views[VIEW_warped_pencil_shader_u_normals].texture.stage = SG_SHADERSTAGE_FRAGMENT;
-    sd.views[VIEW_warped_pencil_shader_u_normals].texture.image_type = SG_IMAGETYPE_2D;
-    sd.views[VIEW_warped_pencil_shader_u_normals].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
-    sd.views[VIEW_warped_pencil_shader_u_depth].texture.stage = SG_SHADERSTAGE_FRAGMENT;
-    sd.views[VIEW_warped_pencil_shader_u_depth].texture.image_type = SG_IMAGETYPE_2D;
-    sd.views[VIEW_warped_pencil_shader_u_depth].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
-
-    sd.samplers[SMP_warped_pencil_shader_u_scene_smp].stage = SG_SHADERSTAGE_FRAGMENT;
-    sd.samplers[SMP_warped_pencil_shader_u_scene_smp].sampler_type = SG_SAMPLERTYPE_FILTERING;
-    sd.samplers[SMP_warped_pencil_shader_u_normal_smp].stage = SG_SHADERSTAGE_FRAGMENT;
-    sd.samplers[SMP_warped_pencil_shader_u_normal_smp].sampler_type = SG_SAMPLERTYPE_FILTERING;
-    sd.samplers[SMP_warped_pencil_shader_u_depth_smp].stage = SG_SHADERSTAGE_FRAGMENT;
-    sd.samplers[SMP_warped_pencil_shader_u_depth_smp].sampler_type = SG_SAMPLERTYPE_FILTERING;
-
-    sd.texture_sampler_pairs[0].stage = SG_SHADERSTAGE_FRAGMENT;
-    sd.texture_sampler_pairs[0].view_slot = VIEW_warped_pencil_shader_u_scene;
-    sd.texture_sampler_pairs[0].sampler_slot = SMP_warped_pencil_shader_u_scene_smp;
-    sd.texture_sampler_pairs[0].glsl_name = "u_scene";
-    sd.texture_sampler_pairs[1].stage = SG_SHADERSTAGE_FRAGMENT;
-    sd.texture_sampler_pairs[1].view_slot = VIEW_warped_pencil_shader_u_normals;
-    sd.texture_sampler_pairs[1].sampler_slot = SMP_warped_pencil_shader_u_normal_smp;
-    sd.texture_sampler_pairs[1].glsl_name = "u_normals";
-    sd.texture_sampler_pairs[2].stage = SG_SHADERSTAGE_FRAGMENT;
-    sd.texture_sampler_pairs[2].view_slot = VIEW_warped_pencil_shader_u_depth;
-    sd.texture_sampler_pairs[2].sampler_slot = SMP_warped_pencil_shader_u_depth_smp;
-    sd.texture_sampler_pairs[2].glsl_name = "u_depth";
-    return sg_make_shader(&sd);
-}
-
-static sg_shader Renderer_MakePlatformPencilShader(sg_backend backend) {
-#if defined(WARPED_SOKOL_BACKEND_METAL)
-    if (backend != SG_BACKEND_METAL_MACOS) {
-        printf("[Renderer] Backend mismatch: expected METAL_MACOS, got %s.\n",
-               RendererBackendName(backend));
-        return {};
-    }
-    return Renderer_MakeGeneratedPencilShader(backend);
-#elif defined(WARPED_SOKOL_BACKEND_D3D11)
-    if (backend != SG_BACKEND_D3D11) {
-        printf("[Renderer] Backend mismatch: expected D3D11, got %s.\n",
-               RendererBackendName(backend));
-        return {};
-    }
-    return Renderer_MakeGeneratedPencilShader(backend);
-#elif defined(WARPED_SOKOL_BACKEND_GLCORE)
-    if (backend != SG_BACKEND_GLCORE) {
-        printf("[Renderer] Backend mismatch: expected GLCORE, got %s.\n",
-               RendererBackendName(backend));
-        return {};
-    }
-    return Renderer_MakeGLPencilShader();
-#else
-    (void)backend;
-    return {};
-#endif
-}
-
-static sg_shader Renderer_MakeGeneratedNormalShader(sg_backend backend) {
+static sg_shader Renderer_MakePlatformNormalShader(sg_backend backend) {
     const sg_shader_desc* desc = warped_normal_shader_normal_pass_shader_desc(backend);
     if (!desc) {
         printf("[Renderer] No generated normal shader descriptor for backend %s.\n",
@@ -415,81 +147,6 @@ static sg_shader Renderer_MakeGeneratedNormalShader(sg_backend backend) {
         return {};
     }
     return sg_make_shader(desc);
-}
-
-static const char* WARPED_NORMAL_VS_SRC =
-    "#version 330\n"
-    "uniform mat4 u_mvp;\n"
-    "uniform mat4 u_normal_model;\n"
-    "layout(location=0) in vec3 a_pos;\n"
-    "layout(location=1) in vec3 a_nrm;\n"
-    "out vec3 v_nrm;\n"
-    "out float v_view_dist;\n"
-    "void main() {\n"
-    "    v_nrm = normalize(mat3(u_normal_model) * a_nrm);\n"
-    "    vec4 view_pos = u_normal_model * vec4(a_pos, 1.0);\n"
-    "    v_view_dist = max(-view_pos.z, 0.0);\n"
-    "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
-    "}\n";
-
-static const char* WARPED_NORMAL_FS_SRC =
-    "#version 330\n"
-    "in vec3 v_nrm;\n"
-    "in float v_view_dist;\n"
-    "layout(location=0) out vec4 frag_color;\n"
-    "layout(location=1) out vec4 frag_depth_out;\n"
-    "void main() {\n"
-    "    vec3 n = normalize(v_nrm) * 0.5 + 0.5;\n"
-    "    frag_color = vec4(n, 1.0);\n"
-    "    frag_depth_out = vec4(v_view_dist / 4096.0, 0.0, 0.0, 0.0);\n"
-    "}\n";
-
-static sg_shader Renderer_MakeGLNormalShader(void) {
-    sg_shader_desc sd = {};
-    sd.label = "normal-post-shader";
-    sd.vertex_func.source = WARPED_NORMAL_VS_SRC;
-    sd.fragment_func.source = WARPED_NORMAL_FS_SRC;
-
-    sd.attrs[ATTR_warped_normal_shader_normal_pass_a_pos].glsl_name = "a_pos";
-    sd.attrs[ATTR_warped_normal_shader_normal_pass_a_nrm].glsl_name = "a_nrm";
-
-    sd.uniform_blocks[UB_warped_normal_shader_vs_params].stage = SG_SHADERSTAGE_VERTEX;
-    sd.uniform_blocks[UB_warped_normal_shader_vs_params].size = sizeof(warped_normal_shader_vs_params_t);
-    sd.uniform_blocks[UB_warped_normal_shader_vs_params].layout = SG_UNIFORMLAYOUT_NATIVE;
-    sd.uniform_blocks[UB_warped_normal_shader_vs_params].glsl_uniforms[0].type = SG_UNIFORMTYPE_MAT4;
-    sd.uniform_blocks[UB_warped_normal_shader_vs_params].glsl_uniforms[0].glsl_name = "u_mvp";
-    sd.uniform_blocks[UB_warped_normal_shader_vs_params].glsl_uniforms[1].type = SG_UNIFORMTYPE_MAT4;
-    sd.uniform_blocks[UB_warped_normal_shader_vs_params].glsl_uniforms[1].glsl_name = "u_normal_model";
-
-    return sg_make_shader(&sd);
-}
-
-static sg_shader Renderer_MakePlatformNormalShader(sg_backend backend) {
-#if defined(WARPED_SOKOL_BACKEND_METAL)
-    if (backend != SG_BACKEND_METAL_MACOS) {
-        printf("[Renderer] Backend mismatch: expected METAL_MACOS, got %s.\n",
-               RendererBackendName(backend));
-        return {};
-    }
-    return Renderer_MakeGeneratedNormalShader(backend);
-#elif defined(WARPED_SOKOL_BACKEND_D3D11)
-    if (backend != SG_BACKEND_D3D11) {
-        printf("[Renderer] Backend mismatch: expected D3D11, got %s.\n",
-               RendererBackendName(backend));
-        return {};
-    }
-    return Renderer_MakeGeneratedNormalShader(backend);
-#elif defined(WARPED_SOKOL_BACKEND_GLCORE)
-    if (backend != SG_BACKEND_GLCORE) {
-        printf("[Renderer] Backend mismatch: expected GLCORE, got %s.\n",
-               RendererBackendName(backend));
-        return {};
-    }
-    return Renderer_MakeGLNormalShader();
-#else
-    (void)backend;
-    return {};
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,9 +736,10 @@ void Renderer_Init(void) {
     lsmp.min_filter = SG_FILTER_LINEAR;
     lsmp.mag_filter = SG_FILTER_LINEAR;
     lsmp.mipmap_filter = SG_FILTER_LINEAR;
+    lsmp.max_lod = 0.001f;
     lsmp.max_anisotropy = 16;
-    lsmp.wrap_u     = SG_WRAP_REPEAT;
-    lsmp.wrap_v     = SG_WRAP_REPEAT;
+    lsmp.wrap_u     = SG_WRAP_CLAMP_TO_EDGE;
+    lsmp.wrap_v     = SG_WRAP_CLAMP_TO_EDGE;
     lsmp.label      = "lightmap-sampler";
     g_lmSampler = sg_make_sampler(&lsmp);
 

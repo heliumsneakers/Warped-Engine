@@ -141,6 +141,7 @@ void AppendBrushEntityPolygons(const Entity& entity,
                    std::make_move_iterator(exteriorPolys.begin()),
                    std::make_move_iterator(exteriorPolys.end()));
     } else {
+        HealTJunctions(entityPolys, CSG_POINT_EPS);
         ConvertMapPolygonsTBToWorld(entityPolys);
         out.insert(out.end(),
                    std::make_move_iterator(entityPolys.begin()),

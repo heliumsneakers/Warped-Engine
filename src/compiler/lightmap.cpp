@@ -5,6 +5,7 @@
 // extremely tall atlas.
 
 #include "lightmap.h"
+#include "lightmap_constants.h"
 #include "lightmap_compute.h"
 #include "lightmap_trace.h"
 
@@ -16,11 +17,12 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 // --------------------------------------------------------------------------
 //  Tunables
 // --------------------------------------------------------------------------
-static constexpr int   LM_PAD             = 2;      // border luxels (filled by dilate)
+static constexpr int   LM_PAD             = LIGHTMAP_LM_PAD;      // border luxels (filled by dilate)
 static constexpr int   LIGHTMAP_PAGE_SIZE = 1024;
 static constexpr int   FACE_MAX_LUXELS    = 127;    // Source-style per-face luxel cap (interior only)
 static constexpr float SHADOW_BIAS        = 0.03125f;
@@ -30,7 +32,7 @@ static constexpr float SOLID_SHADOW_CONTACT_EPSILON = 0.01f;
 static constexpr float SAMPLE_REPAIR_JITTER = 0.5f;
 static constexpr float DARK_LUXEL_THRESHOLD = 8.0f / 255.0f;
 static constexpr float OCCLUSION_NEAR_TMIN = RAY_TRACE_TMIN;
-static constexpr float EDGE_SEAM_GUARD_LUXELS = 0.75f;
+static constexpr float EDGE_SEAM_GUARD_LUXELS = LIGHTMAP_EDGE_SEAM_GUARD_LUXELS;
 // Indirect bounce is emitted from lit patch surfaces. Keep the first radiosity
 // pass conservative so it lifts occluded regions without flattening direct
 // shadow contrast into an overcast look.
@@ -109,7 +111,7 @@ struct SurfaceLightEmitter {
 static int ComputeInteriorLuxelSpan(float extentWorld, float luxelSize) {
     const float safeLuxelSize = std::max(0.125f, luxelSize);
     const float extentLuxels = std::max(0.0f, extentWorld) / safeLuxelSize;
-    return std::max(2, (int)ceilf(std::max(0.0f, extentLuxels - 1e-4f)));
+    return std::max(1, (int)ceilf(std::max(0.0f, extentLuxels - 1e-4f)));
 }
 
 static Vector3 LerpVec3(const Vector3& a, const Vector3& b, float t) {
@@ -803,7 +805,7 @@ static std::vector<BakePatch> SubdivideLightmappedPolygon(const MapPolygon& poly
     }
 
     const float safeLuxelSize = std::max(0.125f, luxelSize);
-    const float tileExtent = FACE_MAX_LUXELS * safeLuxelSize;
+    const float tileExtent = (FACE_MAX_LUXELS - 2) * safeLuxelSize;
     const float startU = floorf(minU / tileExtent) * tileExtent;
     const float startV = floorf(minV / tileExtent) * tileExtent;
     const int tilesU = std::max(1, (int)ceilf((maxU - startU) / tileExtent));
@@ -934,6 +936,7 @@ struct RepairedSamplePoint {
 };
 
 static bool InsidePoly2D(const std::vector<Vector2>& poly, float px, float py);
+static float DistSqPointSegment2D(const Vector2& p, const Vector2& a, const Vector2& b);
 static float MinDistToPolyEdge2D(const std::vector<Vector2>& poly, float px, float py);
 static Vector3 OffsetPointAlongSurfaceNormal(const Vector3& planePoint,
                                              const Vector3& faceNormal,
@@ -1534,20 +1537,34 @@ static void BuildComputeSurfaceEmitterPayload(
     }
 }
 
-// --------------------------------------------------------------------------
-//  Point-in-convex-polygon test (2-D, polygon already CCW in plane space).
-// --------------------------------------------------------------------------
 static bool InsidePoly2D(const std::vector<Vector2>& poly, float px, float py) {
     const size_t n = poly.size();
+    if (n < 3) {
+        return false;
+    }
+
+    constexpr float kEdgeEpsilon = 1e-4f;
+    const Vector2 p{ px, py };
     for (size_t i = 0; i < n; ++i) {
         const size_t j = (i + 1) % n;
-        const float ex = poly[j].x - poly[i].x;
-        const float ey = poly[j].y - poly[i].y;
-        const float cx = px - poly[i].x;
-        const float cy = py - poly[i].y;
-        if (ex * cy - ey * cx < -1e-3f) return false;
+        if (DistSqPointSegment2D(p, poly[i], poly[j]) <= kEdgeEpsilon * kEdgeEpsilon) {
+            return true;
+        }
     }
-    return true;
+
+    bool inside = false;
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        const Vector2& a = poly[i];
+        const Vector2& b = poly[j];
+        if ((a.y > py) == (b.y > py)) {
+            continue;
+        }
+        const float xIntersect = (b.x - a.x) * (py - a.y) / (b.y - a.y) + a.x;
+        if (px < xIntersect) {
+            inside = !inside;
+        }
+    }
+    return inside;
 }
 
 static float DistSqPointSegment2D(const Vector2& p, const Vector2& a, const Vector2& b) {
@@ -1691,16 +1708,50 @@ static Vector3 ClosestPointOnPolyBoundaryProjected(const std::vector<Vector2>& p
 struct FaceRect {
     LightmapComputeFaceRect gpu;
     std::vector<Vector2> poly2d;
+    std::vector<Vector2> polyGlobal2d;
     AABB bounds{};
     std::vector<uint32_t> lightIndices;
     std::vector<uint32_t> surfaceEmitterIndices;
     uint32_t page = 0;
     uint32_t sourcePolyIndex = 0;
+    int sourceEntityId = -1;
+    int sourceBrushId = -1;
+    int sourceFaceIndex = -1;
     float maxU = 0.0f;
     float maxV = 0.0f;
     bool computeCompatible = true;
     std::string computeFallbackReason;
 };
+
+static std::string FaceRectSourceSurfaceKey(const FaceRect& rect) {
+    if (rect.sourceEntityId >= 0 && rect.sourceBrushId >= 0 && rect.sourceFaceIndex >= 0) {
+        return std::string("face:") +
+               std::to_string(rect.sourceEntityId) + ":" +
+               std::to_string(rect.sourceBrushId) + ":" +
+               std::to_string(rect.sourceFaceIndex);
+    }
+    return std::string("poly:") + std::to_string(rect.sourcePolyIndex);
+}
+
+static bool FaceRectsShareSourceSurface(const FaceRect& a, const FaceRect& b) {
+    const bool aHasFaceSource = a.sourceEntityId >= 0 && a.sourceBrushId >= 0 && a.sourceFaceIndex >= 0;
+    const bool bHasFaceSource = b.sourceEntityId >= 0 && b.sourceBrushId >= 0 && b.sourceFaceIndex >= 0;
+    if (aHasFaceSource && bHasFaceSource) {
+        return a.sourceEntityId == b.sourceEntityId &&
+               a.sourceBrushId == b.sourceBrushId &&
+               a.sourceFaceIndex == b.sourceFaceIndex;
+    }
+    return a.sourcePolyIndex == b.sourcePolyIndex;
+}
+
+static std::unordered_map<std::string, std::vector<size_t>> GroupRectsBySourceSurface(const std::vector<FaceRect>& rects) {
+    std::unordered_map<std::string, std::vector<size_t>> rectsBySourceSurface;
+    rectsBySourceSurface.reserve(rects.size());
+    for (size_t i = 0; i < rects.size(); ++i) {
+        rectsBySourceSurface[FaceRectSourceSurfaceKey(rects[i])].push_back(i);
+    }
+    return rectsBySourceSurface;
+}
 
 static void BuildComputeRectSurfaceEmitterDispatchData(
     const std::vector<FaceRect>& rects,
@@ -1806,20 +1857,29 @@ static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patche
             AABBExtend(&r.bounds, vv);
         }
 
-        const int interiorW = ComputeInteriorLuxelSpan(maxU - minU, safeLuxelSize);
-        const int interiorH = ComputeInteriorLuxelSpan(maxV - minV, safeLuxelSize);
+        // Snap every face rect to the same plane-space luxel grid so coplanar
+        // neighbors bake angled shadow transitions at matching sample phases.
+        const float alignedMinU = floorf(minU / safeLuxelSize) * safeLuxelSize;
+        const float alignedMinV = floorf(minV / safeLuxelSize) * safeLuxelSize;
+        const float alignedMaxU = ceilf(maxU / safeLuxelSize) * safeLuxelSize;
+        const float alignedMaxV = ceilf(maxV / safeLuxelSize) * safeLuxelSize;
+        const int interiorW = ComputeInteriorLuxelSpan(alignedMaxU - alignedMinU, safeLuxelSize);
+        const int interiorH = ComputeInteriorLuxelSpan(alignedMaxV - alignedMinV, safeLuxelSize);
         r.gpu.w = interiorW + LM_PAD * 2;
         r.gpu.h = interiorH + LM_PAD * 2;
         r.gpu.luxelSize = safeLuxelSize;
-        r.gpu.minU = minU;
-        r.gpu.minV = minV;
+        r.gpu.minU = alignedMinU;
+        r.gpu.minV = alignedMinV;
         r.gpu.axisU = U;
         r.gpu.axisV = V;
         r.gpu.normal = p.normal;
         r.sourcePolyIndex = patches[i].sourcePolyIndex;
         r.gpu.sourcePolyIndex = (int)r.sourcePolyIndex;
-        r.maxU = maxU;
-        r.maxV = maxV;
+        r.sourceEntityId = p.sourceEntityId;
+        r.sourceBrushId = p.sourceBrushId;
+        r.sourceFaceIndex = p.sourceFaceIndex;
+        r.maxU = alignedMaxU;
+        r.maxV = alignedMaxV;
         if (r.sourcePolyIndex >= repairPolys.size()) {
             r.computeCompatible = false;
             r.computeFallbackReason = "page references an invalid repair source polygon";
@@ -1856,12 +1916,17 @@ static std::vector<FaceRect> BuildFaceRects(const std::vector<BakePatch>& patche
         const float d = Vector3DotProduct(p.verts[0], p.normal);
         r.gpu.origin = Vector3Add(
             Vector3Scale(p.normal, d),
-            Vector3Add(Vector3Scale(U, minU), Vector3Scale(V, minV)));
+            Vector3Add(Vector3Scale(U, alignedMinU), Vector3Scale(V, alignedMinV)));
         r.poly2d.reserve(p.verts.size());
+        r.polyGlobal2d.reserve(p.verts.size());
         for (const Vector3& vv : p.verts) {
+            r.polyGlobal2d.push_back({
+                Vector3DotProduct(vv, U),
+                Vector3DotProduct(vv, V)
+            });
             r.poly2d.push_back({
-                (Vector3DotProduct(vv, U) - minU) / safeLuxelSize,
-                (Vector3DotProduct(vv, V) - minV) / safeLuxelSize
+                (Vector3DotProduct(vv, U) - alignedMinU) / safeLuxelSize,
+                (Vector3DotProduct(vv, V) - alignedMinV) / safeLuxelSize
             });
         }
         if (r.poly2d.size() > LIGHTMAP_COMPUTE_MAX_POLY_VERTS) {
@@ -1929,11 +1994,11 @@ static bool LocalInteriorIndexFromGlobalCenter(float rectMinCoord,
     }
 
     const float local = (globalCenter - rectMinCoord) / luxelSize;
-    const int candidate = (int)floorf(local);
+    const int candidate = (int)lroundf(local);
     if (candidate < 0 || candidate >= interiorSpan) {
         return false;
     }
-    const float expectedCenter = (float)candidate + 0.5f;
+    const float expectedCenter = (float)candidate;
     if (fabsf(local - expectedCenter) > 1e-3f) {
         return false;
     }
@@ -1986,7 +2051,7 @@ static size_t WeldVerticalSiblingSeam(const FaceRect& left,
 
     size_t welded = 0;
     for (int leftRow = 0; leftRow < leftInteriorH; ++leftRow) {
-        const float globalVCenter = left.gpu.minV + ((float)leftRow + 0.5f) * left.gpu.luxelSize;
+        const float globalVCenter = left.gpu.minV + (float)leftRow * left.gpu.luxelSize;
         int rightRow = 0;
         if (!LocalInteriorIndexFromGlobalCenter(right.gpu.minV, right.gpu.luxelSize, rightInteriorH, globalVCenter, &rightRow)) {
             continue;
@@ -2032,7 +2097,7 @@ static size_t WeldHorizontalSiblingSeam(const FaceRect& bottom,
 
     size_t welded = 0;
     for (int bottomCol = 0; bottomCol < bottomInteriorW; ++bottomCol) {
-        const float globalUCenter = bottom.gpu.minU + ((float)bottomCol + 0.5f) * bottom.gpu.luxelSize;
+        const float globalUCenter = bottom.gpu.minU + (float)bottomCol * bottom.gpu.luxelSize;
         int topCol = 0;
         if (!LocalInteriorIndexFromGlobalCenter(top.gpu.minU, top.gpu.luxelSize, topInteriorW, globalUCenter, &topCol)) {
             continue;
@@ -2059,15 +2124,10 @@ static size_t WeldSiblingPatchSeams(const std::vector<FaceRect>& rects,
 {
     const float kSeamCoordEpsilon = std::max(0.125f, luxelSize) * 0.05f;
 
-    std::unordered_map<uint32_t, std::vector<size_t>> rectsBySourcePoly;
-    rectsBySourcePoly.reserve(rects.size());
-    for (size_t i = 0; i < rects.size(); ++i) {
-        rectsBySourcePoly[rects[i].sourcePolyIndex].push_back(i);
-    }
-
+    const auto rectsBySourceSurface = GroupRectsBySourceSurface(rects);
     size_t weldedSamples = 0;
-    for (const auto& [sourcePolyIndex, group] : rectsBySourcePoly) {
-        (void)sourcePolyIndex;
+    for (const auto& [sourceSurfaceKey, group] : rectsBySourceSurface) {
+        (void)sourceSurfaceKey;
         if (group.size() < 2) {
             continue;
         }
@@ -2087,6 +2147,239 @@ static size_t WeldSiblingPatchSeams(const std::vector<FaceRect>& rects,
                     weldedSamples += WeldHorizontalSiblingSeam(a, b, pages, coverageMasks);
                 } else if (fabsf(b.maxV - a.gpu.minV) <= kSeamCoordEpsilon) {
                     weldedSamples += WeldHorizontalSiblingSeam(b, a, pages, coverageMasks);
+                }
+            }
+        }
+    }
+
+    return weldedSamples;
+}
+
+static float DistSqPointLine2D(const Vector2& p, const Vector2& a, const Vector2& b)
+{
+    const float dx = b.x - a.x;
+    const float dy = b.y - a.y;
+    const float lenSq = dx * dx + dy * dy;
+    if (lenSq <= 1e-8f) {
+        const float px = p.x - a.x;
+        const float py = p.y - a.y;
+        return px * px + py * py;
+    }
+    const float cross = (p.x - a.x) * dy - (p.y - a.y) * dx;
+    return (cross * cross) / lenSq;
+}
+
+static bool ComputeCollinearSegmentOverlap2D(const Vector2& a0,
+                                             const Vector2& a1,
+                                             const Vector2& b0,
+                                             const Vector2& b1,
+                                             float epsilon,
+                                             Vector2* outStart,
+                                             Vector2* outEnd)
+{
+    if (!outStart || !outEnd) {
+        return false;
+    }
+
+    const float dx = a1.x - a0.x;
+    const float dy = a1.y - a0.y;
+    const float lenSq = dx * dx + dy * dy;
+    if (lenSq <= epsilon * epsilon) {
+        return false;
+    }
+
+    if (DistSqPointLine2D(b0, a0, a1) > epsilon * epsilon ||
+        DistSqPointLine2D(b1, a0, a1) > epsilon * epsilon) {
+        return false;
+    }
+
+    const float t0 = ((b0.x - a0.x) * dx + (b0.y - a0.y) * dy) / lenSq;
+    const float t1 = ((b1.x - a0.x) * dx + (b1.y - a0.y) * dy) / lenSq;
+    const float overlapMin = std::max(0.0f, std::min(t0, t1));
+    const float overlapMax = std::min(1.0f, std::max(t0, t1));
+    if (overlapMax - overlapMin <= std::max(1e-4f, epsilon / std::max(1e-4f, sqrtf(lenSq)))) {
+        return false;
+    }
+
+    *outStart = { a0.x + dx * overlapMin, a0.y + dy * overlapMin };
+    *outEnd = { a0.x + dx * overlapMax, a0.y + dy * overlapMax };
+    return true;
+}
+
+static bool ComputePolygonEdgeInteriorOffset(const std::vector<Vector2>& polyGlobal2d,
+                                             const Vector2& edgeStart,
+                                             const Vector2& edgeEnd,
+                                             float insetDistance,
+                                             Vector2* outOffset)
+{
+    if (!outOffset || polyGlobal2d.size() < 3) {
+        return false;
+    }
+
+    const float dx = edgeEnd.x - edgeStart.x;
+    const float dy = edgeEnd.y - edgeStart.y;
+    const float len = sqrtf(dx * dx + dy * dy);
+    if (len <= 1e-6f) {
+        return false;
+    }
+
+    const Vector2 midpoint = {
+        (edgeStart.x + edgeEnd.x) * 0.5f,
+        (edgeStart.y + edgeEnd.y) * 0.5f
+    };
+    const Vector2 candidateA = { -dy / len * insetDistance, dx / len * insetDistance };
+    const Vector2 candidateB = { -candidateA.x, -candidateA.y };
+    const Vector2 testA = { midpoint.x + candidateA.x, midpoint.y + candidateA.y };
+    const Vector2 testB = { midpoint.x + candidateB.x, midpoint.y + candidateB.y };
+    const bool insideA = InsidePoly2D(polyGlobal2d, testA.x, testA.y);
+    const bool insideB = InsidePoly2D(polyGlobal2d, testB.x, testB.y);
+    if (insideA == insideB) {
+        return false;
+    }
+
+    *outOffset = insideA ? candidateA : candidateB;
+    return true;
+}
+
+static bool FaceRectPagePixelFromGlobalUV(const FaceRect& rect,
+                                          const Vector2& globalUv,
+                                          int* outPageX,
+                                          int* outPageY)
+{
+    if (!outPageX || !outPageY || rect.gpu.luxelSize <= 0.0f) {
+        return false;
+    }
+
+    const int interiorW = InteriorSpanX(rect);
+    const int interiorH = InteriorSpanY(rect);
+    if (interiorW <= 0 || interiorH <= 0) {
+        return false;
+    }
+
+    const float localU = (globalUv.x - rect.gpu.minU) / rect.gpu.luxelSize;
+    const float localV = (globalUv.y - rect.gpu.minV) / rect.gpu.luxelSize;
+    const int col = (int)floorf(localU);
+    const int row = (int)floorf(localV);
+    if (col < 0 || col >= interiorW || row < 0 || row >= interiorH) {
+        return false;
+    }
+
+    *outPageX = rect.gpu.x + LM_PAD + col;
+    *outPageY = rect.gpu.y + LM_PAD + row;
+    return true;
+}
+
+static size_t WeldCrossPolygonEdgeSeams(const std::vector<FaceRect>& rects,
+                                        std::vector<LightmapPage>& pages,
+                                        const std::vector<std::vector<uint8_t>>& coverageMasks,
+                                        float luxelSize)
+{
+    const float kNormalEpsilon = 1e-3f;
+    const float kPlaneEpsilon = 0.1f;
+    const float kEdgeOverlapEpsilon = std::max(0.05f, luxelSize * 0.1f);
+    const float kBoundsEpsilon = std::max(0.125f, luxelSize);
+    const float kInsetDistance = std::max(0.125f, luxelSize * 0.5f);
+
+    size_t weldedSamples = 0;
+    std::unordered_set<uint64_t> weldedPairs;
+    for (size_t i = 0; i < rects.size(); ++i) {
+        const FaceRect& a = rects[i];
+        for (size_t j = i + 1; j < rects.size(); ++j) {
+            const FaceRect& b = rects[j];
+
+            if (FaceRectsShareSourceSurface(a, b)) {
+                continue;
+            }
+
+            const Vector3 normalDiff = Vector3Subtract(a.gpu.normal, b.gpu.normal);
+            if (Vector3DotProduct(normalDiff, normalDiff) > kNormalEpsilon * kNormalEpsilon) {
+                continue;
+            }
+
+            const float planeA = Vector3DotProduct(a.gpu.normal, a.gpu.origin);
+            const float planeB = Vector3DotProduct(b.gpu.normal, b.gpu.origin);
+            if (fabsf(planeA - planeB) > kPlaneEpsilon) {
+                continue;
+            }
+
+            if (a.maxU + kBoundsEpsilon < b.gpu.minU || b.maxU + kBoundsEpsilon < a.gpu.minU ||
+                a.maxV + kBoundsEpsilon < b.gpu.minV || b.maxV + kBoundsEpsilon < a.gpu.minV) {
+                continue;
+            }
+
+            if (a.page >= pages.size() || b.page >= pages.size() ||
+                a.page >= coverageMasks.size() || b.page >= coverageMasks.size()) {
+                continue;
+            }
+
+            const LightmapPage& aPage = pages[a.page];
+            const LightmapPage& bPage = pages[b.page];
+            const std::vector<uint8_t>& aCoverage = coverageMasks[a.page];
+            const std::vector<uint8_t>& bCoverage = coverageMasks[b.page];
+
+            for (size_t aEdge = 0; aEdge < a.polyGlobal2d.size(); ++aEdge) {
+                const Vector2& a0 = a.polyGlobal2d[aEdge];
+                const Vector2& a1 = a.polyGlobal2d[(aEdge + 1) % a.polyGlobal2d.size()];
+                for (size_t bEdge = 0; bEdge < b.polyGlobal2d.size(); ++bEdge) {
+                    const Vector2& b0 = b.polyGlobal2d[bEdge];
+                    const Vector2& b1 = b.polyGlobal2d[(bEdge + 1) % b.polyGlobal2d.size()];
+
+                    Vector2 overlapStart{};
+                    Vector2 overlapEnd{};
+                    if (!ComputeCollinearSegmentOverlap2D(a0, a1, b0, b1, kEdgeOverlapEpsilon, &overlapStart, &overlapEnd)) {
+                        continue;
+                    }
+
+                    Vector2 aOffset{};
+                    Vector2 bOffset{};
+                    if (!ComputePolygonEdgeInteriorOffset(a.polyGlobal2d, overlapStart, overlapEnd, kInsetDistance, &aOffset) ||
+                        !ComputePolygonEdgeInteriorOffset(b.polyGlobal2d, overlapStart, overlapEnd, kInsetDistance, &bOffset)) {
+                        continue;
+                    }
+
+                    const float overlapDx = overlapEnd.x - overlapStart.x;
+                    const float overlapDy = overlapEnd.y - overlapStart.y;
+                    const float overlapLength = sqrtf(overlapDx * overlapDx + overlapDy * overlapDy);
+                    const int sampleCount = std::max(1, (int)ceilf(overlapLength / std::max(0.25f, luxelSize * 0.5f)));
+                    for (int sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
+                        const float t = ((float)sampleIndex + 0.5f) / (float)sampleCount;
+                        const Vector2 seamPoint = {
+                            overlapStart.x + overlapDx * t,
+                            overlapStart.y + overlapDy * t
+                        };
+                        const Vector2 aSampleUv = { seamPoint.x + aOffset.x, seamPoint.y + aOffset.y };
+                        const Vector2 bSampleUv = { seamPoint.x + bOffset.x, seamPoint.y + bOffset.y };
+
+                        int aPageX = 0;
+                        int aPageY = 0;
+                        int bPageX = 0;
+                        int bPageY = 0;
+                        if (!FaceRectPagePixelFromGlobalUV(a, aSampleUv, &aPageX, &aPageY) ||
+                            !FaceRectPagePixelFromGlobalUV(b, bSampleUv, &bPageX, &bPageY)) {
+                            continue;
+                        }
+
+                        if (!CoverageContains(aCoverage, aPage, aPageX, aPageY) ||
+                            !CoverageContains(bCoverage, bPage, bPageX, bPageY)) {
+                            continue;
+                        }
+
+                        const uint64_t aPixelId = ((uint64_t)a.page << 20) |
+                                                  ((uint64_t)aPageY << 10) |
+                                                  (uint64_t)aPageX;
+                        const uint64_t bPixelId = ((uint64_t)b.page << 20) |
+                                                  ((uint64_t)bPageY << 10) |
+                                                  (uint64_t)bPageX;
+                        const uint64_t lowId = std::min(aPixelId, bPixelId);
+                        const uint64_t highId = std::max(aPixelId, bPixelId);
+                        const uint64_t pairKey = (lowId << 32) | highId;
+                        if (!weldedPairs.insert(pairKey).second) {
+                            continue;
+                        }
+
+                        AverageLuxelPair(pages[a.page], aPageX, aPageY, pages[b.page], bPageX, bPageY);
+                        ++weldedSamples;
+                    }
                 }
             }
         }
@@ -2184,28 +2477,9 @@ static void FillPatchUVs(const std::vector<BakePatch>& patches,
         for (const Vector3& vv : p.verts) {
             const float u = (Vector3DotProduct(vv, r.gpu.axisU) - r.gpu.minU) / r.gpu.luxelSize;
             const float v = (Vector3DotProduct(vv, r.gpu.axisV) - r.gpu.minV) / r.gpu.luxelSize;
-            // Vertex UVs map to luxel-grid boundaries within the rect (NOT pixel
-            // centers). The bake loop samples luxel `k` over the polygon chunk
-            // [k, k+1) (see ju/jv in BakeLightmapCPUPage) so luxel k's value is
-            // geometrically centered at local coord k+0.5. Placing the polygon's
-            // vertex at the grid-line `k` lets linear interpolation of the vertex
-            // UVs hit luxel k's center exactly at u_local = k+0.5, and the
-            // polygon edges (u_local = 0 and u_local = interiorW) land at the
-            // boundary between an interior luxel and the adjacent padding luxel.
-            // After DilatePage those padding luxels carry the nearest interior
-            // value, so bilinear at the edge resolves to ~the edge luxel value.
-            //
-            // The old formula added `+ 0.5f` on top, which shifted the entire
-            // lightmap half-a-luxel across every polygon: the minU vertex still
-            // sampled the first interior luxel's center, but the maxU vertex
-            // sampled the *first padding luxel's* center (past the interior).
-            // At lmscale=1 that 0.5-luxel shift is 0.5 world units (invisible),
-            // but at lmscale=16 it's 8 world units, which manifests as very
-            // visible seams at polygon edges because adjacent polygons shift in
-            // different directions relative to their shared edge.
             atlas.patches[i].uv.push_back({
-                (r.gpu.x + LM_PAD + u) / page.width,
-                (r.gpu.y + LM_PAD + v) / page.height
+                (r.gpu.x + LM_PAD + u + 0.5f) / page.width,
+                (r.gpu.y + LM_PAD + v + 0.5f) / page.height
             });
         }
     }
@@ -2226,8 +2500,8 @@ static std::vector<uint8_t> BuildCoverageMask(const std::vector<FaceRect>& rects
                 uint8_t coveredSamples = 0;
                 for (int sy = 0; sy < g_aaGrid; ++sy) {
                     for (int sx = 0; sx < g_aaGrid; ++sx) {
-                        const float cu = (lx - LM_PAD) + (sx + 0.5f) * invGrid;
-                        const float cv = (ly - LM_PAD) + (sy + 0.5f) * invGrid;
+                        const float cu = (lx - LM_PAD - 0.5f) + (sx + 0.5f) * invGrid;
+                        const float cv = (ly - LM_PAD - 0.5f) + (sy + 0.5f) * invGrid;
                         if (InsidePoly2D(r.poly2d, cu, cv)) {
                             ++coveredSamples;
                         }
@@ -2260,8 +2534,8 @@ static std::vector<uint8_t> BuildStrictInteriorMask(const std::vector<FaceRect>&
         }
         for (int ly = 0; ly < rect.gpu.h; ++ly) {
             for (int lx = 0; lx < rect.gpu.w; ++lx) {
-                const float cu = (float)(lx - LM_PAD) + 0.5f;
-                const float cv = (float)(ly - LM_PAD) + 0.5f;
+                const float cu = (float)(lx - LM_PAD);
+                const float cv = (float)(ly - LM_PAD);
                 if (!InsidePoly2D(rect.poly2d, cu, cv)) {
                     continue;
                 }
@@ -2433,6 +2707,7 @@ static bool InitializeStitchedSourceFaceCanvas(const std::vector<FaceRect>& rect
     }
 
     const int safeSampleScale = std::max(1, sampleScale);
+    const float stitchedLuxelSize = baseLuxelSize / (float)safeSampleScale;
     const int stitchedWidth = ComputeInteriorLuxelSpan(maxU - minU, baseLuxelSize) * safeSampleScale;
     const int stitchedHeight = ComputeInteriorLuxelSpan(maxV - minV, baseLuxelSize) * safeSampleScale;
     if (stitchedWidth <= 0 || stitchedHeight <= 0) {
@@ -2440,9 +2715,9 @@ static bool InitializeStitchedSourceFaceCanvas(const std::vector<FaceRect>& rect
     }
 
     const size_t pixelCount = (size_t)stitchedWidth * (size_t)stitchedHeight;
-    outCanvas->minU = minU;
-    outCanvas->minV = minV;
-    outCanvas->luxelSize = baseLuxelSize / (float)safeSampleScale;
+    outCanvas->minU = minU - 0.5f * baseLuxelSize + 0.5f * stitchedLuxelSize;
+    outCanvas->minV = minV - 0.5f * baseLuxelSize + 0.5f * stitchedLuxelSize;
+    outCanvas->luxelSize = stitchedLuxelSize;
     outCanvas->width = stitchedWidth;
     outCanvas->height = stitchedHeight;
     outCanvas->valid.assign(pixelCount, 0);
@@ -2467,8 +2742,8 @@ static bool RectLocalPixelToStitchedIndex(const FaceRect& rect,
         return false;
     }
 
-    const float globalUCenter = rect.gpu.minU + ((float)(localX - LM_PAD) + 0.5f) * rect.gpu.luxelSize;
-    const float globalVCenter = rect.gpu.minV + ((float)(localY - LM_PAD) + 0.5f) * rect.gpu.luxelSize;
+    const float globalUCenter = rect.gpu.minU + (float)(localX - LM_PAD) * rect.gpu.luxelSize;
+    const float globalVCenter = rect.gpu.minV + (float)(localY - LM_PAD) * rect.gpu.luxelSize;
     return GlobalCenterToStitchedIndex(stitchedMinU,
                                        stitchedMinV,
                                        stitchedLuxelSize,
@@ -2499,8 +2774,8 @@ static bool RectLocalSubsampleToStitchedIndex(const FaceRect& rect,
     }
 
     const float invScale = 1.0f / (float)sampleScale;
-    const float globalUCenter = rect.gpu.minU + ((float)(localX - LM_PAD) + ((float)subX + 0.5f) * invScale) * rect.gpu.luxelSize;
-    const float globalVCenter = rect.gpu.minV + ((float)(localY - LM_PAD) + ((float)subY + 0.5f) * invScale) * rect.gpu.luxelSize;
+    const float globalUCenter = rect.gpu.minU + ((float)(localX - LM_PAD) - 0.5f + ((float)subX + 0.5f) * invScale) * rect.gpu.luxelSize;
+    const float globalVCenter = rect.gpu.minV + ((float)(localY - LM_PAD) - 0.5f + ((float)subY + 0.5f) * invScale) * rect.gpu.luxelSize;
     return GlobalCenterToStitchedIndex(stitchedMinU,
                                        stitchedMinV,
                                        stitchedLuxelSize,
@@ -2760,9 +3035,9 @@ static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
         for (int i = 0; i <= radius; ++i) kernel[i] /= sum;
     }
 
-    const auto rectsBySourcePoly = GroupRectsBySourcePoly(rects);
-    for (const auto& [sourcePolyIndex, rectGroup] : rectsBySourcePoly) {
-        (void)sourcePolyIndex;
+    const auto rectsBySourceSurface = GroupRectsBySourceSurface(rects);
+    for (const auto& [sourceSurfaceKey, rectGroup] : rectsBySourceSurface) {
+        (void)sourceSurfaceKey;
         StitchedSourceFaceCanvas canvas;
         if (!BuildStitchedSourceFaceCanvas(rects, pages, validMasks, rectGroup, &canvas)) {
             continue;
@@ -2771,17 +3046,22 @@ static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
         const int W = canvas.width;
         const int H = canvas.height;
         const size_t pixelCount = (size_t)W * (size_t)H;
+        const std::vector<uint8_t> originalValid = canvas.valid;
+        std::vector<uint8_t> paddedValid = canvas.valid;
+        std::vector<float> paddedR = canvas.pixelsR;
+        std::vector<float> paddedG = canvas.pixelsG;
+        std::vector<float> paddedB = canvas.pixelsB;
+        FloodFillTransparentCanvas(W, H, paddedValid, paddedR, paddedG, paddedB);
         std::vector<float> tempR(pixelCount, 0.0f);
         std::vector<float> tempG(pixelCount, 0.0f);
         std::vector<float> tempB(pixelCount, 0.0f);
 
-        // Blur in stitched source-face space so split bake patches filter as
-        // one continuous lightmap surface while still respecting polygon
-        // coverage via the stitched valid mask.
+        // Pre-padding restores a symmetric kernel at stitched face boundaries
+        // while the final write-back still only touches originally valid luxels.
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
                 const size_t idx = (size_t)y * (size_t)W + (size_t)x;
-                if (!canvas.valid[idx]) {
+                if (!paddedValid[idx]) {
                     continue;
                 }
 
@@ -2795,13 +3075,13 @@ static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
                         continue;
                     }
                     const size_t ni = (size_t)y * (size_t)W + (size_t)nx;
-                    if (!canvas.valid[ni]) {
+                    if (!paddedValid[ni]) {
                         continue;
                     }
                     const float w = kernel[abs(k)];
-                    sumR += w * canvas.pixelsR[ni];
-                    sumG += w * canvas.pixelsG[ni];
-                    sumB += w * canvas.pixelsB[ni];
+                    sumR += w * paddedR[ni];
+                    sumG += w * paddedG[ni];
+                    sumB += w * paddedB[ni];
                     wTotal += w;
                 }
                 if (wTotal > 0.0f) {
@@ -2815,7 +3095,7 @@ static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
                 const size_t idx = (size_t)y * (size_t)W + (size_t)x;
-                if (!canvas.valid[idx]) {
+                if (!originalValid[idx]) {
                     continue;
                 }
 
@@ -2829,7 +3109,7 @@ static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
                         continue;
                     }
                     const size_t ni = (size_t)ny * (size_t)W + (size_t)x;
-                    if (!canvas.valid[ni]) {
+                    if (!paddedValid[ni]) {
                         continue;
                     }
                     const float w = kernel[abs(k)];
@@ -2850,14 +3130,46 @@ static void ApplyLightmapAA(std::vector<LightmapPage>& pages,
     }
 }
 
-static void DilatePage(LightmapPage& page, std::vector<uint8_t>& valid) {
+static std::vector<int32_t> BuildDilateOwnerMap(const std::vector<FaceRect>& rects,
+                                                uint32_t pageIndex,
+                                                int width,
+                                                int height)
+{
+    std::vector<int32_t> ownerMap((size_t)width * (size_t)height, -1);
+    for (size_t rectIndex = 0; rectIndex < rects.size(); ++rectIndex) {
+        const FaceRect& rect = rects[rectIndex];
+        if (rect.page != pageIndex) {
+            continue;
+        }
+
+        const int minX = std::max(0, rect.gpu.x);
+        const int minY = std::max(0, rect.gpu.y);
+        const int maxX = std::min(width, rect.gpu.x + rect.gpu.w);
+        const int maxY = std::min(height, rect.gpu.y + rect.gpu.h);
+        for (int y = minY; y < maxY; ++y) {
+            for (int x = minX; x < maxX; ++x) {
+                ownerMap[(size_t)y * (size_t)width + (size_t)x] = (int32_t)rectIndex;
+            }
+        }
+    }
+    return ownerMap;
+}
+
+static void DilatePage(LightmapPage& page,
+                       std::vector<uint8_t>& valid,
+                       const std::vector<int32_t>& ownerMap) {
     const int W = page.width;
     const int H = page.height;
+    if (ownerMap.size() < (size_t)W * (size_t)H) {
+        return;
+    }
     for (int pass = 0; pass < DILATE_PASSES; ++pass) {
         std::vector<uint8_t> nextValid = valid;
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
                 const size_t idx = (size_t)y * W + x;
+                const int32_t owner = ownerMap[idx];
+                if (owner < 0) continue;
                 if (valid[idx]) continue;
                 float sr = 0.0f, sg = 0.0f, sb = 0.0f;
                 int n = 0;
@@ -2868,6 +3180,7 @@ static void DilatePage(LightmapPage& page, std::vector<uint8_t>& valid) {
                     const int ny = y + dy[k];
                     if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
                     const size_t ni = (size_t)ny * W + nx;
+                    if (ownerMap[ni] != owner) continue;
                     if (!valid[ni]) continue;
                     sr += page.pixels[ni * 4 + 0];
                     sg += page.pixels[ni * 4 + 1];
@@ -3692,10 +4005,13 @@ static float ComputeEdgeAwareNearHitT(const std::vector<Vector2>& poly2d,
                                       float ju,
                                       float jv)
 {
-    (void)poly2d;
-    (void)ju;
-    (void)jv;
-    return OCCLUSION_NEAR_TMIN;
+    if (poly2d.size() < 2 || EDGE_SEAM_GUARD_LUXELS <= 0.0f) {
+        return OCCLUSION_NEAR_TMIN;
+    }
+
+    const float edgeDist = MinDistToPolyEdge2D(poly2d, ju, jv);
+    const float edgeFactor = std::clamp(1.0f - edgeDist / std::max(1e-3f, EDGE_SEAM_GUARD_LUXELS), 0.0f, 1.0f);
+    return OCCLUSION_NEAR_TMIN + edgeFactor * (SHADOW_BIAS * 2.0f);
 }
 
 static float ComputeDirtAttenuation(float occlusionRatio, float dirtScale, float dirtGain) {
@@ -4396,8 +4712,8 @@ static void ShadeRectOversampled(const FaceRect& rect,
         for (int lx = 0; lx < rect.gpu.w; ++lx) {
             for (int sy = 0; sy < aaGrid; ++sy) {
                 for (int sx = 0; sx < aaGrid; ++sx) {
-                    const float ju = (lx - LM_PAD) + (sx + 0.5f) * invG;
-                    const float jv = (ly - LM_PAD) + (sy + 0.5f) * invG;
+                    const float ju = (lx - LM_PAD - 0.5f) + (sx + 0.5f) * invG;
+                    const float jv = (ly - LM_PAD - 0.5f) + (sy + 0.5f) * invG;
                     if (!InsidePoly2D(rect.poly2d, ju, jv)) {
                         continue;
                     }
@@ -4692,8 +5008,8 @@ static bool BuildComputeOversampledGroupRects(const std::vector<FaceRect>& rects
                                          hiCanvas.luxelSize,
                                          hiCanvas.width,
                                          hiCanvas.height,
-                                         rect.gpu.minU + hiCanvas.luxelSize * 0.5f,
-                                         rect.gpu.minV + hiCanvas.luxelSize * 0.5f,
+                                         rect.gpu.minU - 0.5f * rect.gpu.luxelSize + 0.5f * hiCanvas.luxelSize,
+                                         rect.gpu.minV - 0.5f * rect.gpu.luxelSize + 0.5f * hiCanvas.luxelSize,
                                          &hiX,
                                          &hiY)) {
             return false;
@@ -4735,9 +5051,9 @@ static bool BakeLightmapComputeStitchedExtra(const std::vector<FaceRect>& rects,
         return true;
     }
 
-    const auto rectsBySourcePoly = GroupRectsBySourcePoly(rects);
-    for (const auto& [sourcePolyIndex, rectGroup] : rectsBySourcePoly) {
-        (void)sourcePolyIndex;
+    const auto rectsBySourceSurface = GroupRectsBySourceSurface(rects);
+    for (const auto& [sourceSurfaceKey, rectGroup] : rectsBySourceSurface) {
+        (void)sourceSurfaceKey;
         StitchedSourceFaceCanvas hiCanvas;
         if (!InitializeStitchedSourceFaceCanvas(rects, rectGroup, g_aaGrid, &hiCanvas)) {
             continue;
@@ -4829,9 +5145,9 @@ static void BakeLightmapCPUStitchedExtra(const std::vector<PhongSourcePoly>& sou
     }
 
     static const std::vector<uint32_t> kEmptyLightIndices;
-    const auto rectsBySourcePoly = GroupRectsBySourcePoly(rects);
-    for (const auto& [sourcePolyIndex, rectGroup] : rectsBySourcePoly) {
-        (void)sourcePolyIndex;
+    const auto rectsBySourceSurface = GroupRectsBySourceSurface(rects);
+    for (const auto& [sourceSurfaceKey, rectGroup] : rectsBySourceSurface) {
+        (void)sourceSurfaceKey;
         StitchedSourceFaceCanvas hiCanvas;
         if (!InitializeStitchedSourceFaceCanvas(rects, rectGroup, g_aaGrid, &hiCanvas)) {
             continue;
@@ -5001,9 +5317,9 @@ static void ApplyLightmapSoften(std::vector<LightmapPage>& pages,
     if (soften <= 0) return;
     const int n = std::min(4, soften);  // kernel radius, 1..4
 
-    const auto rectsBySourcePoly = GroupRectsBySourcePoly(rects);
-    for (const auto& [sourcePolyIndex, rectGroup] : rectsBySourcePoly) {
-        (void)sourcePolyIndex;
+    const auto rectsBySourceSurface = GroupRectsBySourceSurface(rects);
+    for (const auto& [sourceSurfaceKey, rectGroup] : rectsBySourceSurface) {
+        (void)sourceSurfaceKey;
         StitchedSourceFaceCanvas canvas;
         if (!BuildStitchedSourceFaceCanvas(rects, pages, validMasks, rectGroup, &canvas)) {
             continue;
@@ -5097,8 +5413,7 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
     // key. 0 -> 1x1 (off), 2 -> 2x2, 4 -> 4x4 (historical default). This value
     // is consulted by BakeLightmapCPUPage, BuildCoverageMask, and every
     // coverage-threshold check in this TU via the file-scope g_aaGrid.
-    g_aaGrid = (settings.extraSamples <= 0) ? 1
-             : (settings.extraSamples <= 2) ? 2 : 4;
+    g_aaGrid = ComputeLightmapAAGridSize(settings.extraSamples);
     // CSG union is responsible for removing true internal/contact geometry.
     // The lightmap visibility heuristic can false-positive on valid clipped
     // faces; because compile_map emits render geometry from atlas.patches, do
@@ -5401,6 +5716,14 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         printf("[Lightmap] welded %zu direct seam-adjacent luxel pairs across split patches.\n", directSeamWelded);
         fflush(stdout);
     }
+    for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
+        LightmapPage& page = atlas.pages[pageIndex];
+        std::vector<uint8_t> valid = baseValidMasks[pageIndex];
+        const std::vector<int32_t> ownerMap = BuildDilateOwnerMap(rects, pageIndex, page.width, page.height);
+        printf("[Lightmap] page %u dilating direct borders\n", pageIndex);
+        fflush(stdout);
+        DilatePage(page, valid, ownerMap);
+    }
 
     std::vector<LightmapPage> bounceSourcePages = atlas.pages;
     Vector3 bounceAmbient = settings.ambientColor;
@@ -5462,11 +5785,35 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
                    indirectSeamWelded, bouncePass + 1);
             fflush(stdout);
         }
-
-        WeldSiblingPatchSeams(rects, bouncedPages, coverageMasks, luxelSize);
+        const size_t bounceSourceSeamWelded = WeldSiblingPatchSeams(rects, bouncedPages, coverageMasks, luxelSize);
+        if (bounceSourceSeamWelded > 0) {
+            printf("[Lightmap] welded %zu bounce %d source seam-adjacent luxel pairs across split patches.\n",
+                   bounceSourceSeamWelded, bouncePass + 1);
+            fflush(stdout);
+        }
+        for (uint32_t pageIndex = 0; pageIndex < bouncedPages.size(); ++pageIndex) {
+            LightmapPage& bouncedPage = bouncedPages[pageIndex];
+            std::vector<uint8_t> valid = baseValidMasks[pageIndex];
+            const std::vector<int32_t> ownerMap = BuildDilateOwnerMap(rects, pageIndex, bouncedPage.width, bouncedPage.height);
+            printf("[Lightmap] page %u bounce %d dilating source borders\n",
+                   pageIndex, bouncePass + 1);
+            fflush(stdout);
+            DilatePage(bouncedPage, valid, ownerMap);
+        }
 
         bounceSourcePages = std::move(bouncedPages);
         bounceAmbient = Vector3Zero();
+    }
+
+    if (settings.bounceCount > 0) {
+        for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
+            LightmapPage& page = atlas.pages[pageIndex];
+            std::vector<uint8_t> valid = baseValidMasks[pageIndex];
+            const std::vector<int32_t> ownerMap = BuildDilateOwnerMap(rects, pageIndex, page.width, page.height);
+            printf("[Lightmap] page %u dilating post-indirect borders\n", pageIndex);
+            fflush(stdout);
+            DilatePage(page, valid, ownerMap);
+        }
     }
 
     const float outputRangeScale = EffectiveOutputRangeScale(settings);
@@ -5480,44 +5827,35 @@ LightmapAtlas BakeLightmap(const std::vector<MapPolygon>& polys,
         ApplyLightmapOutputConditioning(atlas.pages, baseValidMasks, settings);
     }
 
+    const size_t crossPolySeamWelded = WeldCrossPolygonEdgeSeams(rects, atlas.pages, coverageMasks, luxelSize);
+    if (crossPolySeamWelded > 0) {
+        printf("[Lightmap] welded %zu cross-polygon boundary luxel pairs.\n", crossPolySeamWelded);
+        fflush(stdout);
+    }
+
     if (settings.lmAAScale > 0) {
         printf("[Lightmap] applying post-bake AA (scale=%d, sigma=%.1f)\n", settings.lmAAScale, settings.lmAAScale / 2.0f);
         fflush(stdout);
         ApplyLightmapAA(atlas.pages, rects, baseValidMasks, settings.lmAAScale);
-
-        // The stitched-face AA pass now filters across split patch seams for a
-        // source face directly, but keeping the final seam weld here still
-        // helps clamp any residual quantization mismatch between independently
-        // baked sibling patches before DilatePage propagates the edge values.
-        const size_t postAASeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks, luxelSize);
-        if (postAASeamWelded > 0) {
-            printf("[Lightmap] welded %zu post-AA seam-adjacent luxel pairs across split patches.\n", postAASeamWelded);
-            fflush(stdout);
-        }
     }
 
     // Post-process box-filter softening from the worldspawn `_soften` key. Runs
-    // after AA so the gaussian and the box filter compose cleanly, and re-welds
-    // sibling seams afterwards for the same residual quantization guard.
+    // after AA so the gaussian and the box filter compose cleanly before the
+    // final border dilation pass.
     if (settings.soften > 0) {
         printf("[Lightmap] applying _soften post-process (n=%d, %dx%d window)\n",
                settings.soften, settings.soften * 2 + 1, settings.soften * 2 + 1);
         fflush(stdout);
         ApplyLightmapSoften(atlas.pages, rects, baseValidMasks, settings.soften);
-
-        const size_t postSoftenSeamWelded = WeldSiblingPatchSeams(rects, atlas.pages, coverageMasks, luxelSize);
-        if (postSoftenSeamWelded > 0) {
-            printf("[Lightmap] welded %zu post-soften seam-adjacent luxel pairs across split patches.\n", postSoftenSeamWelded);
-            fflush(stdout);
-        }
     }
 
     for (uint32_t pageIndex = 0; pageIndex < atlas.pages.size(); ++pageIndex) {
         LightmapPage& page = atlas.pages[pageIndex];
         std::vector<uint8_t> valid = baseValidMasks[pageIndex];
-        printf("[Lightmap] page %u dilating borders\n", pageIndex);
+        const std::vector<int32_t> ownerMap = BuildDilateOwnerMap(rects, pageIndex, page.width, page.height);
+        printf("[Lightmap] page %u dilating final borders\n", pageIndex);
         fflush(stdout);
-        DilatePage(page, valid);
+        DilatePage(page, valid, ownerMap);
         printf("[Lightmap] page %u complete\n", pageIndex);
         fflush(stdout);
     }

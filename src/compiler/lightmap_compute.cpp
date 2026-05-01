@@ -1,4 +1,5 @@
 #include "lightmap_compute.h"
+#include "lightmap_constants.h"
 
 #include "sokol_gfx.h"
 #include "sokol_log.h"
@@ -1231,10 +1232,7 @@ bool BakeLightmapCompute(const std::vector<LightmapComputeFaceRect>& rects,
             params.skylight_angle_scale = settings.sunlightAngleScale;
             params.sky_trace_distance = skyTraceDistance;
             params.sunlight_nosky = settings.sunlightNoSky;
-            // Mirror the CPU-side aaGrid derivation from settings.extraSamples.
-            // 0 -> 1x1 (off), 2 -> 2x2, 4 -> 4x4 (historical default).
-            params.extra_samples = (settings.extraSamples <= 0) ? 1
-                                 : (settings.extraSamples <= 2) ? 2 : 4;
+            params.aa_grid = ComputeLightmapAAGridSize(settings.extraSamples);
             params.oversampled_output = oversampledOutput ? 1 : 0;
             params.surface_sample_offset = settings.surfaceSampleOffset;
             params._pad_scalar0 = 0.0f;

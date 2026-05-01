@@ -139,6 +139,76 @@ bool TriangleIsUsable(const std::vector<Vector3>& poly,
     return Vector3DotProduct(cross, normal) > 0.0f;
 }
 
+bool PointInTriangle3D(const Vector3& p,
+                       const Vector3& a,
+                       const Vector3& b,
+                       const Vector3& c,
+                       float eps)
+{
+    const Vector3 v0 = Vector3Subtract(c, a);
+    const Vector3 v1 = Vector3Subtract(b, a);
+    const Vector3 v2 = Vector3Subtract(p, a);
+    const float dot00 = Vector3DotProduct(v0, v0);
+    const float dot01 = Vector3DotProduct(v0, v1);
+    const float dot02 = Vector3DotProduct(v0, v2);
+    const float dot11 = Vector3DotProduct(v1, v1);
+    const float dot12 = Vector3DotProduct(v1, v2);
+    const float denom = dot00 * dot11 - dot01 * dot01;
+    if (fabsf(denom) <= eps * eps) {
+        return false;
+    }
+
+    const float invDenom = 1.0f / denom;
+    const float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
+    const float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
+    return u >= -eps && v >= -eps && (u + v) <= 1.0f + eps;
+}
+
+bool TriangleContainsAnyOtherVertex(const std::vector<Vector3>& poly,
+                                    const std::vector<uint32_t>& remaining,
+                                    uint32_t ia,
+                                    uint32_t ib,
+                                    uint32_t ic,
+                                    float eps)
+{
+    const Vector3& a = poly[ia];
+    const Vector3& b = poly[ib];
+    const Vector3& c = poly[ic];
+    const float epsSq = eps * eps;
+    for (uint32_t index : remaining) {
+        if (index == ia || index == ib || index == ic) {
+            continue;
+        }
+        if (PointsNearlyEqual(poly[index], a, epsSq) ||
+            PointsNearlyEqual(poly[index], b, epsSq) ||
+            PointsNearlyEqual(poly[index], c, epsSq)) {
+            continue;
+        }
+        if (PointInTriangle3D(poly[index], a, b, c, eps)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+float DistSqPointSegment2D(const Vector2& p, const Vector2& a, const Vector2& b) {
+    const float abx = b.x - a.x;
+    const float aby = b.y - a.y;
+    const float abLenSq = abx * abx + aby * aby;
+    if (abLenSq <= 1e-8f) {
+        const float dx = p.x - a.x;
+        const float dy = p.y - a.y;
+        return dx * dx + dy * dy;
+    }
+
+    const float t = std::clamp(((p.x - a.x) * abx + (p.y - a.y) * aby) / abLenSq, 0.0f, 1.0f);
+    const float qx = a.x + abx * t;
+    const float qy = a.y + aby * t;
+    const float dx = p.x - qx;
+    const float dy = p.y - qy;
+    return dx * dx + dy * dy;
+}
+
 } // namespace
 
 void HealTJunctions(std::vector<MapPolygon>& polys, float eps) {
@@ -254,6 +324,9 @@ std::vector<uint32_t> TriangulatePolygonIndices(const std::vector<Vector3>& poly
             const uint32_t curr = remaining[i];
             const uint32_t next = remaining[(i + 1) % remaining.size()];
             if (!TriangleIsUsable(poly, prev, curr, next, normal, epsSq)) {
+                continue;
+            }
+            if (TriangleContainsAnyOtherVertex(poly, remaining, prev, curr, next, eps)) {
                 continue;
             }
 
@@ -407,17 +480,32 @@ void FaceBasis(const Vector3& n, Vector3& u, Vector3& v) {
 
 bool InsidePoly2D(const std::vector<Vector2>& poly, float px, float py) {
     const size_t n = poly.size();
+    if (n < 3) {
+        return false;
+    }
+
+    constexpr float kEdgeEpsilon = 1e-4f;
+    const Vector2 p{ px, py };
     for (size_t i = 0; i < n; ++i) {
         const size_t j = (i + 1) % n;
-        const float ex = poly[j].x - poly[i].x;
-        const float ey = poly[j].y - poly[i].y;
-        const float cx = px - poly[i].x;
-        const float cy = py - poly[i].y;
-        if (ex * cy - ey * cx < -1e-3f) {
-            return false;
+        if (DistSqPointSegment2D(p, poly[i], poly[j]) <= kEdgeEpsilon * kEdgeEpsilon) {
+            return true;
         }
     }
-    return true;
+
+    bool inside = false;
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        const Vector2& a = poly[i];
+        const Vector2& b = poly[j];
+        if ((a.y > py) == (b.y > py)) {
+            continue;
+        }
+        const float xIntersect = (b.x - a.x) * (py - a.y) / (b.y - a.y) + a.x;
+        if (px < xIntersect) {
+            inside = !inside;
+        }
+    }
+    return inside;
 }
 
 Vector2 ComputeFaceUV(const Vector3& vert,

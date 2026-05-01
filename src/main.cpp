@@ -18,22 +18,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
-#include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
-#include <algorithm>
-#include <cstdint>
-
-#define FONTSTASH_IMPLEMENTATION
-#include "fontstash.h"
-#define SOKOL_FONTSTASH_IMPL
-#include "sokol_fontstash.h"
-
-#define CLAY_IMPLEMENTATION
-#include "clay.h"
-#define SOKOL_CLAY_IMPL
-#include "renderers/sokol/sokol_clay.h"
 
 #include "math/wmath.h"
 #include "platform/platform.h"
@@ -45,34 +32,10 @@
 #include "physx/collision_data.h"
 #include "physx/physics.h"
 #include "player/player.h"
+#include "ui/ui_menu.h"
 
 #include "Jolt/Jolt.h"
 #include "Jolt/Physics/Body/BodyInterface.h"
-
-namespace fs = std::filesystem;
-
-static constexpr const char* kMapDirectory = "../../assets/maps";
-static constexpr const char* kMenuFontPath = "../../lib/clay/examples/sokol-video-demo/resources/Roboto-Regular.ttf";
-
-enum ClayFontId {
-    FONT_ID_UI_16,
-    FONT_ID_UI_24,
-    FONT_ID_UI_40,
-    FONT_ID_COUNT
-};
-
-enum class AppMode {
-    MainMenu,
-    Playing,
-};
-
-struct MapEntry {
-    std::string name;
-    std::string bspPath;
-};
-
-static sclay_font_t g_clayFonts[FONT_ID_COUNT] = {};
-static void* g_clayMemory = nullptr;
 
 // ---------------------------------------------------------------------------
 //  State
@@ -91,7 +54,6 @@ static struct {
     bool                physicsReady = false;
 
     std::vector<MapEntry> availableMaps;
-    int                   requestedMapIndex = -1;
     std::string           menuStatus;
     std::string           currentMapName;
 } G;
@@ -109,170 +71,6 @@ static const char* GfxBackendName(sg_backend backend) {
         case SG_BACKEND_DUMMY:           return "DUMMY";
         default:                         return "UNKNOWN";
     }
-}
-
-static Clay_String ClayString(const std::string& str) {
-    return Clay_String{ false, (int32_t)str.size(), str.c_str() };
-}
-
-static void HandleClayError(Clay_ErrorData errorData) {
-    printf("[Clay] %.*s\n", errorData.errorText.length, errorData.errorText.chars);
-}
-
-static void RefreshMapList() {
-    G.availableMaps.clear();
-    G.menuStatus.clear();
-
-    std::error_code ec;
-    if (!fs::exists(kMapDirectory, ec)) {
-        G.menuStatus = "Map directory not found: assets/maps";
-        return;
-    }
-
-    for (const fs::directory_entry& entry : fs::directory_iterator(kMapDirectory, ec)) {
-        if (ec || !entry.is_regular_file()) {
-            continue;
-        }
-        if (entry.path().extension() != ".bsp") {
-            continue;
-        }
-
-        G.availableMaps.push_back({
-            entry.path().stem().string(),
-            entry.path().string()
-        });
-    }
-
-    std::sort(G.availableMaps.begin(), G.availableMaps.end(), [](const MapEntry& a, const MapEntry& b) {
-        return a.name < b.name;
-    });
-
-    if (G.availableMaps.empty()) {
-        G.menuStatus = "No compiled .bsp maps found in assets/maps.";
-    }
-}
-
-static void HandleMapButtonInteraction(Clay_ElementId, Clay_PointerData pointerData, void* userData) {
-    if (pointerData.state != CLAY_POINTER_DATA_PRESSED_THIS_FRAME) {
-        return;
-    }
-    G.requestedMapIndex = (int)(intptr_t)userData;
-}
-
-static Clay_RenderCommandArray BuildMainMenuLayout() {
-    const Clay_Color bg = { 18, 20, 24, 255 };
-    const Clay_Color panel = { 32, 36, 44, 255 };
-    const Clay_Color panelBorder = { 76, 84, 98, 255 };
-    const Clay_Color button = { 56, 65, 82, 255 };
-    const Clay_Color buttonHover = { 84, 98, 126, 255 };
-    const Clay_Color text = { 235, 238, 244, 255 };
-    const Clay_Color muted = { 164, 171, 184, 255 };
-    const Clay_Color accent = { 123, 196, 255, 255 };
-
-    Clay_BeginLayout();
-
-    CLAY(CLAY_ID("Root"), {
-        .backgroundColor = bg,
-        .layout = {
-            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
-            .padding = CLAY_PADDING_ALL(32),
-            .childAlignment = { CLAY_ALIGN_X_CENTER, CLAY_ALIGN_Y_CENTER },
-        }
-    }) {
-        CLAY(CLAY_ID("Panel"), {
-            .backgroundColor = panel,
-            .cornerRadius = CLAY_CORNER_RADIUS(18),
-            .border = {
-                .width = CLAY_BORDER_ALL(2),
-                .color = panelBorder,
-            },
-            .layout = {
-                .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                .childGap = 18,
-                .padding = CLAY_PADDING_ALL(24),
-                .sizing = {
-                    CLAY_SIZING_FIXED(520),
-                    CLAY_SIZING_FIT(0, 720)
-                },
-            }
-        }) {
-            CLAY(CLAY_ID("Header"), {
-                .layout = {
-                    .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                    .childGap = 8,
-                }
-            }) {
-                CLAY_TEXT(CLAY_STRING("Warped"), CLAY_TEXT_CONFIG({
-                    .fontId = FONT_ID_UI_40,
-                    .fontSize = 40,
-                    .textColor = accent,
-                }));
-                CLAY_TEXT(CLAY_STRING("Select a map to start playing."), CLAY_TEXT_CONFIG({
-                    .fontId = FONT_ID_UI_16,
-                    .fontSize = 18,
-                    .textColor = muted,
-                }));
-            }
-
-            if (!G.menuStatus.empty()) {
-                CLAY(CLAY_ID("Status"), {
-                    .backgroundColor = { 44, 49, 58, 255 },
-                    .cornerRadius = CLAY_CORNER_RADIUS(12),
-                    .layout = {
-                        .padding = CLAY_PADDING_ALL(14),
-                        .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0, 0) },
-                    }
-                }) {
-                    CLAY_TEXT(ClayString(G.menuStatus), CLAY_TEXT_CONFIG({
-                        .fontId = FONT_ID_UI_16,
-                        .fontSize = 16,
-                        .textColor = text,
-                    }));
-                }
-            }
-
-            CLAY(CLAY_ID("MapList"), {
-                .layout = {
-                    .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                    .childGap = 12,
-                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0, 560) },
-                }
-            }) {
-                for (int i = 0; i < (int)G.availableMaps.size(); ++i) {
-                    const MapEntry& map = G.availableMaps[i];
-
-                    CLAY(CLAY_IDI("MapButton", i), {
-                        .backgroundColor = Clay_Hovered() ? buttonHover : button,
-                        .cornerRadius = CLAY_CORNER_RADIUS(12),
-                        .border = {
-                            .width = CLAY_BORDER_ALL(1),
-                            .color = Clay_Hovered() ? accent : panelBorder,
-                        },
-                        .layout = {
-                            .padding = CLAY_PADDING_ALL(16),
-                            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(58) },
-                            .childAlignment = { CLAY_ALIGN_X_LEFT, CLAY_ALIGN_Y_CENTER },
-                        }
-                    }) {
-                        Clay_OnHover(HandleMapButtonInteraction, (void*)(intptr_t)i);
-                        CLAY_TEXT(ClayString(map.name), CLAY_TEXT_CONFIG({
-                            .fontId = FONT_ID_UI_24,
-                            .fontSize = 24,
-                            .textColor = text,
-                        }));
-                    }
-                }
-            }
-
-            CLAY_TEXT(CLAY_STRING("Maps are loaded from assets/maps/*.bsp"), CLAY_TEXT_CONFIG({
-                .fontId = FONT_ID_UI_16,
-                .fontSize = 14,
-                .textColor = muted,
-            }));
-        }
-    }
-
-    return Clay_EndLayout();
 }
 
 static bool LoadSelectedMap(const MapEntry& map) {
@@ -371,24 +169,14 @@ static void init(void) {
     sdtx_setup(&dtx);
 
     Debug_Init();
-    sclay_setup();
-
-    uint64_t clayMemorySize = Clay_MinMemorySize();
-    g_clayMemory = malloc(clayMemorySize);
-    Clay_Arena clayArena = Clay_CreateArenaWithCapacityAndMemory(clayMemorySize, g_clayMemory);
-    Clay_Initialize(clayArena, (Clay_Dimensions){ (float)sapp_width(), (float)sapp_height() }, (Clay_ErrorHandler){ HandleClayError, nullptr });
-
-    g_clayFonts[FONT_ID_UI_16] = sclay_add_font(kMenuFontPath);
-    g_clayFonts[FONT_ID_UI_24] = g_clayFonts[FONT_ID_UI_16];
-    g_clayFonts[FONT_ID_UI_40] = g_clayFonts[FONT_ID_UI_16];
-    Clay_SetMeasureTextFunction(sclay_measure_text, &g_clayFonts);
+    UI_Init(sapp_width(), sapp_height());
 
     Renderer_Init();
     InitTextureManager(G.texMgr);
     Input_Init();
     Input_LockMouse(false);
 
-    RefreshMapList();
+    UI_RefreshMapList(G.availableMaps, G.menuStatus);
 
     G.menuPassAction = {};
     G.menuPassAction.colors[0].load_action = SG_LOADACTION_CLEAR;
@@ -424,12 +212,11 @@ static void frame(void) {
             sapp_request_quit();
         }
 
-        G.requestedMapIndex = -1;
-        sclay_new_frame();
-        Clay_RenderCommandArray renderCommands = BuildMainMenuLayout();
+        UI_NewFrame();
+        int requestedMapIndex = UI_UpdateMenu(G.availableMaps, G.menuStatus);
 
-        if (G.requestedMapIndex >= 0 && G.requestedMapIndex < (int)G.availableMaps.size()) {
-            LoadSelectedMap(G.availableMaps[G.requestedMapIndex]);
+        if (requestedMapIndex >= 0 && requestedMapIndex < (int)G.availableMaps.size()) {
+            LoadSelectedMap(G.availableMaps[requestedMapIndex]);
             accumulator = 0.0;
             if (G.mode == AppMode::Playing) {
                 return;
@@ -446,7 +233,7 @@ static void frame(void) {
             sgl_load_identity();
             sgl_matrix_mode_modelview();
             sgl_load_identity();
-            sclay_render(renderCommands, g_clayFonts);
+            UI_RenderMenu();
             sgl_draw();
         sg_end_pass();
         sg_commit();
@@ -561,7 +348,7 @@ static void frame(void) {
 // ---------------------------------------------------------------------------
 static void event(const sapp_event* ev) {
     Input_HandleEvent(ev);
-    sclay_handle_event(ev);
+    UI_HandleEvent(ev);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,13 +363,10 @@ static void cleanup(void) {
     }
     UnloadAllTextures(G.texMgr);
     Renderer_Shutdown();
-    sclay_shutdown();
+    UI_Shutdown();
     Debug_Shutdown();
     sdtx_shutdown();
     sg_shutdown();
-
-    free(g_clayMemory);
-    g_clayMemory = nullptr;
 }
 
 // ---------------------------------------------------------------------------
