@@ -80,28 +80,3 @@ On Linux and MacOS
 ``` bash
 ./compile_map ../../assets/maps/example.map ../../assets/maps/example.bsp
 ```
-
-## Lightmap regression harness
-
-The CPU reference baker can be regression-tested against a small fixture set:
-
-```bash
-python3 tools/lightmap_regression.py record
-python3 tools/lightmap_regression.py verify
-```
-
-By default this bakes:
-
-- `assets/maps/reg_direct_point.map`
-- `assets/maps/reg_extra.map`
-- `assets/maps/reg_range.map`
-- `assets/maps/reg_maxlight.map`
-- `assets/maps/reg_gamma.map`
-- `assets/maps/reg_soften.map`
-- `assets/maps/reg_surface_direct.map`
-- `assets/maps/reg_surface_bounce.map`
-- `assets/maps/reg_sun_sky.map`
-
-through `build_mc/bin/compile_map`, forcing the CPU path with
-`WARPED_LIGHTMAP_FORCE_CPU=1`, then compares the baked `LUMP_LIGHTMAP` pages
-against `tools/lightmap_regression_baseline.json`.
