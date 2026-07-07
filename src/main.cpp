@@ -34,8 +34,7 @@
 #include "player/player.h"
 #include "ui/ui_menu.h"
 
-#include "Jolt/Jolt.h"
-#include "Jolt/Physics/Body/BodyInterface.h"
+#include "box3d/box3d.h"
 
 // ---------------------------------------------------------------------------
 //  State
@@ -44,7 +43,6 @@ static struct {
     TextureManager      texMgr;
     MapModel            mapModel;
     Player              player;
-    JPH::BodyInterface* bodyInterface = nullptr;
 
     sg_pass_action      menuPassAction;
     sg_pass_action      gamePassAction;
@@ -87,7 +85,6 @@ static bool LoadSelectedMap(const MapEntry& map) {
 
     if (!G.physicsReady) {
         InitPhysicsSystem();
-        G.bodyInterface = &GetBodyInterface();
         G.physicsReady = true;
     }
 
@@ -98,10 +95,10 @@ static bool LoadSelectedMap(const MapEntry& map) {
     InitPlayer(&G.player, spawn, (Vector3){0, 0, 0}, (Vector3){0, 1, 0}, 90.0f);
     G.mapModel = Renderer_UploadBSP(bsp, G.texMgr);
 
-    BuildMapPhysics(bsp.hulls, bsp.entities, G.bodyInterface);
-    SpawnDebugPhysObj(G.bodyInterface);
-    InitJoltCharacter(&G.player, s_physics_system);
-    RespawnPlayer(&G.player, s_physics_system, start.position, start.yaw, start.pitch);
+    BuildMapPhysics(bsp.hulls, bsp.entities);
+    SpawnDebugPhysObj();
+    InitPlayerPhysics(&G.player);
+    RespawnPlayer(&G.player, start.position, start.yaw, start.pitch);
 
     G.currentMapName = map.name;
     G.menuStatus.clear();
@@ -250,12 +247,12 @@ static void frame(void) {
         if (Input_KeyPressed(WKEY_TAB))    sapp_toggle_fullscreen();
         if (Input_KeyPressed(WKEY_ESCAPE)) sapp_request_quit();
 
-        UpdatePhysicsSystem(deltaTime, G.bodyInterface);
+        UpdatePhysicsSystem(deltaTime);
 
         if (DEVMODE) {
-            UpdatePlayer(&G.player, s_physics_system, deltaTime);
+            UpdatePlayer(&G.player, deltaTime);
         } else {
-            UpdatePlayerMove(&G.player, s_physics_system, deltaTime);
+            UpdatePlayerMove(&G.player, deltaTime);
         }
 
         Input_EndFrame();
@@ -278,9 +275,9 @@ static void frame(void) {
     Debug_NewFrame();
     Debug_SetCamera(proj, view);
 
-    if (G.bodyInterface && G.bodyInterface->IsActive(debugSphereID)) {
-        JPH::RVec3 pos = G.bodyInterface->GetCenterOfMassPosition(debugSphereID);
-        Debug_Sphere((Vector3){(float)pos.GetX(), (float)pos.GetY(), (float)pos.GetZ()},
+    if (G.physicsReady && b3Body_IsValid(debugSphereID) && b3Body_IsAwake(debugSphereID)) {
+        b3Pos pos = b3Body_GetPosition(debugSphereID);
+        Debug_Sphere((Vector3){(float)pos.x, (float)pos.y, (float)pos.z},
                      10.0f, WCOLOR(230, 41, 55, 255));
     }
     DebugDrawPlayerAABB(&G.player);

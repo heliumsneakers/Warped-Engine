@@ -114,7 +114,7 @@ static std::vector<Vector3> BuildBrushGeometry(const Brush &brush) {
 
         // 4) Append these face vertices to 'finalPoints'
         //    (This means every face's polygon points end up in one big array.)
-        //    That can be used to build a convex hull in Jolt
+        //    That can be used to build a convex hull in Box3D
         for (auto &v : polys[i]) {
             finalPoints.push_back(v);
         }

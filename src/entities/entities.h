@@ -2,13 +2,7 @@
 
 #include "../math/wmath.h"
 #include "../utils/map_types.h"
-#include "Jolt/Jolt.h"
-#include "Jolt/Physics/Body/BodyID.h"
-
-namespace JPH {
-class PhysicsSystem;
-class Shape;
-}
+#include "box3d/box3d.h"
 
 namespace GameplayEntities {
 
@@ -28,18 +22,16 @@ void Reset();
 
 void RegisterPointEntities(const std::vector<Entity>& entities);
 
-void RegisterBrushEntity(const Entity& entity, int entityIndex, JPH::BodyID bodyID);
+void RegisterBrushEntity(const Entity& entity, int entityIndex, b3BodyId bodyId);
 
-PlayerEffectResult ApplyPlayerEffects(JPH::PhysicsSystem* physicsSystem,
-                                      const JPH::Shape* playerShape,
+PlayerEffectResult ApplyPlayerEffects(const b3ShapeProxy* playerProxy,
                                       Vector3 playerCenter,
                                       Vector3 groundNormal,
                                       bool isGrounded,
                                       float deltaTime,
                                       Vector3& inOutVelocity);
 
-TriggerTeleportResult QueryPlayerTeleportTrigger(JPH::PhysicsSystem* physicsSystem,
-                                                 const JPH::Shape* playerShape,
+TriggerTeleportResult QueryPlayerTeleportTrigger(const b3ShapeProxy* playerProxy,
                                                  Vector3 playerCenter,
                                                  float deltaTime);
 

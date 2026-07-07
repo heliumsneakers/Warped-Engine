@@ -8,7 +8,7 @@
 #define SOKOL_GLCORE
 #endif
 
-// sokol_clay.h requires: sokol_gl.h → sokol_fontstash.h → sokol_app.h → clay.h → sokol_clay.h
+// sokol_clay.h requires: sokol_gl.h,  sokol_fontstash.h, sokol_app.h, clay.h, sokol_clay.h
 #include "sokol_app.h"
 #include "sokol_gfx.h"
 #include "sokol_gl.h"
@@ -184,8 +184,6 @@ static Clay_RenderCommandArray BuildMainMenuLayout(
 
     return Clay_EndLayout();
 }
-
-// ---------------------------------------------------------------------------
 
 void UI_Init(int width, int height) {
     sclay_setup();

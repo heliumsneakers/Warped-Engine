@@ -4,14 +4,7 @@
 #include "../compiler/map_parser.h"
 #include "../physx/physics.h"
 
-#include "Jolt/Jolt.h"
-#include "Jolt/Math/Vec3.h"
-#include "Jolt/Physics/Collision/BackFaceMode.h"
-#include "Jolt/Physics/Collision/CollideShape.h"
-#include "Jolt/Physics/Collision/CollisionCollectorImpl.h"
-#include "Jolt/Physics/Collision/ObjectLayer.h"
-#include "Jolt/Physics/Collision/Shape/Shape.h"
-#include "Jolt/Physics/PhysicsSystem.h"
+#include "box3d/box3d.h"
 
 #include <algorithm>
 #include <cmath>
@@ -34,9 +27,12 @@ static constexpr Vector3 kDefaultDirectionTB = { 0.0f, 0.0f, 1.0f };
 static constexpr float kBoostTouchDistance = 0.1f;
 static constexpr float kTriggerTouchDistance = 0.1f;
 
+// Bodies are tracked by their packed 64bit id so they can key hash containers.
+using BodyKey = uint64_t;
+
 struct BoostVolume {
     int entityIndex = -1;
-    JPH::BodyID bodyID;
+    BodyKey bodyKey = 0;
     Vector3 direction = { 0.0f, 1.0f, 0.0f };
     float boostAmount = (float)kDefaultBoostAmount;
     float acceleration = (float)kDefaultAcceleration;
@@ -56,7 +52,7 @@ struct CheckPoint {
 
 struct TeleportTrigger {
     int entityIndex = -1;
-    JPH::BodyID bodyID;
+    BodyKey bodyKey = 0;
     std::string target;
     bool triggerOnce = false;
     bool enabled = true;
@@ -66,40 +62,46 @@ struct TeleportTrigger {
 };
 
 std::vector<BoostVolume> sBoostVolumes;
-std::unordered_map<JPH::BodyID, size_t> sBoostVolumesByBody;
-std::unordered_map<JPH::BodyID, ActiveBoostState> sActivePlayerBoosts;
+std::unordered_map<BodyKey, size_t> sBoostVolumesByBody;
+std::unordered_map<BodyKey, ActiveBoostState> sActivePlayerBoosts;
 std::vector<CheckPoint> sCheckPoints;
 std::unordered_map<std::string, size_t> sCheckPointsByTargetname;
 std::vector<TeleportTrigger> sTeleportTriggers;
-std::unordered_map<JPH::BodyID, size_t> sTeleportTriggersByBody;
-std::unordered_set<JPH::BodyID> sActivePlayerTriggerContacts;
+std::unordered_map<BodyKey, size_t> sTeleportTriggersByBody;
+std::unordered_set<BodyKey> sActivePlayerTriggerContacts;
 double sGameplayTime = 0.0;
 
-class BoostTouchLayerFilter final : public JPH::ObjectLayerFilter
-{
-public:
-    bool ShouldCollide(JPH::ObjectLayer inLayer) const override
-    {
-        return inLayer == Layers::SENSOR;
-    }
+struct SensorOverlapContext {
+    std::vector<BodyKey> touchedBodies;
 };
 
-BoostTouchLayerFilter sBoostTouchLayerFilter;
-
-class SensorTouchLayerFilter final : public JPH::ObjectLayerFilter
+static bool CollectSensorOverlaps(b3ShapeId shapeId, void* context)
 {
-public:
-    bool ShouldCollide(JPH::ObjectLayer inLayer) const override
-    {
-        return inLayer == Layers::SENSOR;
-    }
-};
+    auto* overlapContext = (SensorOverlapContext*)context;
+    overlapContext->touchedBodies.push_back(b3StoreBodyId(b3Shape_GetBody(shapeId)));
+    return true;
+}
 
-SensorTouchLayerFilter sSensorTouchLayerFilter;
-
-static inline JPH::RVec3 ToJoltRVec3(Vector3 v)
+// Overlap the player shape (inflated by touchDistance via the proxy radius)
+// against sensor shapes and return the packed body ids of every touched sensor.
+static std::vector<BodyKey> QueryTouchedSensors(const b3ShapeProxy* playerProxy,
+                                                Vector3 playerCenter,
+                                                float touchDistance)
 {
-    return JPH::RVec3(v.x, v.y, v.z);
+    b3ShapeProxy proxy = { playerProxy->points, playerProxy->count, playerProxy->radius + touchDistance };
+
+    b3QueryFilter filter = b3DefaultQueryFilter();
+    filter.categoryBits = Layers::MOVING;
+    filter.maskBits = Layers::SENSOR;
+
+    SensorOverlapContext context;
+    b3World_OverlapShape(g_physicsWorld,
+                         b3Pos{ playerCenter.x, playerCenter.y, playerCenter.z },
+                         &proxy,
+                         filter,
+                         CollectSensorOverlaps,
+                         &context);
+    return context.touchedBodies;
 }
 
 static bool ParseVec3Property(const Entity& entity, const char* key, Vector3& out)
@@ -265,7 +267,7 @@ void RegisterPointEntities(const std::vector<Entity>& entities)
     }
 }
 
-void RegisterBrushEntity(const Entity& entity, int entityIndex, JPH::BodyID bodyID)
+void RegisterBrushEntity(const Entity& entity, int entityIndex, b3BodyId bodyId)
 {
     auto classnameIt = entity.properties.find("classname");
     if (classnameIt == entity.properties.end()) {
@@ -273,22 +275,23 @@ void RegisterBrushEntity(const Entity& entity, int entityIndex, JPH::BodyID body
     }
 
     const std::string& classname = classnameIt->second;
+    const BodyKey bodyKey = b3StoreBodyId(bodyId);
 
     if (classname == "trigger_boost" || classname == "func_boost") {
         BoostVolume boostVolume;
         boostVolume.entityIndex = entityIndex;
-        boostVolume.bodyID = bodyID;
+        boostVolume.bodyKey = bodyKey;
         boostVolume.direction = ParseBoostDirection(entity);
         boostVolume.boostAmount = (float)ParseClampedIntProperty(entity, "boost", kDefaultBoostAmount, kBoostAmountMin, kBoostAmountMax);
         boostVolume.acceleration = (float)ParseClampedIntProperty(entity, "acceleration", kDefaultAcceleration, kAccelerationMin, kAccelerationMax);
 
-        sBoostVolumesByBody[bodyID] = sBoostVolumes.size();
+        sBoostVolumesByBody[bodyKey] = sBoostVolumes.size();
         sBoostVolumes.push_back(boostVolume);
 
-        printf("[entities] registered %s entity=%d body=%u boost=%.1f accel=%.1f dir=(%.3f %.3f %.3f)\n",
+        printf("[entities] registered %s entity=%d body=%llu boost=%.1f accel=%.1f dir=(%.3f %.3f %.3f)\n",
                classname.c_str(),
                entityIndex,
-               bodyID.GetIndexAndSequenceNumber(),
+               (unsigned long long)bodyKey,
                boostVolume.boostAmount,
                boostVolume.acceleration,
                boostVolume.direction.x,
@@ -310,27 +313,26 @@ void RegisterBrushEntity(const Entity& entity, int entityIndex, JPH::BodyID body
 
         TeleportTrigger trigger;
         trigger.entityIndex = entityIndex;
-        trigger.bodyID = bodyID;
+        trigger.bodyKey = bodyKey;
         trigger.target = target;
         trigger.triggerOnce = classname == "trigger_once";
         trigger.enabled = (spawnflags & 1) == 0;
         trigger.wait = trigger.triggerOnce ? 0.0f : ParseFloatProperty(entity, "wait", 1.0f, 0.0f);
 
-        sTeleportTriggersByBody[bodyID] = sTeleportTriggers.size();
+        sTeleportTriggersByBody[bodyKey] = sTeleportTriggers.size();
         sTeleportTriggers.push_back(trigger);
 
-        printf("[entities] registered %s entity=%d body=%u target='%s' enabled=%d wait=%.2f\n",
+        printf("[entities] registered %s entity=%d body=%llu target='%s' enabled=%d wait=%.2f\n",
                classname.c_str(),
                entityIndex,
-               bodyID.GetIndexAndSequenceNumber(),
+               (unsigned long long)bodyKey,
                target.c_str(),
                trigger.enabled ? 1 : 0,
                trigger.wait);
     }
 }
 
-PlayerEffectResult ApplyPlayerEffects(JPH::PhysicsSystem* physicsSystem,
-                                      const JPH::Shape* playerShape,
+PlayerEffectResult ApplyPlayerEffects(const b3ShapeProxy* playerProxy,
                                       Vector3 playerCenter,
                                       Vector3 groundNormal,
                                       bool isGrounded,
@@ -339,51 +341,36 @@ PlayerEffectResult ApplyPlayerEffects(JPH::PhysicsSystem* physicsSystem,
 {
     PlayerEffectResult result;
 
-    if (physicsSystem == nullptr || playerShape == nullptr || sBoostVolumes.empty()) {
+    if (!b3World_IsValid(g_physicsWorld) || playerProxy == nullptr || sBoostVolumes.empty()) {
         return result;
     }
 
-    JPH::CollideShapeSettings settings;
-    settings.mBackFaceMode = JPH::EBackFaceMode::CollideWithBackFaces;
-    settings.mMaxSeparationDistance = kBoostTouchDistance;
+    const std::vector<BodyKey> touched = QueryTouchedSensors(playerProxy, playerCenter, kBoostTouchDistance);
 
-    JPH::ClosestHitPerBodyCollisionCollector<JPH::CollideShapeCollector> collector;
-    physicsSystem->GetNarrowPhaseQuery().CollideShape(
-        playerShape,
-        JPH::Vec3::sReplicate(1.0f),
-        JPH::RMat44::sTranslation(ToJoltRVec3(playerCenter)),
-        settings,
-        JPH::RVec3::sZero(),
-        collector,
-        physicsSystem->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
-        sBoostTouchLayerFilter
-    );
-
-    if (!collector.HadHit()) {
+    if (touched.empty()) {
         sActivePlayerBoosts.clear();
         return result;
     }
 
-    collector.Sort();
     std::unordered_set<int> appliedEntities;
-    std::unordered_set<JPH::BodyID> touchedBoostBodies;
+    std::unordered_set<BodyKey> touchedBoostBodies;
     const Vector3 entryVelocity = inOutVelocity;
 
-    for (const JPH::CollideShapeResult& hit : collector.mHits) {
-        auto boostIt = sBoostVolumesByBody.find(hit.mBodyID2);
+    for (BodyKey bodyKey : touched) {
+        auto boostIt = sBoostVolumesByBody.find(bodyKey);
         if (boostIt == sBoostVolumesByBody.end()) {
             continue;
         }
 
         const BoostVolume& boostVolume = sBoostVolumes[boostIt->second];
-        touchedBoostBodies.insert(hit.mBodyID2);
+        touchedBoostBodies.insert(bodyKey);
 
-        auto activeIt = sActivePlayerBoosts.find(hit.mBodyID2);
+        auto activeIt = sActivePlayerBoosts.find(bodyKey);
         if (activeIt == sActivePlayerBoosts.end()) {
             ActiveBoostState activeBoostState;
             activeBoostState.targetAlongDirection =
                 Vector3DotProduct(entryVelocity, boostVolume.direction) + boostVolume.boostAmount;
-            activeIt = sActivePlayerBoosts.emplace(hit.mBodyID2, activeBoostState).first;
+            activeIt = sActivePlayerBoosts.emplace(bodyKey, activeBoostState).first;
         }
 
         if (!appliedEntities.insert(boostVolume.entityIndex).second) {
@@ -411,56 +398,40 @@ PlayerEffectResult ApplyPlayerEffects(JPH::PhysicsSystem* physicsSystem,
     return result;
 }
 
-TriggerTeleportResult QueryPlayerTeleportTrigger(JPH::PhysicsSystem* physicsSystem,
-                                                 const JPH::Shape* playerShape,
+TriggerTeleportResult QueryPlayerTeleportTrigger(const b3ShapeProxy* playerProxy,
                                                  Vector3 playerCenter,
                                                  float deltaTime)
 {
     TriggerTeleportResult result;
     sGameplayTime += deltaTime;
 
-    if (physicsSystem == nullptr || playerShape == nullptr || sTeleportTriggers.empty()) {
+    if (!b3World_IsValid(g_physicsWorld) || playerProxy == nullptr || sTeleportTriggers.empty()) {
         sActivePlayerTriggerContacts.clear();
         return result;
     }
 
-    JPH::CollideShapeSettings settings;
-    settings.mBackFaceMode = JPH::EBackFaceMode::CollideWithBackFaces;
-    settings.mMaxSeparationDistance = kTriggerTouchDistance;
+    const std::vector<BodyKey> touched = QueryTouchedSensors(playerProxy, playerCenter, kTriggerTouchDistance);
 
-    JPH::ClosestHitPerBodyCollisionCollector<JPH::CollideShapeCollector> collector;
-    physicsSystem->GetNarrowPhaseQuery().CollideShape(
-        playerShape,
-        JPH::Vec3::sReplicate(1.0f),
-        JPH::RMat44::sTranslation(ToJoltRVec3(playerCenter)),
-        settings,
-        JPH::RVec3::sZero(),
-        collector,
-        physicsSystem->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
-        sSensorTouchLayerFilter
-    );
-
-    if (!collector.HadHit()) {
+    if (touched.empty()) {
         sActivePlayerTriggerContacts.clear();
         return result;
     }
 
-    collector.Sort();
-    std::unordered_set<JPH::BodyID> touchedTriggerBodies;
+    std::unordered_set<BodyKey> touchedTriggerBodies;
 
-    for (const JPH::CollideShapeResult& hit : collector.mHits) {
-        auto triggerIt = sTeleportTriggersByBody.find(hit.mBodyID2);
+    for (BodyKey bodyKey : touched) {
+        auto triggerIt = sTeleportTriggersByBody.find(bodyKey);
         if (triggerIt == sTeleportTriggersByBody.end()) {
             continue;
         }
 
-        touchedTriggerBodies.insert(hit.mBodyID2);
+        touchedTriggerBodies.insert(bodyKey);
         TeleportTrigger& trigger = sTeleportTriggers[triggerIt->second];
 
         if (result.teleportPlayer ||
             !trigger.enabled ||
             trigger.consumed ||
-            sActivePlayerTriggerContacts.find(hit.mBodyID2) != sActivePlayerTriggerContacts.end() ||
+            sActivePlayerTriggerContacts.find(bodyKey) != sActivePlayerTriggerContacts.end() ||
             sGameplayTime < trigger.nextFireTime) {
             continue;
         }

@@ -191,11 +191,9 @@ if(BUILD_MAP_COMPILER)
 endif()
 
 # ----------------------------
-# JoltPhysics
+# Box3D
 # ----------------------------
-set(BUILD_TESTS OFF CACHE BOOL "Disable building tests" FORCE)
-set(BUILD_VIEWER OFF CACHE BOOL "Disable building viewer" FORCE)
-add_subdirectory(lib/JoltPhysics/Build)
+add_subdirectory(lib/box3d)
 
 # ----------------------------
 # Sources
@@ -275,7 +273,7 @@ endif()
 # Single linking call (keyword signature)
 # ----------------------------
 target_link_libraries(WarpedGame PRIVATE
-    Jolt
+    box3d
     ${PLATFORM_LIBS}
     ${WARPED_LIBCXX_EXTRA_LIBS}
 )

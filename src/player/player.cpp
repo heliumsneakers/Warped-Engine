@@ -1,7 +1,10 @@
 // src/player/player.cpp
 //
-// GoldSrc-style movement using manual Jolt box sweeps.
+// GoldSrc/Quake style movement using manual Box3D box sweeps. The player is a custom
+// box shaped character controller, all queries run against the world with a
+// box point cloud proxy and hull v hull manifolds, the player has no "body".
 
+#include <cfloat>
 #include <cmath>
 
 #include "player.h"
@@ -15,24 +18,7 @@
 #include "sokol_gfx.h"
 #include "sokol_debugtext.h"
 
-#include "Jolt/Jolt.h"
-#include "Jolt/Math/Math.h"
-#include "Jolt/Math/Real.h"
-#include "Jolt/Math/Vec3.h"
-#include "Jolt/Physics/PhysicsSystem.h"
-#include "Jolt/Physics/Body/Body.h"
-#include "Jolt/Physics/Body/BodyLock.h"
-#include "Jolt/Physics/Collision/ObjectLayer.h"
-#include "Jolt/Physics/Collision/NarrowPhaseQuery.h"
-#include "Jolt/Physics/Collision/RayCast.h"
-#include "Jolt/Physics/Collision/CastResult.h"
-#include "Jolt/Physics/Collision/Shape/Shape.h"
-#include "Jolt/Physics/Collision/Shape/BoxShape.h"
-#include "Jolt/Physics/Collision/ShapeCast.h"
-#include "Jolt/Physics/Collision/CollideShape.h"
-#include "Jolt/Physics/Collision/CollisionCollectorImpl.h"
-
-#define JPH_ENABLE_ASSERTS
+#include "box3d/box3d.h"
 
 #define MOUSE_SENSITIVITY 0.5f
 
@@ -48,7 +34,7 @@ static constexpr float AIR_WISH_SPEED_CAP = 30.0f;
 static constexpr float GRAVITY = 800.0f;
 static constexpr float JUMP_HEIGHT = 45.0f;
 static constexpr float STEP_HEIGHT = 18.0f;
-static constexpr float GROUND_NORMAL_MIN = 0.70710677f; // cos(45 deg)
+static constexpr float GROUND_NORMAL_MIN = 0.707106f; // cos(45 deg)
 static constexpr float SLOPE_STOP_SPEED_EPSILON = 1.0f;
 static constexpr float GROUND_PROBE_HALF_THICKNESS = 0.1f;
 static constexpr float OVERCLIP = 1.001f;
@@ -61,10 +47,12 @@ static constexpr float POSITION_EPSILON = 0.02f;
 static constexpr int MAX_CLIP_PLANES = 5;
 static constexpr int MAX_BUMPS = 4;
 static constexpr int MAX_PENETRATION_ITERS = 8;
+static constexpr int MAX_QUERY_SHAPES = 32;
+static constexpr int MAX_GROUND_HITS = 16;
 static constexpr float PLAYER_RADIUS = 16.0f;
 static constexpr float PLAYER_HEIGHT = 56.0f;
 static constexpr float PLAYER_HALF_HEIGHT = PLAYER_HEIGHT * 0.5f;
-static constexpr float JUMP_FORCE = 268.3281573f; // sqrt(2 * 800 * 45)
+static constexpr float JUMP_FORCE = 268.0f;
 
 Vector3 velocity = Vector3Zero();
 float playerYaw = 0.0f;
@@ -75,9 +63,14 @@ Vector3 wishDir = Vector3Zero();
 Vector3 wishVel = Vector3Zero();
 float wishSpeed = 0.0f;
 
-static JPH::RefConst<JPH::Shape> gPlayerShape;
-static JPH::RefConst<JPH::Shape> gGroundProbeShape;
-static JPH::Vec3 gGroundNormal = JPH::Vec3::sAxisY();
+// The player collides as an axis aligned box (32 x 56 x 32).
+// Casts use the corner point cloud as a convex proxy.
+// Penetration queries use the box hull with hull v hull manifolds.
+static b3Vec3 gPlayerBoxPoints[8];
+static b3Vec3 gGroundProbePoints[8];
+static b3BoxHull gPlayerBoxHull;
+static bool gPlayerShapesReady = false;
+static Vector3 gGroundNormal = { 0.0f, 1.0f, 0.0f };
 
 // Debug colors
 static const Color C_RED    = WCOLOR(230, 41, 55, 255);
@@ -105,7 +98,7 @@ struct MoveTrace {
     float fraction = 1.0f;
     Vector3 endPos = Vector3Zero();
     Vector3 normal = { 0.0f, 1.0f, 0.0f };
-    JPH::BodyID bodyID;
+    b3ShapeId shapeID = B3_NULL_ID;
 };
 
 struct GroundSupport {
@@ -124,30 +117,55 @@ struct GroundProbeDebug {
 };
 static GroundProbeDebug gGroundProbeDebug;
 
-static GroundSupport FindGroundSupport(JPH::PhysicsSystem *ps, Vector3 position, float maxDistance);
-
-class PlayerQueryLayerFilter : public JPH::ObjectLayerFilter
-{
-public:
-    virtual bool ShouldCollide(JPH::ObjectLayer inLayer) const override
-    {
-        return inLayer == Layers::NON_MOVING || inLayer == Layers::MOVING;
-    }
-};
-
-static PlayerQueryLayerFilter s_player_query_layer_filter;
+static GroundSupport FindGroundSupport(Vector3 position, float maxDistance);
 
 static inline float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 static inline float HorizontalLength(Vector3 v) { return sqrtf(v.x * v.x + v.z * v.z); }
 static inline float HorizontalLengthSq(Vector3 v) { return v.x * v.x + v.z * v.z; }
 static inline bool IsWalkableNormal(Vector3 n) { return n.y >= GROUND_NORMAL_MIN; }
-static inline bool OnWalkableGround() { return isGrounded && gGroundNormal.GetY() >= GROUND_NORMAL_MIN; }
+static inline bool OnWalkableGround() { return isGrounded && gGroundNormal.y >= GROUND_NORMAL_MIN; }
 
-static inline JPH::Vec3 ToJoltVec3(Vector3 v) { return JPH::Vec3(v.x, v.y, v.z); }
-static inline JPH::RVec3 ToJoltRVec3(Vector3 v) { return JPH::RVec3(v.x, v.y, v.z); }
-static inline Vector3 FromJoltVec3(JPH::Vec3Arg v) { return { v.GetX(), v.GetY(), v.GetZ() }; }
-static inline Vector3 FromJoltRVec3(JPH::RVec3Arg v) { return { (float)v.GetX(), (float)v.GetY(), (float)v.GetZ() }; }
-static inline Vector3 GroundNormalVector() { return FromJoltVec3(gGroundNormal); }
+static inline b3Vec3 ToB3Vec3(Vector3 v) { return b3Vec3{ v.x, v.y, v.z }; }
+static inline b3Pos ToB3Pos(Vector3 v) { return b3Pos{ v.x, v.y, v.z }; }
+static inline Vector3 FromB3Vec3(b3Vec3 v) { return { v.x, v.y, v.z }; }
+static inline Vector3 GroundNormalVector() { return gGroundNormal; }
+
+static inline b3QueryFilter PlayerQueryFilter()
+{
+    b3QueryFilter filter = b3DefaultQueryFilter();
+    filter.categoryBits = Layers::MOVING;
+    filter.maskBits = Layers::STATIC | Layers::MOVING;
+    return filter;
+}
+
+static void InitPlayerShapes()
+{
+    if (gPlayerShapesReady)
+        return;
+
+    int n = 0;
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sy = -1; sy <= 1; sy += 2)
+            for (int sz = -1; sz <= 1; sz += 2)
+            {
+                gPlayerBoxPoints[n] = b3Vec3{ PLAYER_RADIUS * sx, PLAYER_HALF_HEIGHT * sy, PLAYER_RADIUS * sz };
+                gGroundProbePoints[n] = b3Vec3{ PLAYER_RADIUS * sx, GROUND_PROBE_HALF_THICKNESS * sy, PLAYER_RADIUS * sz };
+                ++n;
+            }
+
+    gPlayerBoxHull = b3MakeBoxHull(PLAYER_RADIUS, PLAYER_HALF_HEIGHT, PLAYER_RADIUS);
+    gPlayerShapesReady = true;
+}
+
+static inline b3ShapeProxy PlayerBoxProxy()
+{
+    return b3ShapeProxy{ gPlayerBoxPoints, 8, 0.0f };
+}
+
+static inline b3ShapeProxy GroundProbeProxy()
+{
+    return b3ShapeProxy{ gGroundProbePoints, 8, 0.0f };
+}
 
 static inline Vector3 ProjectVectorOntoPlane(Vector3 v, Vector3 normal)
 {
@@ -180,7 +198,124 @@ static void DebugUpdateVelMetrics()
     if (g_velDbg.horiz > g_velDbg.peakH) g_velDbg.peakH = g_velDbg.horiz;
 }
 
-static MoveTrace CastPlayerShape(JPH::PhysicsSystem *ps, Vector3 start, Vector3 delta)
+//--------------------------------------//
+// Box3D queries
+//--------------------------------------//
+
+struct ShapeCollectContext {
+    b3ShapeId shapes[MAX_QUERY_SHAPES];
+    int count = 0;
+};
+
+static bool CollectOverlapShapes(b3ShapeId shapeId, void *context)
+{
+    auto *collectContext = (ShapeCollectContext *)context;
+    if (collectContext->count < MAX_QUERY_SHAPES)
+        collectContext->shapes[collectContext->count++] = shapeId;
+    return collectContext->count < MAX_QUERY_SHAPES;
+}
+
+struct PenetrationResult {
+    bool hit = false;
+    float depth = 0.0f;
+    Vector3 resolveNormal = { 0.0f, 1.0f, 0.0f }; // pushes the player out
+};
+
+// Collide the player box hull against every nearby shape and return the deepest penetration.
+static PenetrationResult QueryDeepestPenetration(Vector3 position)
+{
+    PenetrationResult result;
+
+    // Broadphase gather around the player's AABB (small margin for near touching contacts).
+    const float margin = 4.0f * POSITION_EPSILON;
+    b3AABB aabb;
+    aabb.lowerBound = b3Vec3{ position.x - PLAYER_RADIUS - margin, position.y - PLAYER_HALF_HEIGHT - margin, position.z - PLAYER_RADIUS - margin };
+    aabb.upperBound = b3Vec3{ position.x + PLAYER_RADIUS + margin, position.y + PLAYER_HALF_HEIGHT + margin, position.z + PLAYER_RADIUS + margin };
+
+    ShapeCollectContext shapes;
+    b3World_OverlapAABB(g_physicsWorld, aabb, PlayerQueryFilter(), CollectOverlapShapes, &shapes);
+
+    // The player box is frame A with identity rotation, so manifold results are
+    // in world axes. The manifold normal points from A (player) to B (shape).
+    const b3WorldTransform playerTransform = { ToB3Pos(position), b3Quat_identity };
+
+    for (int i = 0; i < shapes.count; ++i)
+    {
+        const b3ShapeId shapeId = shapes.shapes[i];
+        const b3WorldTransform bodyTransform = b3Body_GetTransform(b3Shape_GetBody(shapeId));
+        const b3Transform transformBtoA = b3InvMulWorldTransforms(playerTransform, bodyTransform);
+
+        b3LocalManifoldPoint points[8];
+        b3LocalManifold manifold = {};
+        manifold.points = points;
+
+        switch (b3Shape_GetType(shapeId))
+        {
+            case b3_hullShape: {
+                b3SATCache cache = {};
+                b3CollideHulls(&manifold, 8, &gPlayerBoxHull.base, b3Shape_GetHull(shapeId), transformBtoA, &cache);
+                break;
+            }
+            case b3_sphereShape: {
+                b3Sphere sphere = b3Shape_GetSphere(shapeId);
+                b3SimplexCache cache = {};
+                b3CollideHullAndSphere(&manifold, 8, &gPlayerBoxHull.base, &sphere, transformBtoA, &cache);
+                break;
+            }
+            case b3_capsuleShape: {
+                b3Capsule capsule = b3Shape_GetCapsule(shapeId);
+                b3SimplexCache cache = {};
+                b3CollideHullAndCapsule(&manifold, 8, &gPlayerBoxHull.base, &capsule, transformBtoA, &cache);
+                break;
+            }
+            default:
+                continue;
+        }
+
+        for (int p = 0; p < manifold.pointCount; ++p)
+        {
+            const float depth = -points[p].separation;
+            if (depth <= 0.0f)
+                continue;
+
+            if (!result.hit || depth > result.depth)
+            {
+                result.hit = true;
+                result.depth = depth;
+                result.resolveNormal = Vector3Scale(FromB3Vec3(manifold.normal), -1.0f);
+            }
+        }
+    }
+
+    return result;
+}
+
+struct ClosestCastContext {
+    bool hit = false;
+    float fraction = 1.0f;
+    Vector3 normal = { 0.0f, 1.0f, 0.0f };
+    b3ShapeId shapeID = B3_NULL_ID;
+};
+
+static float ClosestCastCallback(b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction,
+                                 uint64_t userMaterialId, int triangleIndex, int childIndex, void *context)
+{
+    (void)point; (void)userMaterialId; (void)triangleIndex; (void)childIndex;
+
+    // Initial overlap hits come back with a zero normal, those surfaces are
+    // handled by the manifold based start solid check, not the cast.
+    if (b3LengthSquared(normal) < 1e-12f)
+        return -1.0f; // filter and continue
+
+    auto *castContext = (ClosestCastContext *)context;
+    castContext->hit = true;
+    castContext->fraction = fraction;
+    castContext->normal = FromB3Vec3(normal);
+    castContext->shapeID = shapeId;
+    return fraction; // clip the cast for the closest hit
+}
+
+static MoveTrace CastPlayerShape(Vector3 start, Vector3 delta)
 {
     MoveTrace trace;
     trace.endPos = Vector3Add(start, delta);
@@ -188,80 +323,52 @@ static MoveTrace CastPlayerShape(JPH::PhysicsSystem *ps, Vector3 start, Vector3 
     if (Vector3LengthSq(delta) <= 1e-10f)
         return trace;
 
-    const JPH::RShapeCast cast(
-        gPlayerShape.GetPtr(),
-        JPH::Vec3::sReplicate(1.0f),
-        JPH::RMat44::sTranslation(ToJoltRVec3(start)),
-        ToJoltVec3(delta)
-    );
+    // Box3D shape casts treat initial overlap as a miss so detect a solid start
+    // explicitly and let the caller resolve the penetration.
+    PenetrationResult penetration = QueryDeepestPenetration(start);
+    if (penetration.hit && penetration.depth > POSITION_EPSILON)
+    {
+        trace.hit = true;
+        trace.startSolid = true;
+        trace.fraction = 0.0f;
+        trace.endPos = start;
+        trace.normal = penetration.resolveNormal;
+        return trace;
+    }
 
-    JPH::ShapeCastSettings settings;
-    settings.mBackFaceModeTriangles = JPH::EBackFaceMode::CollideWithBackFaces;
-    settings.mBackFaceModeConvex = JPH::EBackFaceMode::CollideWithBackFaces;
-    settings.mUseShrunkenShapeAndConvexRadius = false;
-    settings.mReturnDeepestPoint = true;
-    settings.mActiveEdgeMovementDirection = ToJoltVec3(delta);
+    const b3ShapeProxy proxy = PlayerBoxProxy();
 
-    JPH::ClosestHitCollisionCollector<JPH::CastShapeCollector> collector;
-    ps->GetNarrowPhaseQuery().CastShape(
-        cast,
-        settings,
-        JPH::RVec3::sZero(),
-        collector,
-        ps->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
-        s_player_query_layer_filter
-    );
+    ClosestCastContext context;
+    b3World_CastShape(g_physicsWorld, ToB3Pos(start), &proxy, ToB3Vec3(delta),
+                      PlayerQueryFilter(), ClosestCastCallback, &context);
 
-    if (!collector.HadHit())
+    if (!context.hit)
         return trace;
 
     trace.hit = true;
-    trace.fraction = collector.mHit.mFraction;
+    trace.fraction = context.fraction;
     trace.endPos = Vector3Add(start, Vector3Scale(delta, trace.fraction));
-
-    JPH::Vec3 axis = collector.mHit.mPenetrationAxis;
-    if (axis.LengthSq() > 1e-12f)
-        trace.normal = FromJoltVec3(-axis.Normalized());
-
-    trace.startSolid = trace.fraction <= 0.0f && collector.mHit.mPenetrationDepth > POSITION_EPSILON;
-    trace.bodyID = collector.mHit.mBodyID2;
+    trace.normal = context.normal;
+    trace.shapeID = context.shapeID;
     return trace;
 }
 
-static bool ResolvePlayerPenetration(JPH::PhysicsSystem *ps, Vector3 &position)
+static bool ResolvePlayerPenetration(Vector3 &position)
 {
     bool moved = false;
 
     for (int i = 0; i < MAX_PENETRATION_ITERS; ++i)
     {
-        JPH::CollideShapeSettings settings;
-        settings.mBackFaceMode = JPH::EBackFaceMode::CollideWithBackFaces;
-
-        JPH::ClosestHitCollisionCollector<JPH::CollideShapeCollector> collector;
-        ps->GetNarrowPhaseQuery().CollideShapeWithInternalEdgeRemoval(
-            gPlayerShape.GetPtr(),
-            JPH::Vec3::sReplicate(1.0f),
-            JPH::RMat44::sTranslation(ToJoltRVec3(position)),
-            settings,
-            JPH::RVec3::sZero(),
-            collector,
-            ps->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
-            s_player_query_layer_filter
-        );
-
-        if (!collector.HadHit() || collector.mHit.mPenetrationDepth <= 0.0f)
+        PenetrationResult penetration = QueryDeepestPenetration(position);
+        if (!penetration.hit || penetration.depth <= 0.0f)
             return moved;
 
-        JPH::Vec3 axis = collector.mHit.mPenetrationAxis;
-        if (axis.LengthSq() <= 1e-12f)
-            return moved;
-
-        Vector3 resolve = FromJoltVec3(-axis.Normalized());
-        const float resolveDistance = collector.mHit.mPenetrationDepth + POSITION_EPSILON;
+        Vector3 resolve = penetration.resolveNormal;
+        const float resolveDistance = penetration.depth + POSITION_EPSILON;
 
         if (resolve.y >= GROUND_NORMAL_MIN)
         {
-            GroundSupport support = FindGroundSupport(ps, position, GROUND_PROBE_DISTANCE);
+            GroundSupport support = FindGroundSupport(position, GROUND_PROBE_DISTANCE);
             if (support.found && IsWalkableNormal(support.normal))
             {
                 const float verticalDistance = resolveDistance / fmaxf(resolve.y, GROUND_NORMAL_MIN);
@@ -280,16 +387,37 @@ static bool ResolvePlayerPenetration(JPH::PhysicsSystem *ps, Vector3 &position)
     return moved;
 }
 
-static GroundSupport FindGroundSupport(JPH::PhysicsSystem *ps, Vector3 position, float maxDistance)
+struct GroundCastContext {
+    struct Hit {
+        float fraction;
+        Vector3 normal;
+    };
+    Hit hits[MAX_GROUND_HITS];
+    int count = 0;
+};
+
+static float GroundCastCallback(b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction,
+                                uint64_t userMaterialId, int triangleIndex, int childIndex, void *context)
+{
+    (void)shapeId; (void)point; (void)userMaterialId; (void)triangleIndex; (void)childIndex;
+    auto *castContext = (GroundCastContext *)context;
+    if (castContext->count < MAX_GROUND_HITS)
+        castContext->hits[castContext->count++] = { fraction, FromB3Vec3(normal) };
+    return 1.0f; // collect every hit along the cast
+}
+
+static GroundSupport FindGroundSupport(Vector3 position, float maxDistance)
 {
     GroundSupport best;
 
-    if (!gGroundProbeShape || maxDistance <= 0.0f)
+    if (maxDistance <= 0.0f)
     {
         gGroundProbeDebug.valid = false;
         return best;
     }
 
+    // Thin box probe at the player's feet, raised by an epsilon so a surface
+    // the player rests on exactly is not an initial overlap (cast = miss).
     Vector3 probeStart = {
         position.x,
         position.y - PLAYER_HALF_HEIGHT + GROUND_PROBE_HALF_THICKNESS + POSITION_EPSILON,
@@ -303,45 +431,21 @@ static GroundSupport FindGroundSupport(JPH::PhysicsSystem *ps, Vector3 position,
     gGroundProbeDebug.endCenter = { probeStart.x, probeStart.y - castDistance, probeStart.z };
     gGroundProbeDebug.hitCenter = gGroundProbeDebug.endCenter;
     gGroundProbeDebug.hitNormal = { 0.0f, 1.0f, 0.0f };
-    const JPH::RShapeCast cast(
-        gGroundProbeShape.GetPtr(),
-        JPH::Vec3::sReplicate(1.0f),
-        JPH::RMat44::sTranslation(ToJoltRVec3(probeStart)),
-        JPH::Vec3(0.0f, -castDistance, 0.0f)
-    );
 
-    JPH::ShapeCastSettings settings;
-    settings.mBackFaceModeTriangles = JPH::EBackFaceMode::CollideWithBackFaces;
-    settings.mBackFaceModeConvex = JPH::EBackFaceMode::CollideWithBackFaces;
-    settings.mUseShrunkenShapeAndConvexRadius = false;
-    settings.mReturnDeepestPoint = true;
-    settings.mActiveEdgeMovementDirection = JPH::Vec3(0.0f, -1.0f, 0.0f);
+    const b3ShapeProxy proxy = GroundProbeProxy();
 
-    JPH::AllHitCollisionCollector<JPH::CastShapeCollector> collector;
-    ps->GetNarrowPhaseQuery().CastShape(
-        cast,
-        settings,
-        JPH::RVec3::sZero(),
-        collector,
-        ps->GetDefaultBroadPhaseLayerFilter(Layers::MOVING),
-        s_player_query_layer_filter
-    );
+    GroundCastContext context;
+    b3World_CastShape(g_physicsWorld, ToB3Pos(probeStart), &proxy,
+                      b3Vec3{ 0.0f, -castDistance, 0.0f },
+                      PlayerQueryFilter(), GroundCastCallback, &context);
 
-    if (!collector.HadHit())
-        return best;
-
-    collector.Sort();
-    for (const JPH::ShapeCastResult &hit : collector.mHits)
+    for (int i = 0; i < context.count; ++i)
     {
-        JPH::Vec3 axis = hit.mPenetrationAxis;
-        if (axis.LengthSq() <= 1e-12f)
-            continue;
-
-        Vector3 normal = FromJoltVec3(-axis.Normalized());
+        const Vector3 normal = context.hits[i].normal;
         if (!IsWalkableNormal(normal))
             continue;
 
-        const float probeCenterY = probeStart.y - castDistance * hit.mFraction;
+        const float probeCenterY = probeStart.y - castDistance * context.hits[i].fraction;
         const float centerY = probeCenterY + (PLAYER_HALF_HEIGHT - GROUND_PROBE_HALF_THICKNESS);
         if (!best.found || centerY > best.centerY)
         {
@@ -501,37 +605,39 @@ static inline void PM_Jump(float dt)
     velocity.y -= GRAVITY * dt * 0.5f;
 }
 
-static void CategorizeGround(JPH::PhysicsSystem *ps, Vector3 &position, bool allowSnap)
+static void CategorizeGround(Vector3 &position, bool allowSnap)
 {
     const bool wasGroundedState = isGrounded;
 
     if (!allowSnap && velocity.y > 0.0f)
     {
         isGrounded = false;
-        gGroundNormal = JPH::Vec3::sZero();
+        gGroundNormal = Vector3Zero();
         return;
     }
 
     const float probeDistance = allowSnap ? GROUND_PROBE_DISTANCE : GROUND_CONTACT_DISTANCE;
-    GroundSupport support = FindGroundSupport(ps, position, probeDistance);
+    GroundSupport support = FindGroundSupport(position, probeDistance);
 
     isGrounded = false;
-    gGroundNormal = JPH::Vec3::sZero();
+    gGroundNormal = Vector3Zero();
 
     if (!support.found)
         return;
 
     isGrounded = true;
-    gGroundNormal = ToJoltVec3(support.normal);
+    gGroundNormal = support.normal;
 
+    // Snap with a small gap so later casts never start inside Box3D's linear
+    // slope of the ground (which would report initial overlap and no normal).
     if (allowSnap)
-        position.y = support.centerY;
+        position.y = support.centerY + POSITION_EPSILON;
 
     const float targetGroundSpeed = wasGroundedState ? Vector3Length(velocity) : HorizontalLength(velocity);
     velocity = ReprojectVelocityPreserveSpeed(velocity, support.normal, targetGroundSpeed);
 }
 
-static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVelocity, float dt, bool preserveFallVelocityOnWalkableImpact = false, bool *landedOnWalkable = nullptr)
+static void SlideMove(Vector3 &position, Vector3 &moveVelocity, float dt, bool preserveFallVelocityOnWalkableImpact = false, bool *landedOnWalkable = nullptr)
 {
     float timeLeft = dt;
     Vector3 planes[MAX_CLIP_PLANES];
@@ -546,11 +652,11 @@ static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVe
         if (Vector3LengthSq(moveVelocity) <= 1e-8f)
             break;
 
-        MoveTrace trace = CastPlayerShape(ps, position, Vector3Scale(moveVelocity, timeLeft));
+        MoveTrace trace = CastPlayerShape(position, Vector3Scale(moveVelocity, timeLeft));
 
         if (trace.startSolid)
         {
-            if (!ResolvePlayerPenetration(ps, position))
+            if (!ResolvePlayerPenetration(position))
             {
                 moveVelocity = Vector3Zero();
                 break;
@@ -659,13 +765,13 @@ static void SlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVe
     }
 }
 
-static void StepSlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &moveVelocity, float dt)
+static void StepSlideMove(Vector3 &position, Vector3 &moveVelocity, float dt)
 {
     Vector3 downPos = position;
     Vector3 downVel = moveVelocity;
-    SlideMove(ps, downPos, downVel, dt, false, nullptr);
+    SlideMove(downPos, downVel, dt, false, nullptr);
 
-    MoveTrace upTrace = CastPlayerShape(ps, position, { 0.0f, STEP_HEIGHT, 0.0f });
+    MoveTrace upTrace = CastPlayerShape(position, { 0.0f, STEP_HEIGHT, 0.0f });
     if (upTrace.hit && upTrace.fraction < 1.0f)
     {
         position = downPos;
@@ -675,20 +781,28 @@ static void StepSlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &mo
 
     Vector3 upPos = upTrace.endPos;
     Vector3 upVel = moveVelocity;
-    SlideMove(ps, upPos, upVel, dt, false, nullptr);
+    SlideMove(upPos, upVel, dt, false, nullptr);
 
-    MoveTrace downTrace = CastPlayerShape(ps, upPos, { 0.0f, -STEP_HEIGHT, 0.0f });
-    if (downTrace.hit && IsWalkableNormal(downTrace.normal))
+    // The step is only valid if it lands on walkable ground. The player keeps
+    // a small gap above the floor, so cast a little past STEP_HEIGHT.
+    MoveTrace downTrace = CastPlayerShape(upPos, { 0.0f, -(STEP_HEIGHT + 2.0f * POSITION_EPSILON), 0.0f });
+    if (!downTrace.hit || !IsWalkableNormal(downTrace.normal))
     {
-        upPos = downTrace.endPos;
-        if (upVel.y < 0.0f)
-            upVel.y = 0.0f;
+        position = downPos;
+        moveVelocity = downVel;
+        return;
     }
+
+    upPos = downTrace.endPos;
+    if (upVel.y < 0.0f)
+        upVel.y = 0.0f;
 
     float downDist = HorizontalLengthSq(Vector3Subtract(downPos, position));
     float upDist = HorizontalLengthSq(Vector3Subtract(upPos, position));
 
-    if (upDist > downDist)
+    // Require a real gain to step, ties (e.g. running into a tall wall) must
+    // keep the ground level move or the player jitters upward against walls.
+    if (upDist > downDist + POSITION_EPSILON * POSITION_EPSILON)
     {
         position = upPos;
         moveVelocity = upVel;
@@ -700,20 +814,12 @@ static void StepSlideMove(JPH::PhysicsSystem *ps, Vector3 &position, Vector3 &mo
     }
 }
 
-void InitJoltCharacter(Player *player, JPH::PhysicsSystem *physicsSystem)
+void InitPlayerPhysics(Player *player)
 {
-    (void)physicsSystem;
+    InitPlayerShapes();
 
-    if (!gPlayerShape)
-        gPlayerShape = new JPH::BoxShape(JPH::Vec3(PLAYER_RADIUS, PLAYER_HALF_HEIGHT, PLAYER_RADIUS), 0.0f);
-    if (!gGroundProbeShape)
-        gGroundProbeShape = new JPH::BoxShape(
-            JPH::Vec3(PLAYER_RADIUS, GROUND_PROBE_HALF_THICKNESS, PLAYER_RADIUS),
-            0.0f
-        );
-
-    ResolvePlayerPenetration(s_physics_system, player->center);
-    CategorizeGround(s_physics_system, player->center, true);
+    ResolvePlayerPenetration(player->center);
+    CategorizeGround(player->center, true);
 }
 
 void InitPlayer(Player *player, Vector3 center, Vector3 target, Vector3 up, float fovy)
@@ -737,7 +843,7 @@ void InitPlayer(Player *player, Vector3 center, Vector3 target, Vector3 up, floa
     cursorEnabled = false;
 }
 
-void RespawnPlayer(Player *player, JPH::PhysicsSystem *physicsSystem, Vector3 position, float yaw, float pitch)
+void RespawnPlayer(Player *player, Vector3 position, float yaw, float pitch)
 {
     player->center = position;
 
@@ -745,7 +851,7 @@ void RespawnPlayer(Player *player, JPH::PhysicsSystem *physicsSystem, Vector3 po
     playerYaw = yaw;
     playerPitch = pitch;
     isGrounded = false;
-    gGroundNormal = JPH::Vec3::sZero();
+    gGroundNormal = Vector3Zero();
     wishDir = Vector3Zero();
     wishVel = Vector3Zero();
     wishSpeed = 0.0f;
@@ -756,15 +862,15 @@ void RespawnPlayer(Player *player, JPH::PhysicsSystem *physicsSystem, Vector3 po
     player->camera.position = { player->center.x, player->center.y + eyeOffset, player->center.z };
     UpdateCameraTarget(player);
 
-    ResolvePlayerPenetration(physicsSystem, player->center);
-    CategorizeGround(physicsSystem, player->center, true);
+    ResolvePlayerPenetration(player->center);
+    CategorizeGround(player->center, true);
     player->camera.position = { player->center.x, player->center.y + eyeOffset, player->center.z };
     UpdateCameraTarget(player);
 }
 
-void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
+void UpdatePlayerMove(Player *player, float dt)
 {
-    ResolvePlayerPenetration(ps, player->center);
+    ResolvePlayerPenetration(player->center);
 
     float mdx = Input_MouseDeltaX();
     float mdy = Input_MouseDeltaY();
@@ -775,7 +881,7 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
     player->pitch = playerPitch;
 
     bool wasGrounded = isGrounded;
-    CategorizeGround(ps, player->center, wasGrounded);
+    CategorizeGround(player->center, wasGrounded);
 
     PM_BuildWish();
 
@@ -788,7 +894,7 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
         {
             PM_Jump(dt);
             isGrounded = false;
-            gGroundNormal = JPH::Vec3::sZero();
+            gGroundNormal = Vector3Zero();
             jumped = true;
             PM_AirAccelerate(wishDir, wishSpeed, AIR_ACCELERATION, dt);
         }
@@ -804,9 +910,9 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
         velocity.y -= GRAVITY * dt;
     }
 
+    const b3ShapeProxy playerProxy = PlayerBoxProxy();
     const GameplayEntities::PlayerEffectResult playerEffects =
-        GameplayEntities::ApplyPlayerEffects(ps,
-                                             gPlayerShape.GetPtr(),
+        GameplayEntities::ApplyPlayerEffects(&playerProxy,
                                              player->center,
                                              GroundNormalVector(),
                                              OnWalkableGround(),
@@ -815,7 +921,7 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
     if (playerEffects.launchOffGround)
     {
         isGrounded = false;
-        gGroundNormal = JPH::Vec3::sZero();
+        gGroundNormal = Vector3Zero();
         jumped = true;
     }
 
@@ -825,21 +931,21 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
     {
         Vector3 moveVelocity = velocity;
         PM_ClipVelocity(moveVelocity, GroundNormalVector(), moveVelocity, OVERCLIP);
-        StepSlideMove(ps, player->center, moveVelocity, dt);
+        StepSlideMove(player->center, moveVelocity, dt);
         velocity = moveVelocity;
     }
     else
-        SlideMove(ps, player->center, velocity, dt, true, &landedOnWalkable);
+        SlideMove(player->center, velocity, dt, true, &landedOnWalkable);
 
-    ResolvePlayerPenetration(ps, player->center);
-    CategorizeGround(ps, player->center, landedOnWalkable || (wasGrounded && !jumped));
+    ResolvePlayerPenetration(player->center);
+    CategorizeGround(player->center, landedOnWalkable || (wasGrounded && !jumped));
     PM_ApplyWalkableSlopeStop();
 
     const GameplayEntities::TriggerTeleportResult teleportResult =
-        GameplayEntities::QueryPlayerTeleportTrigger(ps, gPlayerShape.GetPtr(), player->center, dt);
+        GameplayEntities::QueryPlayerTeleportTrigger(&playerProxy, player->center, dt);
     if (teleportResult.teleportPlayer)
     {
-        RespawnPlayer(player, ps, teleportResult.position, teleportResult.yaw, teleportResult.pitch);
+        RespawnPlayer(player, teleportResult.position, teleportResult.yaw, teleportResult.pitch);
     }
 
     DebugUpdateVelMetrics();
@@ -851,10 +957,8 @@ void UpdatePlayerMove(Player *player, JPH::PhysicsSystem *ps, float dt)
     player->camera.target = Vector3Add(player->camera.position, fwd);
 }
 
-void UpdatePlayer(Player *player, JPH::PhysicsSystem *mPhysicsSystem, float deltaTime)
+void UpdatePlayer(Player *player, float deltaTime)
 {
-    (void)mPhysicsSystem;
-
     float mdx = Input_MouseDeltaX();
     float mdy = Input_MouseDeltaY();
 

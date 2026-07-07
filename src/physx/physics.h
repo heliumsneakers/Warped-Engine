@@ -1,56 +1,28 @@
 #pragma once
 
-#include "Jolt/Core/Core.h"
 #include "collision_data.h"
-#include "Jolt/Jolt.h"
-#include "Jolt/Physics/PhysicsSystem.h"
-#include "Jolt/Physics/Collision/ObjectLayer.h"
-#include "Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h"
-#include "Jolt/Physics/Body/BodyCreationSettings.h"
-#include "Jolt/Physics/Collision/Shape/ConvexShape.h"
-#include "Jolt/Physics/Collision/Shape/ConvexHullShape.h"
-#include "Jolt/Geometry/ConvexSupport.h"
-#include "Jolt/Geometry/GJKClosestPoint.h"
-#include "Jolt/Physics/Body/BodyInterface.h"
+#include "box3d/box3d.h"
 #include <vector>
 
-extern JPH::PhysicsSystem     *s_physics_system;
-extern JPH::TempAllocatorImpl *s_temp_allocator;
-extern JPH::BodyID debugSphereID;
+extern b3WorldId g_physicsWorld;
+extern b3BodyId  debugSphereID;
 
-namespace JPH {
-    class PhysicsSystem;
-    class BodyInterface;
-}
-
+// Collision category bits. Box3D filters with category/mask bit pairs instead
+// of Jolt-style object layers.
 namespace Layers
 {
-    static constexpr JPH::ObjectLayer NON_MOVING = 0;
-    static constexpr JPH::ObjectLayer MOVING     = 1;
-    static constexpr JPH::ObjectLayer SENSOR     = 2;
-    static constexpr JPH::ObjectLayer NUM_LAYERS = 3;
-}
-
-namespace BroadPhaseLayers
-{
-    static constexpr JPH::BroadPhaseLayer NON_MOVING(0);
-    static constexpr JPH::BroadPhaseLayer MOVING(1);
-    static constexpr JPH::BroadPhaseLayer SENSOR(2);
-    static constexpr uint                 NUM_LAYERS(3);
+    constexpr uint64_t STATIC = 0x1; // non-moving world brushes
+    constexpr uint64_t MOVING = 0x2; // dynamic bodies and the player queries
+    constexpr uint64_t SENSOR = 0x4; // trigger volumes
 }
 
 void InitPhysicsSystem();
 
 void ShutdownPhysicsSystem();
 
-JPH::BodyInterface &GetBodyInterface();
+void UpdatePhysicsSystem(float delta_time);
 
-void UpdatePhysicsSystem(float delta_time, JPH::BodyInterface *bodyInterface);
-
-void SpawnDebugPhysObj(JPH::BodyInterface *bodyInterface);
+void SpawnDebugPhysObj();
 
 void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
-                     const std::vector<Entity> &entities,
-                     JPH::BodyInterface *bodyInterface);
-
-void SpawnMinimalTest(JPH::BodyInterface &bodyInterface);
+                     const std::vector<Entity> &entities);
