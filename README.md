@@ -5,16 +5,17 @@ Id Tech 2 and GoldSrc are awesome pieces of software and I'd like to build somet
 
 The initial spark for this project was from a 72 hour game jam, where I wrote the beginnings of the engine. This initial version included: map parser (without textures), player movement, and UI.
 
-https://heliumsneakers.itch.io/mini-quake-demo
+[MiniQuake](https://heliumsneakers.itch.io/mini-quake-demo)
 
 The original project was compiled with emscripten for web, but I've reverted to local builds to accommodate the physics library, the web build version of this project is split into a separate project folder locally. I plan on uploading it in the future.
 
  The engine is structured around **5 libraries, and 1 external map editor**.
 - **Sokol**: Graphics library used for rendering, the engine supports Metal, DX11, and GL 3.3.
 - **Clay**: CSS style immediate mode UI library.
-- **Jolt Physics**: The physics library used in the project.
+- **Box3D**: The physics library used in the project.
 - **Embree**: Used for accelerating the CPU and Compute shader lightmap bake using SIMD and BVH trees.
 - **RRes**: Binary format used for packing assets for individual maps. 
+
 - **Trench Broom**: Quake map editor for creating convex geometry (maps) and entities. The format used in this project is Valve 220.
 
 ## Engine Structure
@@ -48,11 +49,6 @@ git submodule init
 git submodule update
 ```
 
-**Before building the project ensure that Jolt is built for your platform:**
-```
-https://github.com/jrouwe/JoltPhysics
-```
-
 3. Building the engine
 ```bash 
 mkdir build
@@ -67,8 +63,6 @@ cmake -B build_mc -DBUILD_MAP_COMPILER=ON && cmake --build build_mc
 ```
 
 ## Map compiler usage
-
-When using the map compiler you should follow this structure:
 
 ```bash
 ./compile_map <PATH_TO_MAP_FILE>.map <COMPILED_MAP_DESTINATION>.bsp  
