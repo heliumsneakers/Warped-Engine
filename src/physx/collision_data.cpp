@@ -21,9 +21,9 @@ static CollisionType GetEntityCollisionType(const Entity &ent) {
             ct = CollisionType::TRIGGER;
             printf("\n TRIGGER ENTITY \n");
         }
-        else if (classname == "func_boost") {
-            ct = CollisionType::STATIC;
-            printf("\n FUNC_BOOST ENTITY \n");
+        else if (classname == "trigger_boost" || classname == "func_boost") {
+            ct = CollisionType::TRIGGER;
+            printf("\n BOOST TRIGGER ENTITY \n");
         }
         else if (classname.find("func_physics") != std::string::npos) {
             ct = CollisionType::DYNAMIC;

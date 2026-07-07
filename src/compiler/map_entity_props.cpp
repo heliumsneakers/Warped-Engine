@@ -64,7 +64,9 @@ bool EntityClassStartsWith(const Entity& e, const char* prefix) {
 
 bool ShouldRenderBrushEntity(const Entity& entity, bool devMode) {
     if ((EntityHasClass(entity, "trigger_once") ||
-         EntityHasClass(entity, "trigger_multiple")) && !devMode) {
+         EntityHasClass(entity, "trigger_multiple") ||
+         EntityHasClass(entity, "trigger_boost") ||
+         EntityHasClass(entity, "func_boost")) && !devMode) {
         return false;
     }
 

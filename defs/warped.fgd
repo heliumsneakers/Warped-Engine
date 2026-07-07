@@ -227,7 +227,7 @@
 ]
 
 // Boost Volume
-@SolidClass base(Targetname, LightBakeBrush) color(0 192 255) = func_boost : "Boost Volume" [
+@SolidClass base(Targetname, Target) color(0 192 255) = trigger_boost : "Boost Volume" [
     boost(integer) : "Boost Amount" : 100 : "Target speed along the configured direction. Valid range: 1 to 1000."
     direction(string) : "Direction (X Y Z)" : "0 0 1" : "Boost direction vector in editor coordinates. Negative values are allowed."
     acceleration(integer) : "Acceleration" : 100 : "Acceleration applied while the player is inside the volume. Valid range: 100 to 1000."

@@ -80,7 +80,7 @@ class BoostTouchLayerFilter final : public JPH::ObjectLayerFilter
 public:
     bool ShouldCollide(JPH::ObjectLayer inLayer) const override
     {
-        return inLayer == Layers::NON_MOVING;
+        return inLayer == Layers::SENSOR;
     }
 };
 
@@ -274,7 +274,7 @@ void RegisterBrushEntity(const Entity& entity, int entityIndex, JPH::BodyID body
 
     const std::string& classname = classnameIt->second;
 
-    if (classname == "func_boost") {
+    if (classname == "trigger_boost" || classname == "func_boost") {
         BoostVolume boostVolume;
         boostVolume.entityIndex = entityIndex;
         boostVolume.bodyID = bodyID;
@@ -285,7 +285,8 @@ void RegisterBrushEntity(const Entity& entity, int entityIndex, JPH::BodyID body
         sBoostVolumesByBody[bodyID] = sBoostVolumes.size();
         sBoostVolumes.push_back(boostVolume);
 
-        printf("[entities] registered func_boost entity=%d body=%u boost=%.1f accel=%.1f dir=(%.3f %.3f %.3f)\n",
+        printf("[entities] registered %s entity=%d body=%u boost=%.1f accel=%.1f dir=(%.3f %.3f %.3f)\n",
+               classname.c_str(),
                entityIndex,
                bodyID.GetIndexAndSequenceNumber(),
                boostVolume.boostAmount,
