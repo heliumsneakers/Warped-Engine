@@ -1,11 +1,16 @@
 #include "physics.h"
 #include "collision_data.h"
+#include "../compiler/map_geometry.h"
 #include "../entities/entities.h"
+#include "../render/debug_draw.h"
 
 #include "box3d/box3d.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -31,6 +36,391 @@
 b3WorldId g_physicsWorld = B3_NULL_ID;
 b3BodyId  debugSphereID  = B3_NULL_ID;
 
+namespace {
+
+static constexpr float PHYSICS_MAP_UNITS_PER_METER = 64.0f;
+static constexpr float PHYSICS_DENSITY_SCALE =
+    1.0f / (PHYSICS_MAP_UNITS_PER_METER * PHYSICS_MAP_UNITS_PER_METER * PHYSICS_MAP_UNITS_PER_METER);
+
+struct DynamicPhysicsRenderHull {
+    b3BodyId bodyId = B3_NULL_ID;
+    std::vector<std::array<b3Vec3, 2>> edges;
+    std::vector<std::array<b3Vec3, 3>> triangles;
+};
+
+std::vector<DynamicPhysicsRenderHull> sDynamicRenderHulls;
+std::vector<b3BodyId> sMapHullBodies;
+
+static bool GetEntityProp(const std::vector<Entity>& entities,
+                          const MeshCollisionData& mcd,
+                          const char* key,
+                          std::string& out)
+{
+    if (mcd.entityIndex < 0 || (size_t)mcd.entityIndex >= entities.size()) {
+        return false;
+    }
+
+    const Entity& entity = entities[(size_t)mcd.entityIndex];
+    auto it = entity.properties.find(key);
+    if (it == entity.properties.end()) {
+        return false;
+    }
+
+    out = it->second;
+    return true;
+}
+
+static const char* GetEntityClassname(const std::vector<Entity>& entities, const MeshCollisionData& mcd)
+{
+    if (mcd.entityIndex < 0 || (size_t)mcd.entityIndex >= entities.size()) {
+        return "?";
+    }
+
+    const Entity& entity = entities[(size_t)mcd.entityIndex];
+    auto it = entity.properties.find("classname");
+    return it != entity.properties.end() ? it->second.c_str() : "?";
+}
+
+static bool ParseFloatProperty(const std::vector<Entity>& entities,
+                               const MeshCollisionData& mcd,
+                               const char* key,
+                               float& out)
+{
+    std::string value;
+    if (!GetEntityProp(entities, mcd, key, value)) {
+        return false;
+    }
+
+    char* end = nullptr;
+    const float parsed = std::strtof(value.c_str(), &end);
+    if (end == value.c_str() || *end != '\0') {
+        printf("[physics] %s entity=%d has invalid %s='%s'\n",
+               GetEntityClassname(entities, mcd),
+               mcd.entityIndex,
+               key,
+               value.c_str());
+        return false;
+    }
+
+    out = parsed;
+    return true;
+}
+
+static bool ParseIntProperty(const std::vector<Entity>& entities,
+                             const MeshCollisionData& mcd,
+                             const char* key,
+                             int& out)
+{
+    float parsed = 0.0f;
+    if (!ParseFloatProperty(entities, mcd, key, parsed)) {
+        return false;
+    }
+
+    out = (int)parsed;
+    return true;
+}
+
+static bool ParseU64Property(const std::vector<Entity>& entities,
+                             const MeshCollisionData& mcd,
+                             const char* key,
+                             uint64_t& out)
+{
+    std::string value;
+    if (!GetEntityProp(entities, mcd, key, value)) {
+        return false;
+    }
+
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value.c_str(), &end, 0);
+    if (end == value.c_str() || *end != '\0') {
+        printf("[physics] %s entity=%d has invalid %s='%s'\n",
+               GetEntityClassname(entities, mcd),
+               mcd.entityIndex,
+               key,
+               value.c_str());
+        return false;
+    }
+
+    out = (uint64_t)parsed;
+    return true;
+}
+
+static bool ParseBoolProperty(const std::vector<Entity>& entities,
+                              const MeshCollisionData& mcd,
+                              const char* key,
+                              bool& out)
+{
+    std::string value;
+    if (!GetEntityProp(entities, mcd, key, value)) {
+        return false;
+    }
+
+    if (value == "1" || value == "true" || value == "True" || value == "yes" || value == "on") {
+        out = true;
+        return true;
+    }
+
+    if (value == "0" || value == "false" || value == "False" || value == "no" || value == "off") {
+        out = false;
+        return true;
+    }
+
+    printf("[physics] %s entity=%d has invalid %s='%s'\n",
+           GetEntityClassname(entities, mcd),
+           mcd.entityIndex,
+           key,
+           value.c_str());
+    return false;
+}
+
+static bool ParseVec3Property(const std::vector<Entity>& entities,
+                              const MeshCollisionData& mcd,
+                              const char* key,
+                              Vector3& out)
+{
+    std::string value;
+    if (!GetEntityProp(entities, mcd, key, value)) {
+        return false;
+    }
+
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    if (std::sscanf(value.c_str(), "%f %f %f", &x, &y, &z) != 3) {
+        printf("[physics] %s entity=%d has invalid %s='%s'\n",
+               GetEntityClassname(entities, mcd),
+               mcd.entityIndex,
+               key,
+               value.c_str());
+        return false;
+    }
+
+    out = { x, y, z };
+    return true;
+}
+
+static b3Vec3 ToB3Vec3(Vector3 v)
+{
+    return b3Vec3{ v.x, v.y, v.z };
+}
+
+static Vector3 TransformLocalPoint(b3WorldTransform transform, b3Vec3 local)
+{
+    b3Vec3 rotated = b3RotateVector(transform.q, local);
+    return Vector3{
+        (float)transform.p.x + rotated.x,
+        (float)transform.p.y + rotated.y,
+        (float)transform.p.z + rotated.z
+    };
+}
+
+static Vector3 ComputePointCenter(const std::vector<Vector3>& points)
+{
+    Vector3 minPoint = points[0];
+    Vector3 maxPoint = points[0];
+    for (const Vector3& point : points) {
+        minPoint.x = std::min(minPoint.x, point.x);
+        minPoint.y = std::min(minPoint.y, point.y);
+        minPoint.z = std::min(minPoint.z, point.z);
+        maxPoint.x = std::max(maxPoint.x, point.x);
+        maxPoint.y = std::max(maxPoint.y, point.y);
+        maxPoint.z = std::max(maxPoint.z, point.z);
+    }
+
+    return Vector3Scale(Vector3Add(minPoint, maxPoint), 0.5f);
+}
+
+static b3BodyType ReadBodyType(const std::vector<Entity>& entities,
+                               const MeshCollisionData& mcd,
+                               b3BodyType defaultType)
+{
+    std::string value;
+    if (!GetEntityProp(entities, mcd, "body_type", value)) {
+        return defaultType;
+    }
+
+    if (value == "2" || value == "static") {
+        return b3_staticBody;
+    }
+    if (value == "1" || value == "kinematic") {
+        return b3_kinematicBody;
+    }
+    if (value == "0" || value == "dynamic") {
+        return b3_dynamicBody;
+    }
+
+    printf("[physics] %s entity=%d has invalid body_type='%s'\n",
+           GetEntityClassname(entities, mcd),
+           mcd.entityIndex,
+           value.c_str());
+    return defaultType;
+}
+
+static void ApplyPhysicsEntityProperties(const std::vector<Entity>& entities,
+                                         const MeshCollisionData& mcd,
+                                         b3BodyDef& bodyDef,
+                                         b3ShapeDef& shapeDef)
+{
+    float f = 0.0f;
+    int i = 0;
+    bool b = false;
+    uint64_t u64 = 0;
+    Vector3 vec{};
+
+    if (ParseVec3Property(entities, mcd, "velocity", vec) ||
+        ParseVec3Property(entities, mcd, "linear_velocity", vec)) {
+        bodyDef.linearVelocity = ToB3Vec3(ConvertTBPointEntityToWorld(vec));
+    }
+    if (ParseVec3Property(entities, mcd, "angular_velocity", vec)) {
+        bodyDef.angularVelocity = ToB3Vec3(ConvertTBPointEntityToWorld(vec));
+    }
+
+    if (ParseFloatProperty(entities, mcd, "linear_damping", f)) {
+        bodyDef.linearDamping = std::max(0.0f, f);
+    }
+    if (ParseFloatProperty(entities, mcd, "angular_damping", f)) {
+        bodyDef.angularDamping = std::max(0.0f, f);
+    }
+    if (ParseFloatProperty(entities, mcd, "gravity_scale", f)) {
+        bodyDef.gravityScale = f;
+    }
+    if (ParseFloatProperty(entities, mcd, "sleep_threshold", f)) {
+        bodyDef.sleepThreshold = std::max(0.0f, f);
+    }
+
+    if (ParseBoolProperty(entities, mcd, "enable_sleep", b)) bodyDef.enableSleep = b;
+    if (ParseBoolProperty(entities, mcd, "start_awake", b)) bodyDef.isAwake = b;
+    if (ParseBoolProperty(entities, mcd, "enabled", b)) bodyDef.isEnabled = b;
+    if (ParseBoolProperty(entities, mcd, "bullet", b)) bodyDef.isBullet = b;
+    if (ParseBoolProperty(entities, mcd, "allow_fast_rotation", b)) bodyDef.allowFastRotation = b;
+    if (ParseBoolProperty(entities, mcd, "contact_recycling", b)) bodyDef.enableContactRecycling = b;
+
+    if (ParseBoolProperty(entities, mcd, "lock_linear_x", b)) bodyDef.motionLocks.linearX = b;
+    if (ParseBoolProperty(entities, mcd, "lock_linear_y", b)) bodyDef.motionLocks.linearY = b;
+    if (ParseBoolProperty(entities, mcd, "lock_linear_z", b)) bodyDef.motionLocks.linearZ = b;
+    if (ParseBoolProperty(entities, mcd, "lock_angular_x", b)) bodyDef.motionLocks.angularX = b;
+    if (ParseBoolProperty(entities, mcd, "lock_angular_y", b)) bodyDef.motionLocks.angularY = b;
+    if (ParseBoolProperty(entities, mcd, "lock_angular_z", b)) bodyDef.motionLocks.angularZ = b;
+
+    if (ParseFloatProperty(entities, mcd, "density", f)) {
+        shapeDef.density = std::max(0.0f, f);
+    }
+    if (ParseFloatProperty(entities, mcd, "friction", f)) {
+        shapeDef.baseMaterial.friction = std::max(0.0f, f);
+    }
+    if (ParseFloatProperty(entities, mcd, "restitution", f)) {
+        shapeDef.baseMaterial.restitution = std::max(0.0f, f);
+    }
+    if (ParseFloatProperty(entities, mcd, "rolling_resistance", f)) {
+        shapeDef.baseMaterial.rollingResistance = std::max(0.0f, f);
+    }
+    if (ParseFloatProperty(entities, mcd, "explosion_scale", f)) {
+        shapeDef.explosionScale = std::max(0.0f, f);
+    }
+    if (ParseVec3Property(entities, mcd, "tangent_velocity", vec)) {
+        shapeDef.baseMaterial.tangentVelocity = ToB3Vec3(ConvertTBPointEntityToWorld(vec));
+    }
+
+    if (ParseBoolProperty(entities, mcd, "sensor", b)) shapeDef.isSensor = b;
+    if (ParseBoolProperty(entities, mcd, "sensor_events", b)) shapeDef.enableSensorEvents = b;
+    if (ParseBoolProperty(entities, mcd, "contact_events", b)) shapeDef.enableContactEvents = b;
+    if (ParseBoolProperty(entities, mcd, "hit_events", b)) shapeDef.enableHitEvents = b;
+    if (ParseBoolProperty(entities, mcd, "presolve_events", b)) shapeDef.enablePreSolveEvents = b;
+    if (ParseBoolProperty(entities, mcd, "invoke_contact_creation", b)) shapeDef.invokeContactCreation = b;
+    if (ParseBoolProperty(entities, mcd, "custom_filtering", b)) shapeDef.enableCustomFiltering = b;
+    if (ParseBoolProperty(entities, mcd, "update_body_mass", b)) shapeDef.updateBodyMass = b;
+
+    if (ParseIntProperty(entities, mcd, "group_index", i)) {
+        shapeDef.filter.groupIndex = i;
+    }
+    if (ParseU64Property(entities, mcd, "material_id", u64)) {
+        shapeDef.baseMaterial.userMaterialId = u64;
+    }
+    if (ParseU64Property(entities, mcd, "custom_color", u64)) {
+        shapeDef.baseMaterial.customColor = (uint32_t)u64;
+    }
+    if (ParseU64Property(entities, mcd, "category_bits", u64)) {
+        shapeDef.filter.categoryBits = u64;
+    }
+    if (ParseU64Property(entities, mcd, "mask_bits", u64)) {
+        shapeDef.filter.maskBits = u64;
+    }
+
+    shapeDef.density *= PHYSICS_DENSITY_SCALE;
+}
+
+static void ApplyMassOverride(const std::vector<Entity>& entities,
+                              const MeshCollisionData& mcd,
+                              const b3HullData* hull,
+                              const b3ShapeDef& shapeDef,
+                              b3BodyId body)
+{
+    float mass = 0.0f;
+    if (!ParseFloatProperty(entities, mcd, "mass", mass) || mass <= 0.0f) {
+        return;
+    }
+
+    b3MassData massData = b3ComputeHullMass(hull, shapeDef.density);
+    if (massData.mass <= 0.0f) {
+        printf("[physics] %s entity=%d mass override ignored because computed mass is zero\n",
+               GetEntityClassname(entities, mcd),
+               mcd.entityIndex);
+        return;
+    }
+
+    const float scale = mass / massData.mass;
+    massData.mass = mass;
+    massData.inertia = b3MulSM(scale, massData.inertia);
+    b3Body_SetMassData(body, massData);
+}
+
+static void AddDynamicRenderHull(b3BodyId bodyId, const b3HullData* hull)
+{
+    const b3Vec3* points = b3GetHullPoints(hull);
+    const b3HullHalfEdge* edges = b3GetHullEdges(hull);
+    const b3HullFace* faces = b3GetHullFaces(hull);
+    if (points == nullptr || edges == nullptr || faces == nullptr) {
+        return;
+    }
+
+    DynamicPhysicsRenderHull renderHull;
+    renderHull.bodyId = bodyId;
+    renderHull.edges.reserve((size_t)hull->edgeCount / 2);
+
+    for (int edgeIndex = 0; edgeIndex < hull->edgeCount; ++edgeIndex) {
+        const b3HullHalfEdge& edge = edges[edgeIndex];
+        if (edgeIndex > (int)edge.twin) {
+            continue;
+        }
+
+        const b3HullHalfEdge& twin = edges[edge.twin];
+        renderHull.edges.push_back({ points[edge.origin], points[twin.origin] });
+    }
+
+    for (int faceIndex = 0; faceIndex < hull->faceCount; ++faceIndex) {
+        std::vector<b3Vec3> facePoints;
+        uint8_t edgeIndex = faces[faceIndex].edge;
+        const uint8_t startEdge = edgeIndex;
+        do {
+            const b3HullHalfEdge& edge = edges[edgeIndex];
+            facePoints.push_back(points[edge.origin]);
+            edgeIndex = edge.next;
+        } while (edgeIndex != startEdge && facePoints.size() <= (size_t)hull->edgeCount);
+
+        if (facePoints.size() < 3) {
+            continue;
+        }
+
+        for (size_t i = 1; i + 1 < facePoints.size(); ++i) {
+            renderHull.triangles.push_back({ facePoints[0], facePoints[i], facePoints[i + 1] });
+        }
+    }
+
+    sDynamicRenderHulls.push_back(std::move(renderHull));
+}
+
+} // namespace
+
 //--------------------------------------//
 // Implementation
 //--------------------------------------//
@@ -45,7 +435,7 @@ void InitPhysicsSystem()
     // above Box3D's linear slope (0.005 * lengthUnits) or casts that start near
     // a surface report an initial overlap with a zero normal.
     b3WorldDef worldDef = b3DefaultWorldDef();
-    worldDef.gravity = b3Vec3{ 0.0f, -98.1f, 0.0f };
+    worldDef.gravity = b3Vec3{ 0.0f, -800.1f, 0.0f };
 
     const unsigned hw = std::thread::hardware_concurrency();
     worldDef.workerCount = std::clamp(hw > 1 ? hw - 1 : 1u, 1u, (unsigned)B3_MAX_WORKERS);
@@ -63,6 +453,8 @@ void ShutdownPhysicsSystem()
     b3DestroyWorld(g_physicsWorld);
     g_physicsWorld = B3_NULL_ID;
     debugSphereID  = B3_NULL_ID;
+    sDynamicRenderHulls.clear();
+    sMapHullBodies.clear();
 
     printf("[ShutdownPhysicsSystem] Freed Box3D resources.\n");
 }
@@ -74,6 +466,7 @@ void UpdatePhysicsSystem(float delta_time)
 
     const int subStepCount = 4;
     b3World_Step(g_physicsWorld, delta_time, subStepCount);
+    GameplayEntities::UpdateDynamicBodyEffects(delta_time);
 
     // Trigger volumes are sensor shapes, dynamic bodies entering them show up here.
     b3SensorEvents sensorEvents = b3World_GetSensorEvents(g_physicsWorld);
@@ -89,43 +482,30 @@ void UpdatePhysicsSystem(float delta_time)
     }
 }
 
-void SpawnDebugPhysObj()
-{
-    b3BodyDef bodyDef = b3DefaultBodyDef();
-    bodyDef.type = b3_dynamicBody;
-    bodyDef.position = b3Pos{ 0.0f, 1500.0f, -180.0f };
-
-    debugSphereID = b3CreateBody(g_physicsWorld, &bodyDef);
-
-    b3ShapeDef shapeDef = b3DefaultShapeDef();
-    shapeDef.filter.categoryBits = Layers::MOVING;
-    shapeDef.filter.maskBits = Layers::STATIC | Layers::MOVING | Layers::SENSOR;
-    shapeDef.enableSensorEvents = true;
-
-    b3Sphere sphere = { b3Vec3_zero, 10.0f };
-    b3CreateSphereShape(debugSphereID, &shapeDef, &sphere);
-
-    printf("\n --TEST OBJECT SPAWNED-- \n");
-}
-
 void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
                      const std::vector<Entity> &entities)
 {
     int count = 0;
+    sDynamicRenderHulls.clear();
+    sMapHullBodies.assign(meshCollisionData.size(), B3_NULL_ID);
     GameplayEntities::Reset();
     GameplayEntities::RegisterPointEntities(entities);
 
-    for (auto &mcd : meshCollisionData) {
+    for (size_t hullIndex = 0; hullIndex < meshCollisionData.size(); ++hullIndex) {
+        const MeshCollisionData& mcd = meshCollisionData[hullIndex];
         // If NO_COLLIDE or something similar, we skip
         if (mcd.collisionType == CollisionType::NO_COLLIDE) {
             continue;
         }
 
-        // Convert engine vectors to Box3D points
+        Vector3 bodyCenter = ComputePointCenter(mcd.vertices);
+
+        // Convert engine vectors to Box3D local-space points.
         std::vector<b3Vec3> points;
         points.reserve(mcd.vertices.size());
         for (auto &v : mcd.vertices) {
-            points.push_back(b3Vec3{ v.x, v.y, v.z });
+            Vector3 local = Vector3Subtract(v, bodyCenter);
+            points.push_back(b3Vec3{ local.x, local.y, local.z });
         }
 
         if (points.size() < 4) {
@@ -162,10 +542,11 @@ void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
                 break;
             }
             case CollisionType::DYNAMIC: {
-                bodyDef.type = b3_dynamicBody;
+                bodyDef.type = ReadBodyType(entities, mcd, b3_dynamicBody);
                 shapeDef.filter.categoryBits = Layers::MOVING;
                 shapeDef.filter.maskBits = Layers::STATIC | Layers::MOVING | Layers::SENSOR;
                 shapeDef.enableSensorEvents = true;
+                ApplyPhysicsEntityProperties(entities, mcd, bodyDef, shapeDef);
                 break;
             }
             // NO_COLLIDE or UNKNOWN => skip
@@ -175,7 +556,7 @@ void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
             }
         }
 
-        // Brush geometry is already in world space, so the body sits at the origin.
+        bodyDef.position = b3Pos{ bodyCenter.x, bodyCenter.y, bodyCenter.z };
         b3BodyId body = b3CreateBody(g_physicsWorld, &bodyDef);
         if (B3_IS_NULL(body)) {
             printf("Failed to create body for a brush\n");
@@ -184,13 +565,21 @@ void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
         }
 
         b3ShapeId shape = b3CreateHullShape(body, &shapeDef, hull);
-        b3DestroyHull(hull); // the world interns hull data in its hull database
 
         if (B3_IS_NULL(shape)) {
             printf("Failed to create hull shape for a brush\n");
             b3DestroyBody(body);
+            b3DestroyHull(hull);
             continue;
         }
+
+        sMapHullBodies[hullIndex] = body;
+
+        if (mcd.collisionType == CollisionType::DYNAMIC) {
+            ApplyMassOverride(entities, mcd, hull, shapeDef, body);
+            AddDynamicRenderHull(body, hull);
+        }
+        b3DestroyHull(hull); // the world interns hull data in its hull database
 
         if (mcd.entityIndex >= 0 && (size_t)mcd.entityIndex < entities.size()) {
             GameplayEntities::RegisterBrushEntity(entities[(size_t)mcd.entityIndex], mcd.entityIndex, body);
@@ -199,4 +588,38 @@ void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
     }
 
     printf("\n\n %d MAP COLLISIONS SUCCESSFULLY CREATED \n\n", count);
+}
+
+b3BodyId GetMapPhysicsBodyForHull(size_t hullIndex)
+{
+    if (hullIndex >= sMapHullBodies.size()) {
+        return B3_NULL_ID;
+    }
+    return sMapHullBodies[hullIndex];
+}
+
+void DebugDrawPhysicsObjects()
+{
+    const Color fillColor = WCOLOR(70, 100, 220, 180);
+    const Color edgeColor = WCOLOR(220, 230, 255, 255);
+
+    for (const DynamicPhysicsRenderHull& renderHull : sDynamicRenderHulls) {
+        if (!b3Body_IsValid(renderHull.bodyId)) {
+            continue;
+        }
+
+        const b3WorldTransform transform = b3Body_GetTransform(renderHull.bodyId);
+        for (const auto& tri : renderHull.triangles) {
+            Debug_Triangle(TransformLocalPoint(transform, tri[0]),
+                           TransformLocalPoint(transform, tri[1]),
+                           TransformLocalPoint(transform, tri[2]),
+                           fillColor);
+        }
+
+        for (const auto& edge : renderHull.edges) {
+            Debug_Line(TransformLocalPoint(transform, edge[0]),
+                       TransformLocalPoint(transform, edge[1]),
+                       edgeColor);
+        }
+    }
 }

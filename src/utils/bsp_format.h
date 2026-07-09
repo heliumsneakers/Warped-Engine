@@ -6,7 +6,8 @@
 #include <cstdint>
 
 #define WBSP_MAGIC    0x50534257u   // 'WBSP' little-endian
-#define WBSP_VERSION  5u
+#define WBSP_VERSION  6u
+#define WBSP_VERSION_DYNAMIC_MESHES 6u
 #define WBSP_VERSION_LIGHTMAP_FORMAT 4u
 #define WBSP_VERSION_HULL_ENTITY_REFS 5u
 #define WBSP_VERSION_LIGHTMAP_RGBA8 3u
@@ -32,6 +33,9 @@ enum {
     LUMP_BSP_NODES,      // BSPNode[]
     LUMP_BSP_LEAVES,     // BSPLeaf[]
     LUMP_BSP_FACE_REFS,  // uint32_t[]
+    LUMP_DYNAMIC_MESHES,    // BSPDynamicMesh[]
+    LUMP_DYNAMIC_VERTICES,  // BSPVertex[] local-space dynamic render vertices
+    LUMP_DYNAMIC_INDICES,   // uint32_t[]
     LUMP_COUNT
 };
 
@@ -79,6 +83,16 @@ struct BSPHull {
     uint32_t pointCount;
     uint32_t collisionType;   // maps to enum CollisionType
     int32_t  entityIndex;     // source Entity index in the entity lump, -1 if none / unavailable
+    int32_t  brushIndex;      // source brush index inside the entity, -1 if unavailable
+};
+
+struct BSPDynamicMesh {
+    uint32_t hullIndex;     // index into BSPHull / BSPData::hulls
+    uint32_t textureIndex;
+    uint32_t firstIndex;
+    uint32_t indexCount;
+    uint32_t firstVertex;
+    uint32_t vertexCount;
 };
 
 struct BSPLightmapLumpHeader {

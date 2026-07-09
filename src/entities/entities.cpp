@@ -42,6 +42,26 @@ struct ActiveBoostState {
     float targetAlongDirection = 0.0f;
 };
 
+struct BoostBodyPair {
+    BodyKey boostBody = 0;
+    BodyKey visitorBody = 0;
+
+    bool operator==(const BoostBodyPair& other) const
+    {
+        return boostBody == other.boostBody && visitorBody == other.visitorBody;
+    }
+};
+
+struct BoostBodyPairHash {
+    size_t operator()(const BoostBodyPair& pair) const
+    {
+        uint64_t x = pair.boostBody;
+        uint64_t y = pair.visitorBody;
+        x ^= y + 0x9e3779b97f4a7c15ull + (x << 6u) + (x >> 2u);
+        return (size_t)x;
+    }
+};
+
 struct CheckPoint {
     int entityIndex = -1;
     std::string targetname;
@@ -64,6 +84,7 @@ struct TeleportTrigger {
 std::vector<BoostVolume> sBoostVolumes;
 std::unordered_map<BodyKey, size_t> sBoostVolumesByBody;
 std::unordered_map<BodyKey, ActiveBoostState> sActivePlayerBoosts;
+std::unordered_map<BoostBodyPair, ActiveBoostState, BoostBodyPairHash> sActiveBodyBoosts;
 std::vector<CheckPoint> sCheckPoints;
 std::unordered_map<std::string, size_t> sCheckPointsByTargetname;
 std::vector<TeleportTrigger> sTeleportTriggers;
@@ -217,6 +238,7 @@ void Reset()
     sBoostVolumes.clear();
     sBoostVolumesByBody.clear();
     sActivePlayerBoosts.clear();
+    sActiveBodyBoosts.clear();
     sCheckPoints.clear();
     sCheckPointsByTargetname.clear();
     sTeleportTriggers.clear();
@@ -396,6 +418,89 @@ PlayerEffectResult ApplyPlayerEffects(const b3ShapeProxy* playerProxy,
     }
 
     return result;
+}
+
+void UpdateDynamicBodyEffects(float deltaTime)
+{
+    if (!b3World_IsValid(g_physicsWorld) || sBoostVolumes.empty()) {
+        sActiveBodyBoosts.clear();
+        return;
+    }
+
+    std::unordered_set<BoostBodyPair, BoostBodyPairHash> touchedPairs;
+
+    for (const BoostVolume& boostVolume : sBoostVolumes) {
+        b3BodyId boostBody = b3LoadBodyId(boostVolume.bodyKey);
+        if (!b3Body_IsValid(boostBody)) {
+            continue;
+        }
+
+        const int shapeCount = b3Body_GetShapeCount(boostBody);
+        if (shapeCount <= 0) {
+            continue;
+        }
+
+        std::vector<b3ShapeId> sensorShapes((size_t)shapeCount);
+        const int storedShapeCount = b3Body_GetShapes(boostBody, sensorShapes.data(), shapeCount);
+        for (int shapeIndex = 0; shapeIndex < storedShapeCount; ++shapeIndex) {
+            const b3ShapeId sensorShape = sensorShapes[(size_t)shapeIndex];
+            if (!b3Shape_IsValid(sensorShape)) {
+                continue;
+            }
+
+            const int visitorCapacity = b3Shape_GetSensorCapacity(sensorShape);
+            if (visitorCapacity <= 0) {
+                continue;
+            }
+
+            std::vector<b3ShapeId> visitorShapes((size_t)visitorCapacity);
+            const int visitorCount = b3Shape_GetSensorData(sensorShape, visitorShapes.data(), visitorCapacity);
+            for (int visitorIndex = 0; visitorIndex < visitorCount; ++visitorIndex) {
+                const b3ShapeId visitorShape = visitorShapes[(size_t)visitorIndex];
+                if (!b3Shape_IsValid(visitorShape)) {
+                    continue;
+                }
+
+                const b3BodyId visitorBody = b3Shape_GetBody(visitorShape);
+                if (!b3Body_IsValid(visitorBody) || b3Body_GetType(visitorBody) != b3_dynamicBody) {
+                    continue;
+                }
+
+                const BodyKey visitorBodyKey = b3StoreBodyId(visitorBody);
+                if (visitorBodyKey == boostVolume.bodyKey) {
+                    continue;
+                }
+
+                const BoostBodyPair pair{ boostVolume.bodyKey, visitorBodyKey };
+                touchedPairs.insert(pair);
+
+                b3Vec3 linearVelocityB3 = b3Body_GetLinearVelocity(visitorBody);
+                Vector3 linearVelocity = { linearVelocityB3.x, linearVelocityB3.y, linearVelocityB3.z };
+
+                auto activeIt = sActiveBodyBoosts.find(pair);
+                if (activeIt == sActiveBodyBoosts.end()) {
+                    ActiveBoostState activeBoostState;
+                    activeBoostState.targetAlongDirection =
+                        Vector3DotProduct(linearVelocity, boostVolume.direction) + boostVolume.boostAmount;
+                    activeIt = sActiveBodyBoosts.emplace(pair, activeBoostState).first;
+                }
+
+                if (!ApplyBoostVolume(boostVolume, activeIt->second, deltaTime, linearVelocity)) {
+                    continue;
+                }
+
+                b3Body_SetLinearVelocity(visitorBody, b3Vec3{ linearVelocity.x, linearVelocity.y, linearVelocity.z });
+            }
+        }
+    }
+
+    for (auto it = sActiveBodyBoosts.begin(); it != sActiveBodyBoosts.end(); ) {
+        if (touchedPairs.find(it->first) == touchedPairs.end()) {
+            it = sActiveBodyBoosts.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 TriggerTeleportResult QueryPlayerTeleportTrigger(const b3ShapeProxy* playerProxy,

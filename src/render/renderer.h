@@ -44,6 +44,11 @@ struct SubMesh {
 
 struct MapModel {
     std::vector<SubMesh> meshes;
+    struct DynamicSubMesh {
+        SubMesh mesh;
+        uint32_t hullIndex = 0;
+    };
+    std::vector<DynamicSubMesh> dynamicMeshes;
     std::vector<sg_image> lightmapImages;
     std::vector<sg_view>  lightmapViews;
 };
@@ -64,6 +69,11 @@ void      Renderer_DrawMapNormals(const MapModel& mdl,
                                   const Matrix&   mvp,
                                   const Matrix&   normalModel,
                                   const Frustum&  frustum);
+void      Renderer_DrawDynamicMap(const MapModel& mdl,
+                                  const Matrix&   vp);
+void      Renderer_DrawDynamicMapNormals(const MapModel& mdl,
+                                         const Matrix&   vp,
+                                         const Matrix&   view);
 void      Renderer_DestroyMap(MapModel& mdl);
 
 sg_sampler Renderer_DefaultSampler(void);

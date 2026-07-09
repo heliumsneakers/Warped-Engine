@@ -12,6 +12,7 @@
 #include "../physx/collision_data.h"
 #include "lightmap.h"
 #include "map_geometry.h"
+#include "map_polygons.h"
 #include "structural_bsp.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -110,6 +111,26 @@ static Vector3 ProbeTextureAverageColor(const std::string& mapDir,
 
     cache[name] = avgColor;
     return avgColor;
+}
+
+static Vector3 ComputePointCenter(const std::vector<Vector3>& points)
+{
+    if (points.empty()) {
+        return Vector3Zero();
+    }
+
+    Vector3 minPoint = points.front();
+    Vector3 maxPoint = points.front();
+    for (const Vector3& p : points) {
+        minPoint.x = std::min(minPoint.x, p.x);
+        minPoint.y = std::min(minPoint.y, p.y);
+        minPoint.z = std::min(minPoint.z, p.z);
+        maxPoint.x = std::max(maxPoint.x, p.x);
+        maxPoint.y = std::max(maxPoint.y, p.y);
+        maxPoint.z = std::max(maxPoint.z, p.z);
+    }
+
+    return Vector3Scale(Vector3Add(minPoint, maxPoint), 0.5f);
 }
 
 // --------------------------------------------------------------------------
@@ -372,8 +393,115 @@ int main(int argc, char** argv)
         h.pointCount    = (uint32_t)c.vertices.size();
         h.collisionType = (uint32_t)c.collisionType;
         h.entityIndex   = c.entityIndex;
+        h.brushIndex    = c.brushIndex;
         for (auto& v : c.vertices) hullPts.push_back({v.x,v.y,v.z});
         hulls.push_back(h);
+    }
+
+    // ----- dynamic render geometry ---------------------------------------
+    std::vector<BSPDynamicMesh> dynamicMeshes;
+    std::vector<BSPVertex> dynamicVertices;
+    std::vector<uint32_t> dynamicIndices;
+
+    struct DynamicBucket {
+        uint32_t textureIndex = 0;
+        std::vector<BSPVertex> vertices;
+        std::vector<uint32_t> indices;
+    };
+
+    for (size_t hullIndex = 0; hullIndex < coll.size(); ++hullIndex) {
+        const MeshCollisionData& c = coll[hullIndex];
+        if (c.collisionType != CollisionType::DYNAMIC ||
+            c.entityIndex < 0 ||
+            c.brushIndex < 0 ||
+            (size_t)c.entityIndex >= map.entities.size()) {
+            continue;
+        }
+
+        const Entity& sourceEntity = map.entities[(size_t)c.entityIndex];
+        if ((size_t)c.brushIndex >= sourceEntity.brushes.size()) {
+            continue;
+        }
+
+        Entity singleBrush = sourceEntity;
+        singleBrush.brushes.clear();
+        singleBrush.brushes.push_back(sourceEntity.brushes[(size_t)c.brushIndex]);
+
+        std::vector<MapPolygon> polys;
+        int nextLightBrushGroup = 0;
+        int nextSourceBrushId = 0;
+        size_t sourceFaceCount = 0;
+        AppendBrushEntityPolygons(singleBrush,
+                                  c.entityIndex,
+                                  /*devMode=*/true,
+                                  /*exteriorOnly=*/false,
+                                  &nextLightBrushGroup,
+                                  &nextSourceBrushId,
+                                  &sourceFaceCount,
+                                  polys);
+        if (polys.empty()) {
+            continue;
+        }
+
+        const Vector3 bodyCenter = ComputePointCenter(c.vertices);
+        std::unordered_map<uint32_t, DynamicBucket> dynamicBuckets;
+
+        for (const MapPolygon& p : polys) {
+            const std::string textureName = p.texture.empty() ? std::string("default") : p.texture;
+            const uint32_t ti = GetTex(textureName);
+            const TexInfo td = ProbeTexture(mapDir, textureName, texCache);
+            DynamicBucket& b = dynamicBuckets[ti];
+            b.textureIndex = ti;
+
+            const uint32_t base = (uint32_t)b.vertices.size();
+            b.vertices.reserve(b.vertices.size() + p.verts.size());
+            for (const Vector3& vp : p.verts) {
+                const Vector3 local = Vector3Subtract(vp, bodyCenter);
+                const Vector2 uv = ComputeFaceUV(vp,
+                                                 p.texAxisU,
+                                                 p.texAxisV,
+                                                 p.offU,
+                                                 p.offV,
+                                                 p.rot,
+                                                 p.scaleU,
+                                                 p.scaleV,
+                                                 (float)td.w,
+                                                 (float)td.h);
+                b.vertices.push_back({
+                    local.x, local.y, local.z,
+                    p.normal.x, p.normal.y, p.normal.z,
+                    uv.x, uv.y,
+                    0.0f, 0.0f
+                });
+            }
+
+            const std::vector<uint32_t> triIndices = TriangulatePolygonIndices(p.verts, p.normal);
+            b.indices.reserve(b.indices.size() + triIndices.size());
+            for (uint32_t triIndex : triIndices) {
+                b.indices.push_back(base + triIndex);
+            }
+        }
+
+        for (auto& kv : dynamicBuckets) {
+            DynamicBucket& b = kv.second;
+            if (b.vertices.empty() || b.indices.empty()) {
+                continue;
+            }
+
+            BSPDynamicMesh m{};
+            m.hullIndex = (uint32_t)hullIndex;
+            m.textureIndex = b.textureIndex;
+            m.firstVertex = (uint32_t)dynamicVertices.size();
+            m.vertexCount = (uint32_t)b.vertices.size();
+            m.firstIndex = (uint32_t)dynamicIndices.size();
+            m.indexCount = (uint32_t)b.indices.size();
+
+            dynamicVertices.insert(dynamicVertices.end(), b.vertices.begin(), b.vertices.end());
+            for (uint32_t i : b.indices) {
+                dynamicIndices.push_back(i + m.firstVertex);
+            }
+            dynamicMeshes.push_back(m);
+        }
     }
 
     // ----- entity text -----------------------------------------------------
@@ -441,6 +569,9 @@ int main(int argc, char** argv)
     lw.Write   (LUMP_BSP_NODES, structural.nodes);
     lw.Write   (LUMP_BSP_LEAVES, structural.leaves);
     lw.Write   (LUMP_BSP_FACE_REFS, structural.faceRefs);
+    lw.Write   (LUMP_DYNAMIC_MESHES, dynamicMeshes);
+    lw.Write   (LUMP_DYNAMIC_VERTICES, dynamicVertices);
+    lw.Write   (LUMP_DYNAMIC_INDICES, dynamicIndices);
     lw.End();
     fclose(f);
 
@@ -454,9 +585,10 @@ int main(int argc, char** argv)
     printf("[compile_map] wrote %s\n", outPackName.c_str());
     printf("  textures : %zu\n  vertices : %zu\n  indices  : %zu\n"
            "  meshes   : %zu\n  hulls    : %zu\n  lightmap pages : %zu\n"
-           "  bsp faces: %zu\n  bsp nodes: %zu\n  bsp leaves: %zu\n",
+           "  dynamic meshes : %zu\n  bsp faces: %zu\n  bsp nodes: %zu\n  bsp leaves: %zu\n",
            textures.size(), vertices.size(), indices.size(),
            meshes.size(), hulls.size(), lm.pages.size(),
+           dynamicMeshes.size(),
            structural.faces.size(), structural.nodes.size(), structural.leaves.size());
     return 0;
 }

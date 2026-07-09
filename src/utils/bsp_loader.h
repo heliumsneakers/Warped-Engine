@@ -13,8 +13,14 @@ struct BSPDataLightmapPage {
     std::vector<uint8_t> pixels;
 };
 
+struct BSPDynamicMeshData {
+    uint32_t hullIndex = 0;
+    MapMeshBucket bucket;
+};
+
 struct BSPData {
     std::vector<MapMeshBucket>     buckets;    // per-texture, ready for upload
+    std::vector<BSPDynamicMeshData> dynamicMeshes;
     std::vector<MeshCollisionData> hulls;
     std::vector<Entity>            entities;   // point and brush entities, properties only
     std::vector<BSPDataLightmapPage> lightmapPages;

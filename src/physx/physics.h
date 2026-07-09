@@ -22,7 +22,9 @@ void ShutdownPhysicsSystem();
 
 void UpdatePhysicsSystem(float delta_time);
 
-void SpawnDebugPhysObj();
-
 void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
                      const std::vector<Entity> &entities);
+
+b3BodyId GetMapPhysicsBodyForHull(size_t hullIndex);
+
+void DebugDrawPhysicsObjects();

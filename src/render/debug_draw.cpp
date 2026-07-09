@@ -56,6 +56,15 @@ void Debug_Line(Vector3 a, Vector3 b, Color c) {
     sgl_end();
 }
 
+void Debug_Triangle(Vector3 a, Vector3 b, Vector3 c, Color col) {
+    sgl_begin_triangles();
+        sglc(col);
+        sgl_v3f(a.x, a.y, a.z);
+        sgl_v3f(b.x, b.y, b.z);
+        sgl_v3f(c.x, c.y, c.z);
+    sgl_end();
+}
+
 void Debug_WireBox(Vector3 c, Vector3 he, Color col) {
     Vector3 mn = { c.x-he.x, c.y-he.y, c.z-he.z };
     Vector3 mx = { c.x+he.x, c.y+he.y, c.z+he.z };

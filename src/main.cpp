@@ -96,7 +96,6 @@ static bool LoadSelectedMap(const MapEntry& map) {
     G.mapModel = Renderer_UploadBSP(bsp, G.texMgr);
 
     BuildMapPhysics(bsp.hulls, bsp.entities);
-    SpawnDebugPhysObj();
     InitPlayerPhysics(&G.player);
     RespawnPlayer(&G.player, start.position, start.yaw, start.pitch);
 
@@ -303,11 +302,13 @@ static void frame(void) {
                                                sapp_sample_count());
     if (usePost) {
         Renderer_DrawMap(G.mapModel, mvp, model, frustum);
+        Renderer_DrawDynamicMap(G.mapModel, vp);
         Renderer_EndScenePostPass();
         if (usePost) {
             usePost = Renderer_BeginNormalPostPass(sapp_width(), sapp_height());
             if (usePost) {
                 Renderer_DrawMapNormals(G.mapModel, mvp, normalModel, frustum);
+                Renderer_DrawDynamicMapNormals(G.mapModel, vp, view);
                 Renderer_EndNormalPostPass();
             }
         }
@@ -333,6 +334,7 @@ static void frame(void) {
         pass.swapchain = sglue_swapchain();
         sg_begin_pass(&pass);
             Renderer_DrawMap(G.mapModel, mvp, model, frustum);
+            Renderer_DrawDynamicMap(G.mapModel, vp);
             Debug_Flush();
             sdtx_draw();
         sg_end_pass();

@@ -20,6 +20,7 @@
 #include "shaders/generated/normal.metal_dx11.h"
 #include "shaders/generated/pencil.metal_dx11.h"
 #include "../compiler/map_parser.h"
+#include "../physx/physics.h"
 #include "../utils/bsp_loader.h"
 #include "sokol_gfx.h"
 #include "sokol_glue.h"
@@ -911,37 +912,52 @@ void Renderer_DrawPencilPostProcess(float timeSeconds) {
 // ---------------------------------------------------------------------------
 //  Bucket upload (shared by .map and .bsp paths)
 // ---------------------------------------------------------------------------
+static bool UploadBucket(SubMesh& sm,
+                         const MapMeshBucket& b,
+                         TextureManager& texMgr)
+{
+    if (b.indices.empty()) {
+        return false;
+    }
+
+    sg_buffer_desc vbd = {};
+    vbd.data  = { b.vertices.data(), b.vertices.size() * sizeof(MapVertex) };
+    vbd.label = "map-vbuf";
+    sg_buffer vbuf = sg_make_buffer(&vbd);
+
+    sg_buffer_desc ibd = {};
+    ibd.usage.index_buffer = true;
+    ibd.data  = { b.indices.data(), b.indices.size() * sizeof(uint32_t) };
+    ibd.label = "map-ibuf";
+    sg_buffer ibuf = sg_make_buffer(&ibd);
+
+    const TextureEntry* tex = LoadTextureByName(texMgr, b.texture);
+    uint8_t lr = 0, lg = 0, lb = 0;
+
+    AABB bounds = AABBInvalid();
+    for (auto& v : b.vertices) AABBExtend(&bounds, (Vector3){v.x,v.y,v.z});
+
+    sm = {};
+    sm.vbuf = vbuf;
+    sm.ibuf = ibuf;
+    sm.tex_view = tex->view;
+    sm.index_count = (int)b.indices.size();
+    sm.bounds = bounds;
+    sm.lightmap_page = b.lightmapPage;
+    sm.fullbright = ParseLightBrushTextureName(b.texture, lr, lg, lb);
+    return true;
+}
+
 static void UploadBuckets(MapModel& mdl,
                           const std::vector<MapMeshBucket>& buckets,
                           TextureManager& texMgr)
 {
     mdl.meshes.reserve(buckets.size());
     for (auto& b : buckets) {
-        if (b.indices.empty()) continue;
-
-        sg_buffer_desc vbd = {};
-        vbd.data  = { b.vertices.data(), b.vertices.size() * sizeof(MapVertex) };
-        vbd.label = "map-vbuf";
-        sg_buffer vbuf = sg_make_buffer(&vbd);
-
-        sg_buffer_desc ibd = {};
-        ibd.usage.index_buffer = true;
-        ibd.data  = { b.indices.data(), b.indices.size() * sizeof(uint32_t) };
-        ibd.label = "map-ibuf";
-        sg_buffer ibuf = sg_make_buffer(&ibd);
-
-        const TextureEntry* tex = LoadTextureByName(texMgr, b.texture);
-        uint8_t lr = 0, lg = 0, lb = 0;
-
-        AABB bounds = AABBInvalid();
-        for (auto& v : b.vertices) AABBExtend(&bounds, (Vector3){v.x,v.y,v.z});
-
         SubMesh sm;
-        sm.vbuf=vbuf; sm.ibuf=ibuf; sm.tex_view=tex->view;
-        sm.index_count=(int)b.indices.size(); sm.bounds=bounds;
-        sm.lightmap_page = b.lightmapPage;
-        sm.fullbright = ParseLightBrushTextureName(b.texture, lr, lg, lb);
-        mdl.meshes.push_back(sm);
+        if (UploadBucket(sm, b, texMgr)) {
+            mdl.meshes.push_back(sm);
+        }
     }
 }
 
@@ -958,6 +974,15 @@ MapModel Renderer_UploadBSP(const BSPData& bsp, TextureManager& texMgr) {
     MapModel mdl;
     texMgr.activePackPath = bsp.assetPackPath;
     UploadBuckets(mdl, bsp.buckets, texMgr);
+
+    mdl.dynamicMeshes.reserve(bsp.dynamicMeshes.size());
+    for (const BSPDynamicMeshData& dm : bsp.dynamicMeshes) {
+        MapModel::DynamicSubMesh dsm;
+        if (UploadBucket(dsm.mesh, dm.bucket, texMgr)) {
+            dsm.hullIndex = dm.hullIndex;
+            mdl.dynamicMeshes.push_back(dsm);
+        }
+    }
 
     for (const BSPDataLightmapPage& page : bsp.lightmapPages) {
         if (page.width <= 0 || page.height <= 0 || page.pixels.empty()) {
@@ -996,14 +1021,33 @@ MapModel Renderer_UploadBSP(const BSPData& bsp, TextureManager& texMgr) {
     if (mdl.lightmapViews.empty()) {
         mdl.lightmapViews.push_back(g_whiteLmV);
     }
-    printf("[Renderer] BSP uploaded: %zu submeshes, %zu lightmap pages.\n",
-           mdl.meshes.size(), mdl.lightmapViews.size());
+    printf("[Renderer] BSP uploaded: %zu submeshes, %zu dynamic submeshes, %zu lightmap pages.\n",
+           mdl.meshes.size(), mdl.dynamicMeshes.size(), mdl.lightmapViews.size());
     return mdl;
 }
 
 // ---------------------------------------------------------------------------
 //  Draw
 // ---------------------------------------------------------------------------
+static Matrix MatrixFromB3WorldTransform(b3WorldTransform transform)
+{
+    const b3Matrix3 r = b3MakeMatrixFromQuat(transform.q);
+    Matrix m = MatrixIdentity();
+    m.m0 = r.cx.x;
+    m.m1 = r.cx.y;
+    m.m2 = r.cx.z;
+    m.m4 = r.cy.x;
+    m.m5 = r.cy.y;
+    m.m6 = r.cy.z;
+    m.m8 = r.cz.x;
+    m.m9 = r.cz.y;
+    m.m10 = r.cz.z;
+    m.m12 = (float)transform.p.x;
+    m.m13 = (float)transform.p.y;
+    m.m14 = (float)transform.p.z;
+    return m;
+}
+
 void Renderer_DrawMap(const MapModel& mdl,
                       const Matrix&   mvp,
                       const Matrix&   model,
@@ -1049,6 +1093,47 @@ void Renderer_DrawMap(const MapModel& mdl,
     }
 }
 
+void Renderer_DrawDynamicMap(const MapModel& mdl,
+                             const Matrix&   vp)
+{
+    if (!g_pipeline.id) {
+        return;
+    }
+
+    sg_apply_pipeline(g_pipeline);
+
+    for (const MapModel::DynamicSubMesh& dsm : mdl.dynamicMeshes) {
+        const b3BodyId body = GetMapPhysicsBodyForHull(dsm.hullIndex);
+        if (!b3Body_IsValid(body)) {
+            continue;
+        }
+
+        const Matrix model = MatrixFromB3WorldTransform(b3Body_GetTransform(body));
+        const Matrix mvp = MatrixMultiply(vp, model);
+
+        warped_map_shader_vs_params_t vs = {};
+        float16 m = MatrixToFloat16(mvp);
+        float16 n = MatrixToFloat16(model);
+        for (int i = 0; i < 16; ++i) {
+            vs.u_mvp[i] = m.v[i];
+            vs.u_model[i] = n.v[i];
+        }
+
+        const SubMesh& sm = dsm.mesh;
+        sg_bindings bnd = {};
+        bnd.vertex_buffers[0] = sm.vbuf;
+        bnd.index_buffer = sm.ibuf;
+        bnd.views[VIEW_warped_map_shader_u_tex] = sm.tex_view;
+        bnd.views[VIEW_warped_map_shader_u_lm] = g_whiteLmV;
+        bnd.samplers[SMP_warped_map_shader_u_tex_smp] = g_sampler;
+        bnd.samplers[SMP_warped_map_shader_u_lm_smp] = g_lmSampler;
+
+        sg_apply_bindings(&bnd);
+        sg_apply_uniforms(UB_warped_map_shader_vs_params, { &vs, sizeof(vs) });
+        sg_draw(0, sm.index_count, 1);
+    }
+}
+
 void Renderer_DrawMapNormals(const MapModel& mdl,
                              const Matrix&   mvp,
                              const Matrix&   normalModel,
@@ -1083,12 +1168,56 @@ void Renderer_DrawMapNormals(const MapModel& mdl,
     }
 }
 
+void Renderer_DrawDynamicMapNormals(const MapModel& mdl,
+                                    const Matrix&   vp,
+                                    const Matrix&   view)
+{
+    if (!g_normalPipeline.id) {
+        return;
+    }
+
+    sg_apply_pipeline(g_normalPipeline);
+
+    for (const MapModel::DynamicSubMesh& dsm : mdl.dynamicMeshes) {
+        const b3BodyId body = GetMapPhysicsBodyForHull(dsm.hullIndex);
+        if (!b3Body_IsValid(body)) {
+            continue;
+        }
+
+        const Matrix model = MatrixFromB3WorldTransform(b3Body_GetTransform(body));
+        const Matrix mvp = MatrixMultiply(vp, model);
+        const Matrix normalModel = MatrixMultiply(view, model);
+
+        warped_normal_shader_vs_params_t vs = {};
+        float16 m = MatrixToFloat16(mvp);
+        float16 n = MatrixToFloat16(normalModel);
+        for (int i = 0; i < 16; ++i) {
+            vs.u_mvp[i] = m.v[i];
+            vs.u_normal_model[i] = n.v[i];
+        }
+
+        const SubMesh& sm = dsm.mesh;
+        sg_bindings bnd = {};
+        bnd.vertex_buffers[0] = sm.vbuf;
+        bnd.index_buffer = sm.ibuf;
+
+        sg_apply_bindings(&bnd);
+        sg_apply_uniforms(UB_warped_normal_shader_vs_params, { &vs, sizeof(vs) });
+        sg_draw(0, sm.index_count, 1);
+    }
+}
+
 void Renderer_DestroyMap(MapModel& mdl) {
     for (auto& sm : mdl.meshes) {
         sg_destroy_buffer(sm.vbuf);
         sg_destroy_buffer(sm.ibuf);
     }
     mdl.meshes.clear();
+    for (auto& dsm : mdl.dynamicMeshes) {
+        sg_destroy_buffer(dsm.mesh.vbuf);
+        sg_destroy_buffer(dsm.mesh.ibuf);
+    }
+    mdl.dynamicMeshes.clear();
     for (size_t i = 0; i < mdl.lightmapImages.size(); ++i) {
         if (i < mdl.lightmapViews.size() && mdl.lightmapViews[i].id) {
             sg_destroy_view(mdl.lightmapViews[i]);

@@ -13,12 +13,19 @@ static constexpr uint32_t kLegacyBspVersion = 2u;
 static constexpr uint32_t kRgba8LightmapBspVersion = WBSP_VERSION_LIGHTMAP_RGBA8;
 static constexpr uint32_t kLightmapFormatBspVersion = WBSP_VERSION_LIGHTMAP_FORMAT;
 static constexpr size_t kLegacyLumpCount = 8;
+static constexpr size_t kPreDynamicLumpCount = LUMP_DYNAMIC_MESHES;
 
 #pragma pack(push, 1)
 struct BSPHeaderV2Compat {
     uint32_t magic;
     uint32_t version;
     BSPLump  lumps[kLegacyLumpCount];
+};
+
+struct BSPHeaderV5Compat {
+    uint32_t magic;
+    uint32_t version;
+    BSPLump  lumps[kPreDynamicLumpCount];
 };
 
 struct BSPLightmapPageHeaderV3Compat {
@@ -31,6 +38,13 @@ struct BSPHullV4Compat {
     uint32_t firstPoint;
     uint32_t pointCount;
     uint32_t collisionType;
+};
+
+struct BSPHullV5Compat {
+    uint32_t firstPoint;
+    uint32_t pointCount;
+    uint32_t collisionType;
+    int32_t entityIndex;
 };
 #pragma pack(pop)
 
@@ -47,8 +61,23 @@ static bool ReadHeader(FILE* f, BSPHeader* out) {
     }
 
     fseek(f, 0, SEEK_SET);
-    if (version == WBSP_VERSION || version == kLightmapFormatBspVersion || version == kRgba8LightmapBspVersion) {
+    if (version == WBSP_VERSION) {
         return fread(out, sizeof(*out), 1, f) == 1;
+    }
+    if (version == WBSP_VERSION_HULL_ENTITY_REFS ||
+        version == kLightmapFormatBspVersion ||
+        version == kRgba8LightmapBspVersion) {
+        BSPHeaderV5Compat legacy{};
+        if (fread(&legacy, sizeof(legacy), 1, f) != 1) {
+            return false;
+        }
+        memset(out, 0, sizeof(*out));
+        out->magic = legacy.magic;
+        out->version = legacy.version;
+        for (size_t i = 0; i < kPreDynamicLumpCount; ++i) {
+            out->lumps[i] = legacy.lumps[i];
+        }
+        return true;
     }
     if (version == kLegacyBspVersion) {
         BSPHeaderV2Compat legacy{};
@@ -97,8 +126,20 @@ bool LoadBSP(const char* path, BSPData& out)
     auto meshes   = ReadLump<BSPMesh>   (f, hdr.lumps[LUMP_MESHES]);
     auto hullPts  = ReadLump<BSPVec3>   (f, hdr.lumps[LUMP_HULL_PTS]);
     std::vector<BSPHull> hulls;
-    if (hdr.version >= WBSP_VERSION_HULL_ENTITY_REFS) {
+    if (hdr.version >= WBSP_VERSION_DYNAMIC_MESHES) {
         hulls = ReadLump<BSPHull>(f, hdr.lumps[LUMP_HULLS]);
+    } else if (hdr.version >= WBSP_VERSION_HULL_ENTITY_REFS) {
+        std::vector<BSPHullV5Compat> legacyHulls = ReadLump<BSPHullV5Compat>(f, hdr.lumps[LUMP_HULLS]);
+        hulls.reserve(legacyHulls.size());
+        for (const BSPHullV5Compat& legacyHull : legacyHulls) {
+            BSPHull hull{};
+            hull.firstPoint = legacyHull.firstPoint;
+            hull.pointCount = legacyHull.pointCount;
+            hull.collisionType = legacyHull.collisionType;
+            hull.entityIndex = legacyHull.entityIndex;
+            hull.brushIndex = -1;
+            hulls.push_back(hull);
+        }
     } else {
         std::vector<BSPHullV4Compat> legacyHulls = ReadLump<BSPHullV4Compat>(f, hdr.lumps[LUMP_HULLS]);
         hulls.reserve(legacyHulls.size());
@@ -108,6 +149,7 @@ bool LoadBSP(const char* path, BSPData& out)
             hull.pointCount = legacyHull.pointCount;
             hull.collisionType = legacyHull.collisionType;
             hull.entityIndex = -1;
+            hull.brushIndex = -1;
             hulls.push_back(hull);
         }
     }
@@ -129,12 +171,38 @@ bool LoadBSP(const char* path, BSPData& out)
         out.buckets.push_back(std::move(b));
     }
 
+    // ----- dynamic render meshes -----------------------------------------
+    if (hdr.version >= WBSP_VERSION_DYNAMIC_MESHES) {
+        auto dynamicMeshes = ReadLump<BSPDynamicMesh>(f, hdr.lumps[LUMP_DYNAMIC_MESHES]);
+        auto dynamicVerts = ReadLump<BSPVertex>(f, hdr.lumps[LUMP_DYNAMIC_VERTICES]);
+        auto dynamicIdx = ReadLump<uint32_t>(f, hdr.lumps[LUMP_DYNAMIC_INDICES]);
+
+        out.dynamicMeshes.reserve(dynamicMeshes.size());
+        for (const BSPDynamicMesh& m : dynamicMeshes) {
+            BSPDynamicMeshData dm;
+            dm.hullIndex = m.hullIndex;
+            dm.bucket.texture = textures[m.textureIndex].name;
+            dm.bucket.lightmapPage = 0;
+            dm.bucket.vertices.reserve(m.vertexCount);
+            for (uint32_t i = 0; i < m.vertexCount; ++i) {
+                const BSPVertex& v = dynamicVerts[m.firstVertex + i];
+                dm.bucket.vertices.push_back({ v.x, v.y, v.z, v.nx, v.ny, v.nz, v.u, v.v, v.lu, v.lv });
+            }
+            dm.bucket.indices.reserve(m.indexCount);
+            for (uint32_t i = 0; i < m.indexCount; ++i) {
+                dm.bucket.indices.push_back(dynamicIdx[m.firstIndex + i] - m.firstVertex);
+            }
+            out.dynamicMeshes.push_back(std::move(dm));
+        }
+    }
+
     // ----- collision hulls -----------------------------------------------
     out.hulls.reserve(hulls.size());
     for (auto& h : hulls) {
         MeshCollisionData mcd;
         mcd.collisionType = (CollisionType)h.collisionType;
         mcd.entityIndex = h.entityIndex;
+        mcd.brushIndex = h.brushIndex;
         mcd.vertices.reserve(h.pointCount);
         for (uint32_t i=0;i<h.pointCount;++i) {
             const BSPVec3& p = hullPts[h.firstPoint+i];

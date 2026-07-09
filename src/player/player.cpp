@@ -53,6 +53,10 @@ static constexpr float PLAYER_RADIUS = 16.0f;
 static constexpr float PLAYER_HEIGHT = 56.0f;
 static constexpr float PLAYER_HALF_HEIGHT = PLAYER_HEIGHT * 0.5f;
 static constexpr float JUMP_FORCE = 268.0f;
+static constexpr float PLAYER_PUSH_MASS = 800.0f;
+static constexpr float PLAYER_PUSH_RESTITUTION = 0.0f;
+static constexpr float PLAYER_PUSH_MIN_SPEED = 5.0f;
+static constexpr float PLAYER_PUSH_MAX_IMPULSE = PLAYER_PUSH_MASS * MAX_SPEED;
 
 Vector3 velocity = Vector3Zero();
 float playerYaw = 0.0f;
@@ -97,6 +101,7 @@ struct MoveTrace {
     bool startSolid = false;
     float fraction = 1.0f;
     Vector3 endPos = Vector3Zero();
+    Vector3 hitPoint = Vector3Zero();
     Vector3 normal = { 0.0f, 1.0f, 0.0f };
     b3ShapeId shapeID = B3_NULL_ID;
 };
@@ -104,7 +109,9 @@ struct MoveTrace {
 struct GroundSupport {
     bool found = false;
     float centerY = 0.0f;
+    Vector3 point = Vector3Zero();
     Vector3 normal = { 0.0f, 1.0f, 0.0f };
+    b3ShapeId shapeID = B3_NULL_ID;
 };
 
 struct GroundProbeDebug {
@@ -118,6 +125,7 @@ struct GroundProbeDebug {
 static GroundProbeDebug gGroundProbeDebug;
 
 static GroundSupport FindGroundSupport(Vector3 position, float maxDistance);
+static void ApplyPlayerWeightToGroundBody(const GroundSupport& support);
 
 static inline float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 static inline float HorizontalLength(Vector3 v) { return sqrtf(v.x * v.x + v.z * v.z); }
@@ -218,7 +226,9 @@ static bool CollectOverlapShapes(b3ShapeId shapeId, void *context)
 struct PenetrationResult {
     bool hit = false;
     float depth = 0.0f;
+    Vector3 contactPoint = Vector3Zero();
     Vector3 resolveNormal = { 0.0f, 1.0f, 0.0f }; // pushes the player out
+    b3ShapeId shapeID = B3_NULL_ID;
 };
 
 // Collide the player box hull against every nearby shape and return the deepest penetration.
@@ -282,7 +292,9 @@ static PenetrationResult QueryDeepestPenetration(Vector3 position)
             {
                 result.hit = true;
                 result.depth = depth;
+                result.contactPoint = Vector3Add(position, FromB3Vec3(points[p].point));
                 result.resolveNormal = Vector3Scale(FromB3Vec3(manifold.normal), -1.0f);
+                result.shapeID = shapeId;
             }
         }
     }
@@ -293,6 +305,7 @@ static PenetrationResult QueryDeepestPenetration(Vector3 position)
 struct ClosestCastContext {
     bool hit = false;
     float fraction = 1.0f;
+    Vector3 point = Vector3Zero();
     Vector3 normal = { 0.0f, 1.0f, 0.0f };
     b3ShapeId shapeID = B3_NULL_ID;
 };
@@ -300,7 +313,7 @@ struct ClosestCastContext {
 static float ClosestCastCallback(b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction,
                                  uint64_t userMaterialId, int triangleIndex, int childIndex, void *context)
 {
-    (void)point; (void)userMaterialId; (void)triangleIndex; (void)childIndex;
+    (void)userMaterialId; (void)triangleIndex; (void)childIndex;
 
     // Initial overlap hits come back with a zero normal, those surfaces are
     // handled by the manifold based start solid check, not the cast.
@@ -310,9 +323,70 @@ static float ClosestCastCallback(b3ShapeId shapeId, b3Pos point, b3Vec3 normal, 
     auto *castContext = (ClosestCastContext *)context;
     castContext->hit = true;
     castContext->fraction = fraction;
+    castContext->point = { (float)point.x, (float)point.y, (float)point.z };
     castContext->normal = FromB3Vec3(normal);
     castContext->shapeID = shapeId;
     return fraction; // clip the cast for the closest hit
+}
+
+static void PushDynamicBodyFromPlayerContact(b3ShapeId shapeID,
+                                             Vector3 contactPoint,
+                                             Vector3 playerResolveNormal,
+                                             Vector3 moveVelocity)
+{
+    if (B3_IS_NULL(shapeID)) {
+        return;
+    }
+
+    const b3BodyId body = b3Shape_GetBody(shapeID);
+    if (!b3Body_IsValid(body) || b3Body_GetType(body) != b3_dynamicBody) {
+        return;
+    }
+
+    Vector3 pushDir = Vector3Scale(playerResolveNormal, -1.0f);
+    if (pushDir.y > 0.0f) {
+        pushDir.y = 0.0f;
+    }
+
+    const float pushLenSq = Vector3LengthSq(pushDir);
+    if (pushLenSq <= 1e-8f) {
+        return;
+    }
+    pushDir = Vector3Scale(pushDir, 1.0f / sqrtf(pushLenSq));
+
+    const float playerSpeedIntoBody = Vector3DotProduct(moveVelocity, pushDir);
+    if (playerSpeedIntoBody <= PLAYER_PUSH_MIN_SPEED) {
+        return;
+    }
+
+    const b3Vec3 bodyVelocity = b3Body_GetWorldPointVelocity(body, ToB3Pos(contactPoint));
+    const float bodySpeedAlongPush = Vector3DotProduct(FromB3Vec3(bodyVelocity), pushDir);
+    const float relativeSpeed = playerSpeedIntoBody - bodySpeedAlongPush;
+    if (relativeSpeed <= PLAYER_PUSH_MIN_SPEED) {
+        return;
+    }
+
+    const float bodyMass = b3Body_GetMass(body);
+    if (bodyMass <= 0.0f) {
+        return;
+    }
+
+    const float invPlayerMass = 1.0f / PLAYER_PUSH_MASS;
+    const float invBodyMass = 1.0f / bodyMass;
+    float impulseMagnitude = (1.0f + PLAYER_PUSH_RESTITUTION) * relativeSpeed / (invPlayerMass + invBodyMass);
+    impulseMagnitude = fminf(impulseMagnitude, PLAYER_PUSH_MAX_IMPULSE);
+
+    const Vector3 impulse = Vector3Scale(pushDir, impulseMagnitude);
+    b3Body_ApplyLinearImpulse(body, ToB3Vec3(impulse), ToB3Pos(contactPoint), true);
+}
+
+static void PushDynamicBodyFromPlayerHit(const MoveTrace& trace, Vector3 moveVelocity)
+{
+    if (!trace.hit) {
+        return;
+    }
+
+    PushDynamicBodyFromPlayerContact(trace.shapeID, trace.hitPoint, trace.normal, moveVelocity);
 }
 
 static MoveTrace CastPlayerShape(Vector3 start, Vector3 delta)
@@ -348,6 +422,7 @@ static MoveTrace CastPlayerShape(Vector3 start, Vector3 delta)
     trace.hit = true;
     trace.fraction = context.fraction;
     trace.endPos = Vector3Add(start, Vector3Scale(delta, trace.fraction));
+    trace.hitPoint = context.point;
     trace.normal = context.normal;
     trace.shapeID = context.shapeID;
     return trace;
@@ -362,6 +437,11 @@ static bool ResolvePlayerPenetration(Vector3 &position)
         PenetrationResult penetration = QueryDeepestPenetration(position);
         if (!penetration.hit || penetration.depth <= 0.0f)
             return moved;
+
+        PushDynamicBodyFromPlayerContact(penetration.shapeID,
+                                         penetration.contactPoint,
+                                         penetration.resolveNormal,
+                                         velocity);
 
         Vector3 resolve = penetration.resolveNormal;
         const float resolveDistance = penetration.depth + POSITION_EPSILON;
@@ -390,7 +470,9 @@ static bool ResolvePlayerPenetration(Vector3 &position)
 struct GroundCastContext {
     struct Hit {
         float fraction;
+        Vector3 point;
         Vector3 normal;
+        b3ShapeId shapeID;
     };
     Hit hits[MAX_GROUND_HITS];
     int count = 0;
@@ -399,10 +481,15 @@ struct GroundCastContext {
 static float GroundCastCallback(b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction,
                                 uint64_t userMaterialId, int triangleIndex, int childIndex, void *context)
 {
-    (void)shapeId; (void)point; (void)userMaterialId; (void)triangleIndex; (void)childIndex;
+    (void)userMaterialId; (void)triangleIndex; (void)childIndex;
     auto *castContext = (GroundCastContext *)context;
     if (castContext->count < MAX_GROUND_HITS)
-        castContext->hits[castContext->count++] = { fraction, FromB3Vec3(normal) };
+        castContext->hits[castContext->count++] = {
+            fraction,
+            { (float)point.x, (float)point.y, (float)point.z },
+            FromB3Vec3(normal),
+            shapeId
+        };
     return 1.0f; // collect every hit along the cast
 }
 
@@ -451,7 +538,9 @@ static GroundSupport FindGroundSupport(Vector3 position, float maxDistance)
         {
             best.found = true;
             best.centerY = centerY;
+            best.point = context.hits[i].point;
             best.normal = normal;
+            best.shapeID = context.hits[i].shapeID;
             gGroundProbeDebug.hadHit = true;
             gGroundProbeDebug.hitCenter = { probeStart.x, probeCenterY, probeStart.z };
             gGroundProbeDebug.hitNormal = normal;
@@ -459,6 +548,21 @@ static GroundSupport FindGroundSupport(Vector3 position, float maxDistance)
     }
 
     return best;
+}
+
+static void ApplyPlayerWeightToGroundBody(const GroundSupport& support)
+{
+    if (!support.found || B3_IS_NULL(support.shapeID)) {
+        return;
+    }
+
+    const b3BodyId body = b3Shape_GetBody(support.shapeID);
+    if (!b3Body_IsValid(body) || b3Body_GetType(body) != b3_dynamicBody) {
+        return;
+    }
+
+    const Vector3 force = { 0.0f, -PLAYER_PUSH_MASS * GRAVITY, 0.0f };
+    b3Body_ApplyForce(body, ToB3Vec3(force), ToB3Pos(support.point), true);
 }
 
 static inline void PM_ClipVelocity(const Vector3 &in, const Vector3 &normal, Vector3 &out, float overbounce)
@@ -627,6 +731,7 @@ static void CategorizeGround(Vector3 &position, bool allowSnap)
 
     isGrounded = true;
     gGroundNormal = support.normal;
+    ApplyPlayerWeightToGroundBody(support);
 
     // Snap with a small gap so later casts never start inside Box3D's linear
     // slope of the ground (which would report initial overlap and no normal).
@@ -674,6 +779,7 @@ static void SlideMove(Vector3 &position, Vector3 &moveVelocity, float dt, bool p
         if (!trace.hit || trace.fraction >= 1.0f)
             break;
 
+        PushDynamicBodyFromPlayerHit(trace, moveVelocity);
         position = Vector3Add(position, Vector3Scale(trace.normal, POSITION_EPSILON));
 
         if (trace.fraction <= 0.0f && IsWalkableNormal(trace.normal))

@@ -25,9 +25,9 @@ static CollisionType GetEntityCollisionType(const Entity &ent) {
             ct = CollisionType::TRIGGER;
             printf("\n BOOST TRIGGER ENTITY \n");
         }
-        else if (classname.find("func_physics") != std::string::npos) {
+        else if (classname == "ent_physx" || classname.find("func_physics") != std::string::npos) {
             ct = CollisionType::DYNAMIC;
-            printf("\n FUNC_PHYSICS ENTITY \n");
+            printf("\n PHYSICS ENTITY \n");
         }
         else if (classname.find("func_clip") != std::string::npos) {
             ct = CollisionType::STATIC;
@@ -143,7 +143,8 @@ std::vector<MeshCollisionData> ExtractCollisionData(const Map &map)
         CollisionType ct = GetEntityCollisionType(ent);
 
         // 2) For each brush in this entity, build geometry
-        for (auto &brush : ent.brushes) {
+        for (size_t brushIndex = 0; brushIndex < ent.brushes.size(); ++brushIndex) {
+            const Brush& brush = ent.brushes[brushIndex];
             std::vector<Vector3> corners = BuildBrushGeometry(brush);
 
             if (corners.empty()) 
@@ -153,6 +154,7 @@ std::vector<MeshCollisionData> ExtractCollisionData(const Map &map)
             MeshCollisionData mcd;
             mcd.collisionType = ct;
             mcd.entityIndex   = (int)entityIndex;
+            mcd.brushIndex    = (int)brushIndex;
             mcd.vertices      = std::move(corners);
 
             result.push_back(std::move(mcd));

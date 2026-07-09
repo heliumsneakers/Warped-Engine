@@ -31,6 +31,8 @@ PlayerEffectResult ApplyPlayerEffects(const b3ShapeProxy* playerProxy,
                                       float deltaTime,
                                       Vector3& inOutVelocity);
 
+void UpdateDynamicBodyEffects(float deltaTime);
+
 TriggerTeleportResult QueryPlayerTeleportTrigger(const b3ShapeProxy* playerProxy,
                                                  Vector3 playerCenter,
                                                  float deltaTime);

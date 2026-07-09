@@ -250,8 +250,138 @@
     // No additional properties
 ]
 
-// Physics Brush
-@SolidClass base(Targetname) color(128 128 255) = func_physics : "Physics Brush" [
-    mass(float) : "Mass" : "1" : "Mass of the physics object."
-    velocity(string) : "Initial Velocity" : "0 0 0" : "Initial velocity of the object."
+@BaseClass = Box3DPhysicsBody : "Box3D body controls." [
+    body_type(choices) : "Body Type" : 0 =
+    [
+        0 : "Dynamic"
+        1 : "Kinematic"
+        2 : "Static"
+    ]
+    mass(float) : "Mass Override" : "0" : "Optional body mass in kg. 0 uses density-derived mass."
+    density(float) : "Density" : "1000" : "Shape density in kg/m^3 used when mass is not overridden. Physics mass treats 64 map units as 1 meter."
+    friction(float) : "Friction" : "0.6" : "Coulomb friction coefficient."
+    restitution(float) : "Restitution" : "0" : "Bounciness coefficient."
+    rolling_resistance(float) : "Rolling Resistance" : "0" : "Rolling resistance for round shapes."
+    explosion_scale(float) : "Explosion Scale" : "1" : "Scale used by Box3D explosion forces."
+    tangent_velocity(string) : "Tangent Velocity (X Y Z)" : "0 0 0" : "Surface tangent velocity in editor axes for conveyor-style contacts."
+    material_id(integer) : "Material ID" : 0 : "User material id passed to Box3D material callbacks."
+    custom_color(integer) : "Debug Color" : 0 : "Optional Box3D debug color. 0 uses default."
+    velocity(string) : "Initial Velocity (X Y Z)" : "0 0 0" : "Initial linear velocity in editor axes."
+    linear_velocity(string) : "Initial Linear Velocity (X Y Z)" : "0 0 0" : "Alias for velocity."
+    angular_velocity(string) : "Initial Angular Velocity (X Y Z)" : "0 0 0" : "Initial angular velocity in radians/sec, editor axes."
+    linear_damping(float) : "Linear Damping" : "0" : "Reduces linear velocity over time."
+    angular_damping(float) : "Angular Damping" : "0" : "Reduces angular velocity over time."
+    gravity_scale(float) : "Gravity Scale" : "1" : "Multiplier for world gravity."
+    sleep_threshold(float) : "Sleep Threshold" : "0.05" : "Speed threshold for sleeping."
+    enable_sleep(choices) : "Enable Sleep" : 1 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    start_awake(choices) : "Start Awake" : 1 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    enabled(choices) : "Enabled" : 1 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    bullet(choices) : "Bullet / CCD" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    allow_fast_rotation(choices) : "Allow Fast Rotation" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    contact_recycling(choices) : "Contact Recycling" : 1 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    sensor(choices) : "Sensor" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    sensor_events(choices) : "Sensor Events" : 1 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    contact_events(choices) : "Contact Events" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    hit_events(choices) : "Hit Events" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    presolve_events(choices) : "Pre-solve Events" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    invoke_contact_creation(choices) : "Invoke Contact Creation" : 1 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    custom_filtering(choices) : "Custom Filtering" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    update_body_mass(choices) : "Update Body Mass" : 1 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    category_bits(integer) : "Category Bits" : 2 : "Collision category bit mask. Default is MOVING."
+    mask_bits(integer) : "Mask Bits" : 7 : "Accepted collision categories. Default collides with STATIC, MOVING, and SENSOR."
+    group_index(integer) : "Group Index" : 0 : "Non-zero Box3D collision group override."
+    lock_linear_x(choices) : "Lock Linear X" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    lock_linear_y(choices) : "Lock Linear Y" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    lock_linear_z(choices) : "Lock Linear Z" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    lock_angular_x(choices) : "Lock Angular X" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    lock_angular_y(choices) : "Lock Angular Y" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+    lock_angular_z(choices) : "Lock Angular Z" : 0 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
+]
+
+// Dynamic Physics Brush
+@SolidClass base(Targetname, Box3DPhysicsBody) color(128 128 255) = ent_physx : "Dynamic Physics Brush" [
+]
+
+// Legacy Physics Brush
+@SolidClass base(Targetname, Box3DPhysicsBody) color(128 128 255) = func_physics : "Physics Brush (legacy alias)" [
 ]

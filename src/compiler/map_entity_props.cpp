@@ -74,6 +74,11 @@ bool ShouldRenderBrushEntity(const Entity& entity, bool devMode) {
         return false;
     }
 
+    if ((EntityHasClass(entity, "ent_physx") ||
+         EntityClassStartsWith(entity, "func_physics")) && !devMode) {
+        return false;
+    }
+
     return true;
 }
 

@@ -1,5 +1,17 @@
 cmake_minimum_required(VERSION 3.15)
+
+# Keep macOS builds single-architecture by default. Without an explicit -arch,
+# AppleClang may compile for the host arch while the final linker invocation
+# chooses a different default, which breaks the Embree-backed map compiler.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin" AND CMAKE_HOST_SYSTEM_PROCESSOR AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "${CMAKE_HOST_SYSTEM_PROCESSOR}" CACHE STRING "Build architectures for macOS" FORCE)
+endif()
+
 project(Warped)
+
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "${CMAKE_SYSTEM_PROCESSOR}" CACHE STRING "Build architectures for macOS" FORCE)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -117,6 +129,13 @@ if(BUILD_MAP_COMPILER)
             set(EMBREE_GEOMETRY_INSTANCE_ARRAY OFF CACHE BOOL "Disable Embree instance array geometry" FORCE)
             set(EMBREE_GEOMETRY_GRID OFF CACHE BOOL "Disable Embree grid geometry" FORCE)
             set(EMBREE_GEOMETRY_POINT OFF CACHE BOOL "Disable Embree point geometry" FORCE)
+            if(APPLE)
+                if(CMAKE_OSX_ARCHITECTURES MATCHES "arm64" OR CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
+                    set(EMBREE_MAX_ISA "NEON" CACHE STRING "Select highest Embree ISA for static AppleClang builds" FORCE)
+                else()
+                    set(EMBREE_MAX_ISA "SSE4.2" CACHE STRING "Select highest Embree ISA for static AppleClang builds" FORCE)
+                endif()
+            endif()
             add_subdirectory(lib/embree EXCLUDE_FROM_ALL)
         else()
             message(WARNING "WARPED_LIGHTMAP_USE_EMBREE=ON but lib/embree/CMakeLists.txt was not found; using scalar CPU lightmap tracing and brute-force GPU tracing.")
