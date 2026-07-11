@@ -259,6 +259,11 @@
     ]
     mass(float) : "Mass Override" : "0" : "Optional body mass in kg. 0 uses density-derived mass."
     density(float) : "Density" : "1000" : "Shape density in kg/m^3 used when mass is not overridden. Physics mass treats 64 map units as 1 meter."
+    can_push(choices) : "Can Push" : 1 =
+    [
+        0 : "No"
+        1 : "Yes"
+    ]
     friction(float) : "Friction" : "0.6" : "Coulomb friction coefficient."
     restitution(float) : "Restitution" : "0" : "Bounciness coefficient."
     rolling_resistance(float) : "Rolling Resistance" : "0" : "Rolling resistance for round shapes."

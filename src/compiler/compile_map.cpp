@@ -9,6 +9,7 @@
 #include "map_parser.h"
 #include "../utils/bsp_format.h"
 #include "../utils/asset_pack.h"
+#include "../entities/entity_defs.h"
 #include "../physx/collision_data.h"
 #include "lightmap.h"
 #include "map_geometry.h"
@@ -143,7 +144,6 @@ struct LumpWriter {
 
     void Begin() {
         hdr.magic = WBSP_MAGIC;
-        hdr.version = WBSP_VERSION;
         hdrPos = ftell(f);
         fwrite(&hdr, sizeof(hdr), 1, f);      // placeholder
     }
@@ -411,14 +411,18 @@ int main(int argc, char** argv)
 
     for (size_t hullIndex = 0; hullIndex < coll.size(); ++hullIndex) {
         const MeshCollisionData& c = coll[hullIndex];
-        if (c.collisionType != CollisionType::DYNAMIC ||
-            c.entityIndex < 0 ||
+        if (c.entityIndex < 0 ||
             c.brushIndex < 0 ||
             (size_t)c.entityIndex >= map.entities.size()) {
             continue;
         }
 
         const Entity& sourceEntity = map.entities[(size_t)c.entityIndex];
+        const EntityDefs::EntityDef* def = EntityDefs::Find(sourceEntity);
+        if (def == nullptr || !def->dynamicRenderMesh) {
+            continue;
+        }
+
         if ((size_t)c.brushIndex >= sourceEntity.brushes.size()) {
             continue;
         }

@@ -27,4 +27,6 @@ void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
 
 b3BodyId GetMapPhysicsBodyForHull(size_t hullIndex);
 
+bool CanPlayerPushBody(b3BodyId bodyId);
+
 void DebugDrawPhysicsObjects();

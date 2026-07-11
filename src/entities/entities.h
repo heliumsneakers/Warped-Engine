@@ -6,35 +6,35 @@
 
 namespace GameplayEntities {
 
-struct PlayerEffectResult {
-    bool appliedBoost = false;
-    bool launchOffGround = false;
-};
+    struct PlayerEffectResult {
+        bool appliedBoost = false;
+        bool launchOffGround = false;
+    };
 
-struct TriggerTeleportResult {
-    bool teleportPlayer = false;
-    Vector3 position = Vector3Zero();
-    float yaw = 0.0f;
-    float pitch = 0.0f;
-};
+    struct TriggerTeleportResult {
+        bool teleportPlayer = false;
+        Vector3 position = Vector3Zero();
+        float yaw = 0.0f;
+        float pitch = 0.0f;
+    };
 
-void Reset();
+    void Reset();
 
-void RegisterPointEntities(const std::vector<Entity>& entities);
+    void RegisterPointEntities(const std::vector<Entity>& entities);
 
-void RegisterBrushEntity(const Entity& entity, int entityIndex, b3BodyId bodyId);
+    void RegisterBrushEntity(const Entity& entity, int entityIndex, b3BodyId bodyId);
 
-PlayerEffectResult ApplyPlayerEffects(const b3ShapeProxy* playerProxy,
-                                      Vector3 playerCenter,
-                                      Vector3 groundNormal,
-                                      bool isGrounded,
-                                      float deltaTime,
-                                      Vector3& inOutVelocity);
+    PlayerEffectResult ApplyPlayerEffects(const b3ShapeProxy* playerProxy,
+                                          Vector3 playerCenter,
+                                          Vector3 groundNormal,
+                                          bool isGrounded,
+                                          float deltaTime,
+                                          Vector3& inOutVelocity);
 
-void UpdateDynamicBodyEffects(float deltaTime);
+    void UpdateDynamicBodyEffects(float deltaTime);
 
-TriggerTeleportResult QueryPlayerTeleportTrigger(const b3ShapeProxy* playerProxy,
-                                                 Vector3 playerCenter,
-                                                 float deltaTime);
+    TriggerTeleportResult QueryPlayerTeleportTrigger(const b3ShapeProxy* playerProxy,
+                                                     Vector3 playerCenter,
+                                                     float deltaTime);
 
 } // namespace GameplayEntities

@@ -1,5 +1,6 @@
 #include "map_entity_props.h"
 #include "map_geometry.h"
+#include "../entities/entity_defs.h"
 
 #include <algorithm>
 #include <cmath>
@@ -63,20 +64,9 @@ bool EntityClassStartsWith(const Entity& e, const char* prefix) {
 }
 
 bool ShouldRenderBrushEntity(const Entity& entity, bool devMode) {
-    if ((EntityHasClass(entity, "trigger_once") ||
-         EntityHasClass(entity, "trigger_multiple") ||
-         EntityHasClass(entity, "trigger_boost") ||
-         EntityHasClass(entity, "func_boost")) && !devMode) {
-        return false;
-    }
-
-    if (EntityHasClass(entity, "func_clip")) {
-        return false;
-    }
-
-    if ((EntityHasClass(entity, "ent_physx") ||
-         EntityClassStartsWith(entity, "func_physics")) && !devMode) {
-        return false;
+    const EntityDefs::EntityDef* def = EntityDefs::Find(entity);
+    if (def != nullptr && def->kind == EntityDefs::EntityKind::Brush) {
+        return devMode ? def->devRenderBrushGeometry : def->renderBrushGeometry;
     }
 
     return true;

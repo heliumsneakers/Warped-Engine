@@ -160,6 +160,7 @@ if(BUILD_MAP_COMPILER)
         src/compiler/lightmap_compute.cpp
         src/compiler/sokol_compute_impl.c
         ${WARPED_MAP_PARSER_SOURCES}
+        src/entities/entity_defs.cpp
         src/utils/asset_pack.cpp
         src/utils/parameters.cpp
         src/physx/collision_data.cpp

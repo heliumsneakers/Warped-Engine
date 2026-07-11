@@ -1,5 +1,6 @@
 #include "../math/wmath.h"
 #include "collision_data.h"
+#include "../entities/entity_defs.h"
 #include "../compiler/map_geometry.h"
 #include <vector>
 #include <string>
@@ -7,39 +8,19 @@
 #include <cstdio>
 
 static CollisionType GetEntityCollisionType(const Entity &ent) {
-    CollisionType ct = CollisionType::UNKNOWN;
-
-    auto it = ent.properties.find("classname");
-    if (it != ent.properties.end()) {
-        const std::string &classname = it->second;
-
-        if (classname == "worldspawn") {
-           ct = CollisionType::STATIC;
-            printf("\n WORLDSPAWN ENTITY \n");
-        }
-        else if (classname == "trigger_once" || classname == "trigger_multiple") {
-            ct = CollisionType::TRIGGER;
-            printf("\n TRIGGER ENTITY \n");
-        }
-        else if (classname == "trigger_boost" || classname == "func_boost") {
-            ct = CollisionType::TRIGGER;
-            printf("\n BOOST TRIGGER ENTITY \n");
-        }
-        else if (classname == "ent_physx" || classname.find("func_physics") != std::string::npos) {
-            ct = CollisionType::DYNAMIC;
-            printf("\n PHYSICS ENTITY \n");
-        }
-        else if (classname.find("func_clip") != std::string::npos) {
-            ct = CollisionType::STATIC;
-            printf("\n FUNC_CLIP ENTITY \n");
-        }
-        else if (classname.find("func_detail") != std::string::npos) {
-            ct = CollisionType::NO_COLLIDE;
-            printf("\n FUNC_DETAIL ENTITY \n");
-        }
+    const EntityDefs::EntityDef* def = EntityDefs::Find(ent);
+    if (def == nullptr) {
+        return CollisionType::UNKNOWN;
     }
 
-    return ct;
+    switch (def->collision) {
+        case EntityDefs::CollisionRole::Static: return CollisionType::STATIC;
+        case EntityDefs::CollisionRole::Dynamic: return CollisionType::DYNAMIC;
+        case EntityDefs::CollisionRole::Trigger: return CollisionType::TRIGGER;
+        case EntityDefs::CollisionRole::NoCollide: return CollisionType::NO_COLLIDE;
+        case EntityDefs::CollisionRole::Unknown:
+        default: return CollisionType::UNKNOWN;
+    }
 }
 
 static std::vector<Vector3> BuildBrushGeometry(const Brush &brush) {

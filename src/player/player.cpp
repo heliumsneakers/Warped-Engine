@@ -53,7 +53,7 @@ static constexpr float PLAYER_RADIUS = 16.0f;
 static constexpr float PLAYER_HEIGHT = 56.0f;
 static constexpr float PLAYER_HALF_HEIGHT = PLAYER_HEIGHT * 0.5f;
 static constexpr float JUMP_FORCE = 268.0f;
-static constexpr float PLAYER_PUSH_MASS = 800.0f;
+static constexpr float PLAYER_PUSH_MASS = 2500.0f;
 static constexpr float PLAYER_PUSH_RESTITUTION = 0.0f;
 static constexpr float PLAYER_PUSH_MIN_SPEED = 5.0f;
 static constexpr float PLAYER_PUSH_MAX_IMPULSE = PLAYER_PUSH_MASS * MAX_SPEED;
@@ -342,6 +342,9 @@ static void PushDynamicBodyFromPlayerContact(b3ShapeId shapeID,
     if (!b3Body_IsValid(body) || b3Body_GetType(body) != b3_dynamicBody) {
         return;
     }
+    if (!CanPlayerPushBody(body)) {
+        return;
+    }
 
     Vector3 pushDir = Vector3Scale(playerResolveNormal, -1.0f);
     if (pushDir.y > 0.0f) {
@@ -558,6 +561,9 @@ static void ApplyPlayerWeightToGroundBody(const GroundSupport& support)
 
     const b3BodyId body = b3Shape_GetBody(support.shapeID);
     if (!b3Body_IsValid(body) || b3Body_GetType(body) != b3_dynamicBody) {
+        return;
+    }
+    if (!CanPlayerPushBody(body)) {
         return;
     }
 

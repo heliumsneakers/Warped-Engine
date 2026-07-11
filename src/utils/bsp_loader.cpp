@@ -9,90 +9,37 @@
 
 namespace {
 
-static constexpr uint32_t kLegacyBspVersion = 2u;
-static constexpr uint32_t kRgba8LightmapBspVersion = WBSP_VERSION_LIGHTMAP_RGBA8;
-static constexpr uint32_t kLightmapFormatBspVersion = WBSP_VERSION_LIGHTMAP_FORMAT;
-static constexpr size_t kLegacyLumpCount = 8;
-static constexpr size_t kPreDynamicLumpCount = LUMP_DYNAMIC_MESHES;
-
-#pragma pack(push, 1)
-struct BSPHeaderV2Compat {
-    uint32_t magic;
-    uint32_t version;
-    BSPLump  lumps[kLegacyLumpCount];
-};
-
-struct BSPHeaderV5Compat {
-    uint32_t magic;
-    uint32_t version;
-    BSPLump  lumps[kPreDynamicLumpCount];
-};
-
-struct BSPLightmapPageHeaderV3Compat {
-    uint32_t width;
-    uint32_t height;
-    uint32_t byteLength;
-};
-
-struct BSPHullV4Compat {
-    uint32_t firstPoint;
-    uint32_t pointCount;
-    uint32_t collisionType;
-};
-
-struct BSPHullV5Compat {
-    uint32_t firstPoint;
-    uint32_t pointCount;
-    uint32_t collisionType;
-    int32_t entityIndex;
-};
-#pragma pack(pop)
-
 static bool ReadHeader(FILE* f, BSPHeader* out) {
-    uint32_t magic = 0;
-    uint32_t version = 0;
-    if (fread(&magic, sizeof(magic), 1, f) != 1 ||
-        fread(&version, sizeof(version), 1, f) != 1)
-    {
+    if (fseek(f, 0, SEEK_END) != 0) {
         return false;
     }
-    if (magic != WBSP_MAGIC) {
+    const long fileSize = ftell(f);
+    if (fileSize < (long)sizeof(BSPHeader)) {
         return false;
     }
 
     fseek(f, 0, SEEK_SET);
-    if (version == WBSP_VERSION) {
-        return fread(out, sizeof(*out), 1, f) == 1;
+    if (fread(out, sizeof(*out), 1, f) != 1) {
+        return false;
     }
-    if (version == WBSP_VERSION_HULL_ENTITY_REFS ||
-        version == kLightmapFormatBspVersion ||
-        version == kRgba8LightmapBspVersion) {
-        BSPHeaderV5Compat legacy{};
-        if (fread(&legacy, sizeof(legacy), 1, f) != 1) {
+    if (out->magic != WBSP_MAGIC) {
+        return false;
+    }
+
+    for (int lumpIndex = 0; lumpIndex < LUMP_COUNT; ++lumpIndex) {
+        const BSPLump& lump = out->lumps[lumpIndex];
+        if (lump.length == 0) {
+            continue;
+        }
+        if (lump.offset < sizeof(BSPHeader)) {
             return false;
         }
-        memset(out, 0, sizeof(*out));
-        out->magic = legacy.magic;
-        out->version = legacy.version;
-        for (size_t i = 0; i < kPreDynamicLumpCount; ++i) {
-            out->lumps[i] = legacy.lumps[i];
-        }
-        return true;
-    }
-    if (version == kLegacyBspVersion) {
-        BSPHeaderV2Compat legacy{};
-        if (fread(&legacy, sizeof(legacy), 1, f) != 1) {
+        if ((uint64_t)lump.offset + (uint64_t)lump.length > (uint64_t)fileSize) {
             return false;
         }
-        memset(out, 0, sizeof(*out));
-        out->magic = legacy.magic;
-        out->version = legacy.version;
-        for (size_t i = 0; i < kLegacyLumpCount; ++i) {
-            out->lumps[i] = legacy.lumps[i];
-        }
-        return true;
     }
-    return false;
+
+    return true;
 }
 
 } // namespace
@@ -125,34 +72,7 @@ bool LoadBSP(const char* path, BSPData& out)
     auto idx      = ReadLump<uint32_t>  (f, hdr.lumps[LUMP_INDICES]);
     auto meshes   = ReadLump<BSPMesh>   (f, hdr.lumps[LUMP_MESHES]);
     auto hullPts  = ReadLump<BSPVec3>   (f, hdr.lumps[LUMP_HULL_PTS]);
-    std::vector<BSPHull> hulls;
-    if (hdr.version >= WBSP_VERSION_DYNAMIC_MESHES) {
-        hulls = ReadLump<BSPHull>(f, hdr.lumps[LUMP_HULLS]);
-    } else if (hdr.version >= WBSP_VERSION_HULL_ENTITY_REFS) {
-        std::vector<BSPHullV5Compat> legacyHulls = ReadLump<BSPHullV5Compat>(f, hdr.lumps[LUMP_HULLS]);
-        hulls.reserve(legacyHulls.size());
-        for (const BSPHullV5Compat& legacyHull : legacyHulls) {
-            BSPHull hull{};
-            hull.firstPoint = legacyHull.firstPoint;
-            hull.pointCount = legacyHull.pointCount;
-            hull.collisionType = legacyHull.collisionType;
-            hull.entityIndex = legacyHull.entityIndex;
-            hull.brushIndex = -1;
-            hulls.push_back(hull);
-        }
-    } else {
-        std::vector<BSPHullV4Compat> legacyHulls = ReadLump<BSPHullV4Compat>(f, hdr.lumps[LUMP_HULLS]);
-        hulls.reserve(legacyHulls.size());
-        for (const BSPHullV4Compat& legacyHull : legacyHulls) {
-            BSPHull hull{};
-            hull.firstPoint = legacyHull.firstPoint;
-            hull.pointCount = legacyHull.pointCount;
-            hull.collisionType = legacyHull.collisionType;
-            hull.entityIndex = -1;
-            hull.brushIndex = -1;
-            hulls.push_back(hull);
-        }
-    }
+    auto hulls    = ReadLump<BSPHull>   (f, hdr.lumps[LUMP_HULLS]);
 
     // ----- render buckets -------------------------------------------------
     out.buckets.reserve(meshes.size());
@@ -172,7 +92,7 @@ bool LoadBSP(const char* path, BSPData& out)
     }
 
     // ----- dynamic render meshes -----------------------------------------
-    if (hdr.version >= WBSP_VERSION_DYNAMIC_MESHES) {
+    {
         auto dynamicMeshes = ReadLump<BSPDynamicMesh>(f, hdr.lumps[LUMP_DYNAMIC_MESHES]);
         auto dynamicVerts = ReadLump<BSPVertex>(f, hdr.lumps[LUMP_DYNAMIC_VERTICES]);
         auto dynamicIdx = ReadLump<uint32_t>(f, hdr.lumps[LUMP_DYNAMIC_INDICES]);
@@ -240,46 +160,27 @@ bool LoadBSP(const char* path, BSPData& out)
             BSPLightmapLumpHeader lh{};
             fread(&lh, sizeof(lh), 1, f);
 
-            if (hdr.version >= kLightmapFormatBspVersion) {
-                std::vector<BSPLightmapPageHeader> pageHeaders(lh.pageCount);
-                if (!pageHeaders.empty()) {
-                    fread(pageHeaders.data(), sizeof(BSPLightmapPageHeader), pageHeaders.size(), f);
-                }
+            std::vector<BSPLightmapPageHeader> pageHeaders(lh.pageCount);
+            if (!pageHeaders.empty()) {
+                fread(pageHeaders.data(), sizeof(BSPLightmapPageHeader), pageHeaders.size(), f);
+            }
 
-                out.lightmapPages.resize(lh.pageCount);
-                for (uint32_t i = 0; i < lh.pageCount; ++i) {
-                    BSPDataLightmapPage& page = out.lightmapPages[i];
-                    page.width = (int)pageHeaders[i].width;
-                    page.height = (int)pageHeaders[i].height;
-                    page.format = pageHeaders[i].format;
-                    page.pixels.resize(pageHeaders[i].byteLength);
-                    if (!page.pixels.empty()) {
-                        fread(page.pixels.data(), 1, page.pixels.size(), f);
-                    }
-                }
-            } else {
-                std::vector<BSPLightmapPageHeaderV3Compat> pageHeaders(lh.pageCount);
-                if (!pageHeaders.empty()) {
-                    fread(pageHeaders.data(), sizeof(BSPLightmapPageHeaderV3Compat), pageHeaders.size(), f);
-                }
-
-                out.lightmapPages.resize(lh.pageCount);
-                for (uint32_t i = 0; i < lh.pageCount; ++i) {
-                    BSPDataLightmapPage& page = out.lightmapPages[i];
-                    page.width = (int)pageHeaders[i].width;
-                    page.height = (int)pageHeaders[i].height;
-                    page.format = BSP_LIGHTMAP_FORMAT_RGBA8_UNORM;
-                    page.pixels.resize(pageHeaders[i].byteLength);
-                    if (!page.pixels.empty()) {
-                        fread(page.pixels.data(), 1, page.pixels.size(), f);
-                    }
+            out.lightmapPages.resize(lh.pageCount);
+            for (uint32_t i = 0; i < lh.pageCount; ++i) {
+                BSPDataLightmapPage& page = out.lightmapPages[i];
+                page.width = (int)pageHeaders[i].width;
+                page.height = (int)pageHeaders[i].height;
+                page.format = pageHeaders[i].format;
+                page.pixels.resize(pageHeaders[i].byteLength);
+                if (!page.pixels.empty()) {
+                    fread(page.pixels.data(), 1, page.pixels.size(), f);
                 }
             }
         }
     }
 
     // ----- structural bsp -----------------------------------------------
-    if (hdr.version >= WBSP_VERSION_LIGHTMAP_RGBA8) {
+    {
         const BSPLump& treeLump = hdr.lumps[LUMP_BSP_TREE];
         if (treeLump.length >= sizeof(BSPTreeHeader)) {
             fseek(f, treeLump.offset, SEEK_SET);

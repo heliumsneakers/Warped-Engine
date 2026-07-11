@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 /* Here we will setup all Box3D physics functions for collisions with the world.
@@ -50,6 +51,7 @@ struct DynamicPhysicsRenderHull {
 
 std::vector<DynamicPhysicsRenderHull> sDynamicRenderHulls;
 std::vector<b3BodyId> sMapHullBodies;
+std::unordered_map<uint64_t, bool> sCanPlayerPushBody;
 
 static bool GetEntityProp(const std::vector<Entity>& entities,
                           const MeshCollisionData& mcd,
@@ -455,6 +457,7 @@ void ShutdownPhysicsSystem()
     debugSphereID  = B3_NULL_ID;
     sDynamicRenderHulls.clear();
     sMapHullBodies.clear();
+    sCanPlayerPushBody.clear();
 
     printf("[ShutdownPhysicsSystem] Freed Box3D resources.\n");
 }
@@ -464,7 +467,7 @@ void UpdatePhysicsSystem(float delta_time)
     if (!b3World_IsValid(g_physicsWorld))
         return;
 
-    const int subStepCount = 4;
+    const int subStepCount = 12;
     b3World_Step(g_physicsWorld, delta_time, subStepCount);
     GameplayEntities::UpdateDynamicBodyEffects(delta_time);
 
@@ -487,6 +490,7 @@ void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
 {
     int count = 0;
     sDynamicRenderHulls.clear();
+    sCanPlayerPushBody.clear();
     sMapHullBodies.assign(meshCollisionData.size(), B3_NULL_ID);
     GameplayEntities::Reset();
     GameplayEntities::RegisterPointEntities(entities);
@@ -576,6 +580,10 @@ void BuildMapPhysics(const std::vector<MeshCollisionData> &meshCollisionData,
         sMapHullBodies[hullIndex] = body;
 
         if (mcd.collisionType == CollisionType::DYNAMIC) {
+            bool canPush = true;
+            ParseBoolProperty(entities, mcd, "can_push", canPush);
+            sCanPlayerPushBody[b3StoreBodyId(body)] = canPush;
+
             ApplyMassOverride(entities, mcd, hull, shapeDef, body);
             AddDynamicRenderHull(body, hull);
         }
@@ -596,6 +604,20 @@ b3BodyId GetMapPhysicsBodyForHull(size_t hullIndex)
         return B3_NULL_ID;
     }
     return sMapHullBodies[hullIndex];
+}
+
+bool CanPlayerPushBody(b3BodyId bodyId)
+{
+    if (!b3Body_IsValid(bodyId)) {
+        return false;
+    }
+
+    const auto it = sCanPlayerPushBody.find(b3StoreBodyId(bodyId));
+    if (it == sCanPlayerPushBody.end()) {
+        return true;
+    }
+
+    return it->second;
 }
 
 void DebugDrawPhysicsObjects()

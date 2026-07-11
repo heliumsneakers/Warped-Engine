@@ -6,11 +6,6 @@
 #include <cstdint>
 
 #define WBSP_MAGIC    0x50534257u   // 'WBSP' little-endian
-#define WBSP_VERSION  6u
-#define WBSP_VERSION_DYNAMIC_MESHES 6u
-#define WBSP_VERSION_LIGHTMAP_FORMAT 4u
-#define WBSP_VERSION_HULL_ENTITY_REFS 5u
-#define WBSP_VERSION_LIGHTMAP_RGBA8 3u
 
 enum BSPLightmapPageFormat : uint32_t {
     BSP_LIGHTMAP_FORMAT_RGBA8_UNORM = 0u,
@@ -48,7 +43,6 @@ struct BSPLump {
 
 struct BSPHeader {
     uint32_t magic;
-    uint32_t version;
     BSPLump  lumps[LUMP_COUNT];
 };
 
